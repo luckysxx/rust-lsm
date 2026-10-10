@@ -1,5 +1,7 @@
-//! 执行一种负载：逐个操作计时，记录延迟分布、总耗时与计数器的增量。
+//! 执行一种负载：把操作分给若干线程，逐个操作计时，记录延迟分布、总耗时与计数器的增量。
 
+use std::sync::Barrier;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -10,24 +12,44 @@ use crate::workload::{
     KEY_SIZE, Rng, Workload, existing_key, make_value, missing_key, shuffled_indexes,
 };
 
+/// 相邻两个线程的种子相差这么多，各线程的随机序列互不相同。
+const THREAD_SEED_STEP: u64 = 1000;
+
 /// 一次运行的参数。记进报告，重跑时照抄。
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// key 的个数，也是每种负载的操作次数。
+    /// key 的个数，也是每种负载的操作次数（所有线程合计）。
     pub num: u64,
     pub value_size: usize,
     pub seed: u64,
+    /// 同时发起操作的线程数。
+    pub threads: usize,
+    /// 范围扫描负载每次读多少条记录。
+    pub scan_length: usize,
+}
+
+impl Config {
+    /// 一种负载一共执行多少次操作。
+    ///
+    /// 范围扫描的一次操作要读 `scan_length` 条记录，次数相应减少，
+    /// 使读到的记录总数与其他负载的操作数相当。
+    pub fn total_ops(&self, workload: Workload) -> u64 {
+        match workload {
+            Workload::SeekRandom => (self.num / self.scan_length as u64).max(1),
+            _ => self.num,
+        }
+    }
 }
 
 /// 一种负载跑完后的结果。
 pub struct WorkloadResult {
     pub workload: Workload,
     pub ops: u64,
-    /// 从第一个操作开始到最后一个操作结束。不含生成操作序列的时间。
+    /// 从所有线程一起开始，到最后一个线程结束。不含生成操作序列的时间。
     pub elapsed: Duration,
-    /// 每次操作的耗时，单位纳秒。
+    /// 每次操作的耗时，单位纳秒。所有线程的记录合在一起。
     pub latency_nanos: Histogram<u64>,
-    /// 读负载中查到值的次数；写负载为 0。
+    /// 点查负载中查到值的次数；范围扫描中读到的记录总数；写负载为 0。
     pub found: u64,
     /// 写负载中交给被测对象的字节（key 加 value）；读负载为 0。
     pub user_bytes: u64,
@@ -41,46 +63,171 @@ impl WorkloadResult {
     }
 }
 
-pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) -> WorkloadResult {
-    let seed = config.seed.wrapping_add(workload.seed_offset());
-    let mut rng = Rng::new(seed);
-    let value = make_value(config.value_size, config.seed);
+/// 一个线程要做的事，开始计时之前就准备好。
+struct ThreadPlan {
+    /// 这个线程的操作次数。
+    ops: u64,
+    /// 这个线程自己的随机序列。
+    rng: Rng,
+    /// 只用于 fillrandom：这个线程要写入的 key 编号，已经打乱。
+    fill_order: Vec<u64>,
+}
 
-    // 三位有效数字：记录值与真实值相差不超过千分之一。
-    let mut latency_nanos = Histogram::<u64>::new(3).unwrap();
+/// 一个线程跑完后的结果。
+struct ThreadResult {
+    latency_nanos: Histogram<u64>,
+    found: u64,
+    user_bytes: u64,
+}
+
+/// 把一种负载的操作分给各个线程。
+fn plan_threads(workload: Workload, config: &Config) -> Vec<ThreadPlan> {
+    let base_seed = config.seed.wrapping_add(workload.seed_offset());
+    let threads = config.threads as u64;
+    let total_ops = config.total_ops(workload);
+
+    // fillrandom 要保证每个 key 恰好写一次：先整体打乱，再切给各线程。
+    let mut all_fill_order = Vec::new();
+    if workload == Workload::FillRandom {
+        let mut rng = Rng::new(base_seed);
+        all_fill_order = shuffled_indexes(config.num, &mut rng);
+    }
+
+    let mut plans = Vec::new();
+    let mut assigned = 0u64;
+    for thread_index in 0..threads {
+        // 除不尽时，前面几个线程各多做一次。
+        let mut ops = total_ops / threads;
+        if thread_index < total_ops % threads {
+            ops += 1;
+        }
+
+        let mut fill_order = Vec::new();
+        if workload == Workload::FillRandom {
+            let start = assigned as usize;
+            let end = (assigned + ops) as usize;
+            fill_order = all_fill_order[start..end].to_vec();
+        }
+        assigned += ops;
+
+        let thread_seed = base_seed.wrapping_add(thread_index * THREAD_SEED_STEP);
+        plans.push(ThreadPlan {
+            ops,
+            rng: Rng::new(thread_seed),
+            fill_order,
+        });
+    }
+    plans
+}
+
+pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) -> WorkloadResult {
+    let value = make_value(config.value_size, config.seed);
+    let plans = plan_threads(workload, config);
+    let key_count = config.num;
+    let scan_length = config.scan_length;
+
+    // 起跑线：各工作线程加上发令的主线程，到齐后一起放行。
+    let start_line = Barrier::new(plans.len() + 1);
+
+    let stats_before = target.stats();
+
+    let (thread_results, elapsed) = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for plan in plans {
+            let value = &value;
+            let start_line = &start_line;
+            let handle = scope.spawn(move || {
+                run_thread(
+                    target,
+                    workload,
+                    plan,
+                    key_count,
+                    scan_length,
+                    value,
+                    start_line,
+                )
+            });
+            handles.push(handle);
+        }
+
+        start_line.wait();
+        let started = Instant::now();
+
+        let mut thread_results = Vec::new();
+        for handle in handles {
+            thread_results.push(handle.join().unwrap());
+        }
+        (thread_results, started.elapsed())
+    });
+
+    let stats_after = target.stats();
+    let stats = match (stats_before, stats_after) {
+        (Some(before), Some(after)) => Some(after.since(&before)),
+        _ => None,
+    };
+
+    let mut latency_nanos = new_histogram();
+    let mut found = 0u64;
+    let mut user_bytes = 0u64;
+    for thread_result in &thread_results {
+        latency_nanos
+            .add(&thread_result.latency_nanos)
+            .expect("两个直方图的精度相同，合并不应失败");
+        found += thread_result.found;
+        user_bytes += thread_result.user_bytes;
+    }
+
+    WorkloadResult {
+        workload,
+        ops: config.total_ops(workload),
+        elapsed,
+        latency_nanos,
+        found,
+        user_bytes,
+        stats,
+    }
+}
+
+/// 一个线程的全部工作：在起跑线等齐，然后逐个执行自己的操作并计时。
+fn run_thread(
+    target: &dyn KvTarget,
+    workload: Workload,
+    plan: ThreadPlan,
+    key_count: u64,
+    scan_length: usize,
+    value: &[u8],
+    start_line: &Barrier,
+) -> ThreadResult {
+    let mut rng = plan.rng;
+    let mut latency_nanos = new_histogram();
     let mut found = 0u64;
     let mut user_bytes = 0u64;
 
-    let stats_before = target.stats();
-    let started;
+    start_line.wait();
 
     match workload {
         Workload::FillRandom => {
-            let order = shuffled_indexes(config.num, &mut rng);
-            started = Instant::now();
-            for index in order {
+            for index in plan.fill_order {
                 let key = existing_key(index);
                 let op_started = Instant::now();
-                target.put(&key, &value);
+                target.put(&key, value);
                 record(&mut latency_nanos, op_started.elapsed());
                 user_bytes += (KEY_SIZE + value.len()) as u64;
             }
         }
         Workload::Overwrite => {
-            started = Instant::now();
-            for _ in 0..config.num {
-                let index = rng.below(config.num);
+            for _ in 0..plan.ops {
+                let index = rng.below(key_count);
                 let key = existing_key(index);
                 let op_started = Instant::now();
-                target.put(&key, &value);
+                target.put(&key, value);
                 record(&mut latency_nanos, op_started.elapsed());
                 user_bytes += (KEY_SIZE + value.len()) as u64;
             }
         }
         Workload::ReadRandom => {
-            started = Instant::now();
-            for _ in 0..config.num {
-                let index = rng.below(config.num);
+            for _ in 0..plan.ops {
+                let index = rng.below(key_count);
                 let key = existing_key(index);
                 let op_started = Instant::now();
                 let result = target.get(&key);
@@ -91,9 +238,8 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
             }
         }
         Workload::ReadMissing => {
-            started = Instant::now();
-            for _ in 0..config.num {
-                let index = rng.below(config.num);
+            for _ in 0..plan.ops {
+                let index = rng.below(key_count);
                 let key = missing_key(index);
                 let op_started = Instant::now();
                 let result = target.get(&key);
@@ -103,24 +249,28 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
                 }
             }
         }
+        Workload::SeekRandom => {
+            for _ in 0..plan.ops {
+                let index = rng.below(key_count);
+                let start_key = existing_key(index);
+                let op_started = Instant::now();
+                let records_read = target.scan(&start_key, scan_length);
+                record(&mut latency_nanos, op_started.elapsed());
+                found += records_read as u64;
+            }
+        }
     }
 
-    let elapsed = started.elapsed();
-    let stats_after = target.stats();
-    let stats = match (stats_before, stats_after) {
-        (Some(before), Some(after)) => Some(after.since(&before)),
-        _ => None,
-    };
-
-    WorkloadResult {
-        workload,
-        ops: config.num,
-        elapsed,
+    ThreadResult {
         latency_nanos,
         found,
         user_bytes,
-        stats,
     }
+}
+
+/// 三位有效数字：记录值与真实值相差不超过千分之一。
+fn new_histogram() -> Histogram<u64> {
+    Histogram::<u64>::new(3).unwrap()
 }
 
 fn record(latency_nanos: &mut Histogram<u64>, elapsed: Duration) {
@@ -140,9 +290,19 @@ mod tests {
             num: 1000,
             value_size: 100,
             seed: 1,
+            threads: 1,
+            scan_length: 10,
         }
     }
 
+    fn threaded_config(threads: usize) -> Config {
+        Config {
+            threads,
+            ..small_config()
+        }
+    }
+
+    // fillrandom 把每个存在的 key 都写了一次，没有写出不存在的 key。
     #[test]
     fn fillrandom_writes_every_key_once() {
         let target = BTreeMapTarget::new();
@@ -159,6 +319,7 @@ mod tests {
         }
     }
 
+    // readrandom 每次都查到，readmissing 一次也查不到。
     #[test]
     fn readrandom_finds_all_and_readmissing_finds_none() {
         let target = BTreeMapTarget::new();
@@ -173,6 +334,7 @@ mod tests {
         assert_eq!(hits.user_bytes, 0);
     }
 
+    // overwrite 只覆盖已有的 key，不产生新的 key。
     #[test]
     fn overwrite_does_not_create_new_keys() {
         let target = BTreeMapTarget::new();
@@ -189,11 +351,117 @@ mod tests {
         assert!(target.get(&existing_key(config.num)).is_none());
     }
 
+    // 被测对象没有计数器时，结果里的放大数据为空。
     #[test]
     fn target_without_counters_reports_no_stats() {
         let target = BTreeMapTarget::new();
         let result = run_workload(&target, Workload::FillRandom, &small_config());
 
         assert!(result.stats.is_none());
+    }
+
+    // 操作数除不尽线程数时，各线程的份额相差不超过 1，合计等于总数。
+    #[test]
+    fn plan_splits_ops_across_threads() {
+        let config = Config {
+            num: 10,
+            ..threaded_config(3)
+        };
+
+        let plans = plan_threads(Workload::ReadRandom, &config);
+
+        let ops: Vec<u64> = plans.iter().map(|plan| plan.ops).collect();
+        assert_eq!(ops, vec![4, 3, 3]);
+    }
+
+    // fillrandom 分给各线程的 key 编号合起来，每个编号恰好出现一次。
+    #[test]
+    fn plan_gives_every_fill_key_to_exactly_one_thread() {
+        let plans = plan_threads(Workload::FillRandom, &threaded_config(7));
+
+        let mut all_indexes = Vec::new();
+        for plan in &plans {
+            assert_eq!(plan.fill_order.len() as u64, plan.ops);
+            all_indexes.extend_from_slice(&plan.fill_order);
+        }
+        all_indexes.sort_unstable();
+
+        let expected: Vec<u64> = (0..1000).collect();
+        assert_eq!(all_indexes, expected);
+    }
+
+    // 多线程下 fillrandom 仍然把每个 key 写一次，每次操作都记了延迟。
+    #[test]
+    fn threaded_fillrandom_writes_every_key_once() {
+        let target = BTreeMapTarget::new();
+        let config = threaded_config(4);
+
+        let result = run_workload(&target, Workload::FillRandom, &config);
+
+        assert_eq!(result.latency_nanos.len(), 1000);
+        assert_eq!(result.user_bytes, 1000 * (16 + 100));
+        for index in 0..config.num {
+            assert!(target.get(&existing_key(index)).is_some());
+        }
+    }
+
+    // 多线程下读负载的命中次数与单线程时的规律相同：存在的全中，不存在的全不中。
+    #[test]
+    fn threaded_reads_count_hits_from_all_threads() {
+        let target = BTreeMapTarget::new();
+        let config = threaded_config(4);
+        run_workload(&target, Workload::FillRandom, &config);
+
+        let hits = run_workload(&target, Workload::ReadRandom, &config);
+        let misses = run_workload(&target, Workload::ReadMissing, &config);
+
+        assert_eq!(hits.found, 1000);
+        assert_eq!(hits.latency_nanos.len(), 1000);
+        assert_eq!(misses.found, 0);
+    }
+
+    // 范围扫描的次数是 key 的个数除以每次读的条数，至少一次。
+    #[test]
+    fn seekrandom_runs_fewer_but_longer_operations() {
+        let config = small_config();
+        let tiny = Config {
+            num: 3,
+            ..small_config()
+        };
+
+        assert_eq!(config.total_ops(Workload::SeekRandom), 100);
+        assert_eq!(config.total_ops(Workload::ReadRandom), 1000);
+        assert_eq!(tiny.total_ops(Workload::SeekRandom), 1);
+    }
+
+    // 范围扫描：每次从一个已有的 key 起读若干条；读到的记录数不超过"次数乘以每次的条数"，
+    // 只有起点靠近末尾的那几次会读不满。
+    #[test]
+    fn seekrandom_reads_records_in_runs() {
+        let target = BTreeMapTarget::new();
+        let config = small_config();
+        run_workload(&target, Workload::FillRandom, &config);
+
+        let result = run_workload(&target, Workload::SeekRandom, &config);
+
+        assert_eq!(result.ops, 100);
+        assert_eq!(result.latency_nanos.len(), 100);
+        assert!(result.found <= 100 * 10);
+        assert!(result.found > 100 * 9);
+        assert_eq!(result.user_bytes, 0);
+    }
+
+    // 多线程下范围扫描的次数与读到的记录数合计不变量仍然成立。
+    #[test]
+    fn threaded_seekrandom_splits_scans_across_threads() {
+        let target = BTreeMapTarget::new();
+        let config = threaded_config(4);
+        run_workload(&target, Workload::FillRandom, &config);
+
+        let result = run_workload(&target, Workload::SeekRandom, &config);
+
+        assert_eq!(result.latency_nanos.len(), 100);
+        assert!(result.found <= 100 * 10);
+        assert!(result.found > 100 * 9);
     }
 }

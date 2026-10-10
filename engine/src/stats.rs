@@ -140,6 +140,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    // 刚创建时所有计数器为 0；分母为 0 的比值（写放大、读放大）返回 None。
     #[test]
     fn new_stats_are_zero_and_ratios_undefined() {
         let stats = Stats::new();
@@ -151,6 +152,7 @@ mod tests {
         assert_eq!(snapshot.blocks_read_per_get(), None);
     }
 
+    // 写放大的分子是 WAL、flush、compaction 三项之和。
     #[test]
     fn write_amplification_counts_wal_flush_and_compaction() {
         let stats = Stats::new();
@@ -165,6 +167,7 @@ mod tests {
         assert_eq!(snapshot.write_amplification(), Some(4.0));
     }
 
+    // 读放大是总数除以点查次数得到的平均值。
     #[test]
     fn read_amplification_is_averaged_over_gets() {
         let stats = Stats::new();
@@ -180,6 +183,7 @@ mod tests {
         assert_eq!(snapshot.blocks_read_per_get(), Some(0.5));
     }
 
+    // 两次读数相减，得到的只是中间那一段负载的量。
     #[test]
     fn since_isolates_one_workload() {
         let stats = Stats::new();
@@ -198,6 +202,7 @@ mod tests {
         assert_eq!(delta.write_amplification(), Some(3.0));
     }
 
+    // 多个线程同时累加，最后的总数一次也不少。
     #[test]
     fn concurrent_updates_are_not_lost() {
         let stats = Arc::new(Stats::new());

@@ -9,7 +9,7 @@ mod workload;
 use std::process::ExitCode;
 
 use runner::{Config, WorkloadResult, run_workload};
-use target::{BTreeMapTarget, KvTarget};
+use target::{KvTarget, TARGET_NAMES, create_target};
 use workload::{KEY_SIZE, MAX_KEYS, Workload};
 
 const USAGE: &str = "\
@@ -18,15 +18,22 @@ const USAGE: &str = "\
   --num N            key 的个数，也是每种负载的操作次数（默认 1000000）
   --value-size N     value 的字节数（默认 100）
   --seed N           随机种子（默认 1）
-  --workloads A,B,C  按顺序执行的负载（默认 fillrandom,overwrite,readrandom,readmissing）
+  --workloads A,B,C  按顺序执行的负载（默认五种全部执行）
+  --target NAME      被测对象（默认 btreemap）
+  --threads N        同时发起操作的线程数（默认 1）
+  --scan-length N    范围扫描每次读的记录数（默认 100）
+  --memtable-mb N    被测对象为 engine 时，memtable 的上限，单位 MB（默认 64）
   --help             显示本说明
 
-负载：fillrandom、overwrite、readrandom、readmissing。
+负载：fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）。
+被测对象：btreemap（互斥锁加 BTreeMap）、memtable（引擎的单张 memtable）、engine（引擎层）。
 读负载读的是前面的写负载留下的数据，所以要把 fillrandom 排在前面。";
 
 struct Args {
     config: Config,
     workloads: Vec<Workload>,
+    target: String,
+    memtable_megabytes: usize,
 }
 
 fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
@@ -34,8 +41,12 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         num: 1_000_000,
         value_size: 100,
         seed: 1,
+        threads: 1,
+        scan_length: 100,
     };
     let mut workloads = Workload::ALL.to_vec();
+    let mut target = "btreemap".to_string();
+    let mut memtable_megabytes = 64;
 
     let mut index = 0;
     while index < raw.len() {
@@ -52,6 +63,10 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--value-size" => config.value_size = parse_number(flag, value)? as usize,
             "--seed" => config.seed = parse_number(flag, value)?,
             "--workloads" => workloads = parse_workloads(value)?,
+            "--target" => target = value.clone(),
+            "--threads" => config.threads = parse_number(flag, value)? as usize,
+            "--scan-length" => config.scan_length = parse_number(flag, value)? as usize,
+            "--memtable-mb" => memtable_megabytes = parse_number(flag, value)? as usize,
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -60,7 +75,27 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     if config.num == 0 || config.num > MAX_KEYS {
         return Err(format!("--num 必须在 1 到 {MAX_KEYS} 之间"));
     }
-    Ok(Some(Args { config, workloads }))
+    if config.threads == 0 || config.threads as u64 > config.num {
+        return Err("--threads 必须至少为 1，且不超过 --num".to_string());
+    }
+    if !TARGET_NAMES.contains(&target.as_str()) {
+        return Err(format!("不认识的被测对象：{target}"));
+    }
+    if config.value_size == 0 {
+        return Err("--value-size 必须至少为 1：空 value 在引擎里表示删除".to_string());
+    }
+    if config.scan_length == 0 {
+        return Err("--scan-length 必须至少为 1".to_string());
+    }
+    if memtable_megabytes == 0 {
+        return Err("--memtable-mb 必须至少为 1".to_string());
+    }
+    Ok(Some(Args {
+        config,
+        workloads,
+        target,
+        memtable_megabytes,
+    }))
 }
 
 fn parse_number(flag: &str, value: &str) -> Result<u64, String> {
@@ -92,15 +127,17 @@ fn main() -> ExitCode {
         }
     };
 
-    let target = BTreeMapTarget::new();
+    let memtable_size_limit = args.memtable_megabytes * 1024 * 1024;
+    let target =
+        create_target(&args.target, memtable_size_limit).expect("名字在解析参数时已经检查过");
 
     let mut results = Vec::new();
     for workload in &args.workloads {
         eprintln!("运行 {} ...", workload.name());
-        results.push(run_workload(&target, *workload, &args.config));
+        results.push(run_workload(target.as_ref(), *workload, &args.config));
     }
 
-    print_report(&target, &args, &results);
+    print_report(target.as_ref(), &args, &results);
     ExitCode::SUCCESS
 }
 
@@ -121,16 +158,23 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     println!("## 运行条件");
     println!();
     println!("- 被测对象：{}", target.name());
+    if let Some(details) = target.details() {
+        println!("- 被测对象说明：{details}");
+    }
     println!(
-        "- 参数：`--num {} --value-size {} --seed {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --workloads {}`",
+        args.target,
+        config.threads,
         config.num,
         config.value_size,
         config.seed,
+        config.scan_length,
+        args.memtable_megabytes,
         workload_names.join(",")
     );
     println!(
-        "- key {} 字节，value {} 字节，单线程",
-        KEY_SIZE, config.value_size
+        "- key {} 字节，value {} 字节，{} 个线程；范围扫描每次读 {} 条",
+        KEY_SIZE, config.value_size, config.threads, config.scan_length
     );
     println!("- 编译：{profile}，工具链 {toolchain}");
     println!(
@@ -144,7 +188,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     println!("## 吞吐与延迟");
     println!();
     println!(
-        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到 |"
+        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到或读到的记录 |"
     );
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for result in results {
@@ -220,15 +264,21 @@ mod tests {
         items.iter().map(|item| item.to_string()).collect()
     }
 
+    // 不带参数时的默认规模与 db_bench 相同，并执行全部负载。
     #[test]
     fn defaults_match_db_bench_sizes() {
         let args = parse_args(&[]).unwrap().unwrap();
 
         assert_eq!(args.config.num, 1_000_000);
         assert_eq!(args.config.value_size, 100);
+        assert_eq!(args.config.threads, 1);
+        assert_eq!(args.config.scan_length, 100);
+        assert_eq!(args.memtable_megabytes, 64);
+        assert_eq!(args.target, "btreemap");
         assert_eq!(args.workloads, Workload::ALL.to_vec());
     }
 
+    // 命令行选项能覆盖各个默认值。
     #[test]
     fn flags_override_defaults() {
         let raw = strings(&[
@@ -240,18 +290,31 @@ mod tests {
             "9",
             "--workloads",
             "fillrandom,readmissing",
+            "--target",
+            "memtable",
+            "--threads",
+            "4",
+            "--scan-length",
+            "10",
+            "--memtable-mb",
+            "8",
         ]);
         let args = parse_args(&raw).unwrap().unwrap();
 
         assert_eq!(args.config.num, 500);
         assert_eq!(args.config.value_size, 32);
         assert_eq!(args.config.seed, 9);
+        assert_eq!(args.config.threads, 4);
+        assert_eq!(args.config.scan_length, 10);
+        assert_eq!(args.memtable_megabytes, 8);
+        assert_eq!(args.target, "memtable");
         assert_eq!(
             args.workloads,
             vec![Workload::FillRandom, Workload::ReadMissing]
         );
     }
 
+    // 缺值、非数字、不认识的负载、选项或被测对象，以及各项数值为 0 或线程数多于操作数，都被拒绝。
     #[test]
     fn bad_arguments_are_rejected() {
         assert!(parse_args(&strings(&["--num"])).is_err());
@@ -259,8 +322,15 @@ mod tests {
         assert!(parse_args(&strings(&["--num", "0"])).is_err());
         assert!(parse_args(&strings(&["--workloads", "fillrandom,nosuch"])).is_err());
         assert!(parse_args(&strings(&["--frobnicate", "1"])).is_err());
+        assert!(parse_args(&strings(&["--target", "nosuch"])).is_err());
+        assert!(parse_args(&strings(&["--threads", "0"])).is_err());
+        assert!(parse_args(&strings(&["--num", "2", "--threads", "3"])).is_err());
+        assert!(parse_args(&strings(&["--value-size", "0"])).is_err());
+        assert!(parse_args(&strings(&["--scan-length", "0"])).is_err());
+        assert!(parse_args(&strings(&["--memtable-mb", "0"])).is_err());
     }
 
+    // --help 不算错误，只是不执行负载。
     #[test]
     fn help_is_not_an_error() {
         assert!(parse_args(&strings(&["--help"])).unwrap().is_none());

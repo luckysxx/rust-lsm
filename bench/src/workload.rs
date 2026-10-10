@@ -95,14 +95,18 @@ pub enum Workload {
     ReadRandom,
     /// `num` 次点查，每次随机挑一个不存在、但落在 key 范围内的 key。
     ReadMissing,
+    /// 范围扫描：每次随机挑一个已有的 key 作起点，按顺序读若干条。
+    /// 扫描的次数是 `num` 除以每次读的条数，所以读到的记录总数与 `num` 相当。
+    SeekRandom,
 }
 
 impl Workload {
-    pub const ALL: [Workload; 4] = [
+    pub const ALL: [Workload; 5] = [
         Workload::FillRandom,
         Workload::Overwrite,
         Workload::ReadRandom,
         Workload::ReadMissing,
+        Workload::SeekRandom,
     ];
 
     pub fn name(self) -> &'static str {
@@ -111,6 +115,7 @@ impl Workload {
             Workload::Overwrite => "overwrite",
             Workload::ReadRandom => "readrandom",
             Workload::ReadMissing => "readmissing",
+            Workload::SeekRandom => "seekrandom",
         }
     }
 
@@ -127,6 +132,7 @@ impl Workload {
             Workload::Overwrite => 2,
             Workload::ReadRandom => 3,
             Workload::ReadMissing => 4,
+            Workload::SeekRandom => 5,
         }
     }
 }
@@ -135,6 +141,7 @@ impl Workload {
 mod tests {
     use super::*;
 
+    // 种子相同则序列相同，种子不同则序列不同。
     #[test]
     fn rng_is_reproducible() {
         let mut first = Rng::new(42);
@@ -149,6 +156,7 @@ mod tests {
         assert_ne!(from_first, from_other);
     }
 
+    // 输出与 SplitMix64 参考实现一致，确认算法没有写错。
     #[test]
     fn rng_matches_splitmix64_reference() {
         // SplitMix64 在种子 0 下的前三个输出，来自算法作者的参考实现。
@@ -158,6 +166,7 @@ mod tests {
         assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
     }
 
+    // key 固定 16 字节，字节序与编号的大小顺序一致。
     #[test]
     fn keys_are_fixed_width_and_ordered_like_numbers() {
         assert_eq!(&existing_key(0), b"0000000000000000");
@@ -167,6 +176,7 @@ mod tests {
         assert!(existing_key(99) < existing_key(100));
     }
 
+    // 每个不存在的 key 都夹在两个相邻的存在的 key 之间。
     #[test]
     fn missing_keys_sit_between_existing_keys() {
         for index in 0..100 {
@@ -175,12 +185,14 @@ mod tests {
         }
     }
 
+    // 允许的最大编号仍能写进 16 位十进制。
     #[test]
     fn largest_allowed_key_fits() {
         let last = MAX_KEYS - 1;
         assert_eq!(&missing_key(last), b"1999999999999999");
     }
 
+    // 打乱后的序列确实变了顺序，但每个编号仍恰好出现一次。
     #[test]
     fn shuffle_is_a_permutation() {
         let mut rng = Rng::new(7);
@@ -194,6 +206,7 @@ mod tests {
         assert_eq!(sorted, in_order);
     }
 
+    // value 的长度符合要求，内容只由种子决定。
     #[test]
     fn value_has_requested_size_and_depends_on_seed() {
         assert_eq!(make_value(100, 1).len(), 100);
@@ -202,6 +215,7 @@ mod tests {
         assert_ne!(make_value(100, 1), make_value(100, 2));
     }
 
+    // 每种负载的名字都能解析回它自己，不认识的名字解析失败。
     #[test]
     fn workload_names_round_trip() {
         for workload in Workload::ALL {

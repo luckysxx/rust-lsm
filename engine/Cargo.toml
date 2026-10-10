@@ -7,3 +7,5 @@ publish = { workspace = true }
 description = "学习用的 LSM 存储引擎"
 
 [dependencies]
+bytes = "1.12.1"
+crossbeam-skiplist = "0.1.3"
