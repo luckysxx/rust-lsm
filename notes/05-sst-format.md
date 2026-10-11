@@ -8,6 +8,7 @@
 - 构建 SST：何时结束一个块、何时写出文件。
 - SST 迭代器：先用元信息找到块，再在块内查找。
 - 按需读块与 block cache。
+- 读块的方式：`pread` 加 block cache 与 mmap 的取舍。
 
 ## 资料
 

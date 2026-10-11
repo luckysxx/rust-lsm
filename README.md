@@ -8,7 +8,7 @@
 
 | 目录 | crate | 作用 | 读代码的入口 |
 | --- | --- | --- | --- |
-| engine | `lsm` | 引擎。目前有 memtable、引擎层（可写与冻结的 memtable）、游标与归并、统计计数器 | [lib.rs](engine/src/lib.rs)、[lsm_storage.rs](engine/src/lsm_storage.rs)、[mem_table.rs](engine/src/mem_table.rs)、[iterators.rs](engine/src/iterators.rs)、[iterators/merge_iterator.rs](engine/src/iterators/merge_iterator.rs)、[lsm_iterator.rs](engine/src/lsm_iterator.rs)、[stats.rs](engine/src/stats.rs) |
+| engine | `lsm` | 引擎。目前有 memtable、引擎层（可写与冻结的 memtable）、游标与归并、数据块（未接入引擎）、统计计数器 | [lib.rs](engine/src/lib.rs)、[block.rs](engine/src/block.rs)、[lsm_storage.rs](engine/src/lsm_storage.rs)、[mem_table.rs](engine/src/mem_table.rs)、[iterators.rs](engine/src/iterators.rs)、[iterators/merge_iterator.rs](engine/src/iterators/merge_iterator.rs)、[lsm_iterator.rs](engine/src/lsm_iterator.rs)、[stats.rs](engine/src/stats.rs) |
 | bench | `lsm-bench` | 基准驱动：固定负载、吞吐、延迟分位数、放大 | [main.rs](bench/src/main.rs)、[workload.rs](bench/src/workload.rs)、[runner.rs](bench/src/runner.rs)、[target.rs](bench/src/target.rs) |
 | bench/results | | 每次基准运行的记录 | [记录方式与列表](bench/results/README.md) |
 | notes | | 实现笔记 | [阅读索引](notes/README.md) |
