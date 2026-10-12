@@ -298,6 +298,25 @@ LevelDB 的块也是"记录在前、索引在尾、最后是项数"，但索引�
 
 差异来自数据模型：时序查询通常是"某段时间内、某几列"的大范围扫描加聚合，按列存放并成批解码合算；按 key 逐条点查不是它的主要负载。
 
+### 为什么 mito2 不自己定数据块的格式
+
+LSM 的结构（memtable、flush、compaction、manifest、WAL）与文件内部的格式是两件事。mito2 自己写了前者，后者选了现成的 Parquet。理由有三层：
+
+- **负载适合按列存放。** 一行是"若干标签列、一个时间戳、若干数值列"，查询多是对几列做大范围的扫描与聚合。按行存放的块（key、value 首尾相接）读一列也要把整行读进来；按列存放只读用到的列，同一列的值类型相同、彼此相近，压缩率高得多，解出来就是可以成批计算的数组。
+- **不必重做。** Parquet 是成熟的开放格式，Rust 里有现成的读写库，统计信息（每个 row group、每个 page 的最小最大值）与按条件跳过都已具备；mito2 的查询引擎 DataFusion 本来就以 Arrow 的列式批次为处理单位，读出来不需要转换。mito2 的依赖里直接有 `parquet` 与 `datafusion`（[Cargo.toml](../../references/greptimedb/src/mito2/Cargo.toml)）。
+- **文件能被别的系统读。** 它的数据放在对象存储上，Parquet 文件可以被其他分析工具直接读取。源码里专门为列写入了与 Iceberg 兼容的字段编号（[sst.rs](../../references/greptimedb/src/mito2/src/sst.rs) 的 `PARQUET_FIELD_ID_KEY`）。
+
+代价是按 key 找一行不方便：Parquet 里没有"每行一项"的偏移，最细只能靠统计信息定位到 page，再把这一页解码。mito2 为此另建索引（倒排索引、Bloom filter 等），存在与 SST 配套的 puffin 文件里。
+
+Parquet 文件内部仍然是同一套思路，只是多了"列"这一维：
+
+```
+本项目：  文件 → 块 → 记录                          尾部：每个块的位置与首 key
+Parquet： 文件 → row group → 列 → page → 值         尾部：每个 row group、每列的位置与统计信息
+```
+
+元信息同样写在文件末尾，最后是它的长度与魔数，读的时候从尾巴倒着找。
+
 ### 导读：puffin 文件的尾部
 
 GreptimeDB 里手写的、与"从尾部倒着找"对应的代码在索引文件的格式里。mito2 的索引（倒排索引、Bloom filter 等）存在 puffin 格式的文件中，读文件尾的代码在 [puffin/src/file_format/reader/footer.rs](../../references/greptimedb/src/puffin/src/file_format/reader/footer.rs)：

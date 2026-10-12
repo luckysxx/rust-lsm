@@ -5,8 +5,10 @@
 //! 见 `lsm/notes/README.md`。
 
 pub mod block;
+pub mod error;
 pub mod iterators;
 pub mod lsm_iterator;
 pub mod lsm_storage;
 pub mod mem_table;
 pub mod stats;
+pub mod table;
