@@ -7,15 +7,19 @@
 //! 实现分两类，看类型有没有 `<I: StorageIterator>` 这个参数就能分辨：
 //!
 //! - 直接读数据的（没有参数），和它读的数据放在一起：
-//!   `mem_table::MemTableIterator`、`block::BlockIterator`，
+//!   `mem_table::MemTableIterator`、`block::BlockIterator`、`table::SsTableIterator`，
 //!   以及只在测试里用的 `vec_iterator::VecIterator`。
 //! - 包着别的游标、对它们的结果做加工的（有参数 `I`，就是里面那层的类型）：
-//!   `merge_iterator::MergeIterator<I>`（多个合成一个）、
-//!   `lsm_iterator::LsmIterator<I>`（跳过墓碑）。
+//!   `merge_iterator::MergeIterator<I>`（多个同一种类型的合成一个）、
+//!   `two_merge_iterator::TwoMergeIterator<A, B>`（两个可以不同类型的合成一个）、
+//!   `lsm_iterator::LsmIterator<I>`（跳过墓碑，到上界为止）。
 
 pub mod merge_iterator;
+pub mod two_merge_iterator;
 #[cfg(test)]
 pub mod vec_iterator;
+
+use crate::error::Result;
 
 pub trait StorageIterator {
     /// 当前记录的 key。
@@ -38,5 +42,8 @@ pub trait StorageIterator {
     /// 前进到下一条记录；没有下一条时游标变为无效。
     ///
     /// 只在 `is_valid()` 为真时可以调用。
-    fn next(&mut self);
+    ///
+    /// 读磁盘的游标前进时可能要读下一个块，所以会失败。返回错误之后游标的状态
+    /// 不确定，调用方不能再使用它。
+    fn next(&mut self) -> Result<()>;
 }

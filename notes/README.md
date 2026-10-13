@@ -110,9 +110,9 @@ db/
 | L02 | [memtable 与跳表](02-memtable-and-skiplist.md) | 部分已整理 | 为什么有序与并发、跳表、墓碑的表示、大小估算、数据的归属；冻结与切换、状态快照与两把锁；mini-lsm 与 GreptimeDB 对照 | 第一周第 1 章 |
 | L03 | [迭代器接口与多路归并](03-iterators-and-merge.md) | 部分已整理 | 游标、多路归并与堆、同 key 取新、墓碑的先后、分层；memtable 游标与自引用；归并、去墓碑与引擎扫描的实现；mini-lsm 与 GreptimeDB 对照 | 第一周第 2 章 |
 | L04 | [数据块格式](04-block-format.md) | 部分已整理 | 为什么切成块、块与 SST 和 memtable 的关系、两层索引、与页的对照、大小为何可以不固定、块满与过大的记录、块内定位、格式、LevelDB 的 restart point 对照；构建器、编解码与块上游标的实现、二分的写法；mini-lsm 与 GreptimeDB 对照 | 第一周第 3 章 |
-| L05 | [SST 格式](05-sst-format.md) | 部分已整理 | 文件的组成与索引、构建、落盘的步骤、`pread` 与 mmap、错误类型；打开与读块、游标、block cache 未展开 | 第一周第 4 章 |
-| L06 | [读路径](06-read-path.md) | 未教学 | 两路归并、跨来源的点查与扫描、状态快照 | 第一周第 5 章 |
-| L07 | [写路径](07-write-path.md) | 未教学 | flush 到 L0、触发与后台线程、按 key 范围过滤 | 第一周第 6 章 |
+| L05 | [SST 格式](05-sst-format.md) | 部分已整理 | 文件的组成与索引、构建、落盘的步骤、`pread` 与 mmap、错误类型、打开与读块、按末 key 找块、SST 的游标、对文件内容的检查；block cache 未展开 | 第一周第 4 章 |
+| L06 | [读路径](06-read-path.md) | 部分已整理 | 状态里的 L0、跨来源的点查、两路归并、范围的两端、读放大；状态快照与文件的生命周期未展开 | 第一周第 5 章 |
+| L07 | [写路径](07-write-path.md) | 部分已整理 | flush 做什么、顺序与加锁；触发与后台线程、按 key 范围过滤未展开 | 第一周第 6 章 |
 | L08 | [Bloom filter 与 key 前缀压缩](08-bloom-filter-and-prefix-compression.md) | 未教学 | Bloom filter、前缀压缩、基准对比 | 第一周第 7 章 |
 
 ## compaction 与持久化

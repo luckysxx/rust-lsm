@@ -6,6 +6,7 @@
 use bytes::Bytes;
 
 use super::StorageIterator;
+use crate::error::Result;
 
 pub struct VecIterator {
     /// 全部记录，每一项是（key，value），必须已经按 key 从小到大排好。
@@ -33,10 +34,12 @@ impl VecIterator {
 
 impl StorageIterator for VecIterator {
     fn key(&self) -> &[u8] {
+        assert!(self.is_valid(), "游标无效时不能读取 key");
         &self.records[self.index].0
     }
 
     fn value(&self) -> &[u8] {
+        assert!(self.is_valid(), "游标无效时不能读取 value");
         &self.records[self.index].1
     }
 
@@ -44,8 +47,9 @@ impl StorageIterator for VecIterator {
         self.index < self.records.len()
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<()> {
         self.index += 1;
+        Ok(())
     }
 }
 
@@ -63,7 +67,7 @@ pub fn collect_all(iter: &mut impl StorageIterator) -> Vec<(String, String)> {
         let key = String::from_utf8_lossy(iter.key()).into_owned();
         let value = String::from_utf8_lossy(iter.value()).into_owned();
         collected.push((key, value));
-        iter.next();
+        iter.next().expect("游标前进时出错");
     }
     collected
 }
@@ -103,11 +107,11 @@ mod tests {
     fn next_moves_to_the_following_record() {
         let mut iter = VecIterator::from_strs(&[("a", "1"), ("b", "2"), ("c", "3")]);
 
-        iter.next();
+        iter.next().unwrap();
         assert_eq!(iter.key(), b"b");
         assert_eq!(iter.value(), b"2");
 
-        iter.next();
+        iter.next().unwrap();
         assert_eq!(iter.key(), b"c");
         assert_eq!(iter.value(), b"3");
     }
@@ -118,7 +122,7 @@ mod tests {
         let mut iter = VecIterator::from_strs(&[("a", "1")]);
         assert!(iter.is_valid());
 
-        iter.next();
+        iter.next().unwrap();
 
         assert!(!iter.is_valid());
     }

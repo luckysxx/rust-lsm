@@ -9,3 +9,4 @@ description = "LSM 引擎的基准驱动：固定负载、吞吐、延迟分位�
 [dependencies]
 lsm = { path = "../engine" }
 hdrhistogram = { version = "7.6", default-features = false }
+tempfile = "3.27.0"

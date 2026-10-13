@@ -120,16 +120,22 @@ impl KvTarget for MemTableTarget {
 pub struct EngineTarget {
     storage: LsmStorage,
     memtable_size_limit: usize,
+    /// 引擎所在的临时目录，随被测对象一起清理。
+    _dir: tempfile::TempDir,
 }
 
 impl EngineTarget {
     pub fn new(memtable_size_limit: usize) -> Self {
         let options = LsmStorageOptions {
             memtable_size_limit,
+            block_size: 4096,
         };
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let storage = LsmStorage::open(dir.path(), options).expect("打开引擎失败");
         Self {
-            storage: LsmStorage::open(options),
+            storage,
             memtable_size_limit,
+            _dir: dir,
         }
     }
 }
@@ -144,11 +150,17 @@ impl KvTarget for EngineTarget {
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.storage.get(key).map(|value| value.to_vec())
+        self.storage
+            .get(key)
+            .expect("点查失败")
+            .map(|value| value.to_vec())
     }
 
     fn scan(&self, start: &[u8], limit: usize) -> usize {
-        let mut iter = self.storage.scan(Bound::Included(start), Bound::Unbounded);
+        let mut iter = self
+            .storage
+            .scan(Bound::Included(start), Bound::Unbounded)
+            .expect("建立扫描的游标失败");
         read_up_to(&mut iter, limit)
     }
 
@@ -167,7 +179,7 @@ fn read_up_to(iter: &mut impl StorageIterator, limit: usize) -> usize {
     while count < limit && iter.is_valid() {
         black_box(iter.key().len() + iter.value().len());
         count += 1;
-        iter.next();
+        iter.next().expect("游标前进时出错");
     }
     count
 }

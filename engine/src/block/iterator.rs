@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use super::Block;
+use crate::error::Result;
 use crate::iterators::StorageIterator;
 
 /// 一个块上的游标。墓碑原样给出。
@@ -51,10 +52,12 @@ impl BlockIterator {
 
 impl StorageIterator for BlockIterator {
     fn key(&self) -> &[u8] {
+        assert!(self.is_valid(), "游标无效时不能读取 key");
         self.block.entry(self.index).0
     }
 
     fn value(&self) -> &[u8] {
+        assert!(self.is_valid(), "游标无效时不能读取 value");
         self.block.entry(self.index).1
     }
 
@@ -62,8 +65,9 @@ impl StorageIterator for BlockIterator {
         self.index < self.block.record_count()
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<()> {
         self.index += 1;
+        Ok(())
     }
 }
 
@@ -130,7 +134,7 @@ mod tests {
         let mut iter = BlockIterator::new(block);
         assert!(iter.is_valid());
 
-        iter.next();
+        iter.next().unwrap();
 
         assert!(!iter.is_valid());
     }
@@ -162,7 +166,7 @@ mod tests {
     #[test]
     fn iterator_works_on_a_decoded_block() {
         let block = block_of(&[("a", "1"), ("b", ""), ("cc", "333")]);
-        let decoded = Arc::new(Block::decode(&block.encode()));
+        let decoded = Arc::new(Block::decode(&block.encode()).unwrap());
         let mut iter = BlockIterator::new(decoded);
 
         let collected = collect_all(&mut iter);

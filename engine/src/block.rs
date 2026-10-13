@@ -28,6 +28,8 @@ pub use iterator::BlockIterator;
 
 use bytes::BufMut;
 
+use crate::error::{Error, Result};
+
 /// 块里每个整数（长度、偏移、条数）占的字节数。
 const SIZEOF_U16: usize = 2;
 
@@ -66,10 +68,13 @@ impl Block {
 
     /// 从 `encode` 产生的字节还原出块。
     ///
-    /// 这里信任输入：传入的字节不是 `encode` 产生的（被截断、被改动）时，
-    /// 可能 panic，也可能得到内容不对的块。对坏数据的检查等引擎有了错误类型
-    /// 和校验和之后再加。
-    pub fn decode(encoded: &[u8]) -> Self {
+    /// 传入的字节不符合格式（被截断、被改动）时返回 [`Error::Corruption`]，不会 panic。
+    /// 通过检查的块，之后按下标取记录、在上面建游标都不会越界。
+    /// 只检查结构，不检查 key 是否按顺序排列，也发现不了"格式合法但内容被改过"的
+    /// 情况，后者要靠校验和。
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        check_encoded_block(encoded)?;
+
         // 从尾巴倒着找：最后 2 字节是条数。
         let count_at = encoded.len() - SIZEOF_U16;
         let count = read_u16(encoded, count_at) as usize;
@@ -82,7 +87,7 @@ impl Block {
         }
 
         let data = encoded[0..offsets_start].to_vec();
-        Block { data, offsets }
+        Ok(Block { data, offsets })
     }
 
     /// 第 `index` 条记录的（key，value），从 0 数起。
@@ -105,6 +110,65 @@ impl Block {
         let value = &self.data[value_start..value_end];
         (key, value)
     }
+}
+
+/// 检查一段字节是不是一个结构完整的块；不是的话说明哪里不对。
+///
+/// 检查的内容：读得出条数，条数不为 0；偏移数组没有超出块；每条记录的起点从 0
+/// 开始、严格递增、落在数据区里；每条记录里的两个长度恰好把这条记录占满。
+fn check_encoded_block(encoded: &[u8]) -> Result<()> {
+    if encoded.len() < SIZEOF_U16 {
+        return Err(corrupt_block("长度不足 2 字节，读不出条数"));
+    }
+    let count_at = encoded.len() - SIZEOF_U16;
+    let count = read_u16(encoded, count_at) as usize;
+    if count == 0 {
+        return Err(corrupt_block("条数为 0"));
+    }
+    if count * SIZEOF_U16 > count_at {
+        return Err(corrupt_block("偏移数组超出了块的长度"));
+    }
+    let data_end = count_at - count * SIZEOF_U16;
+
+    for i in 0..count {
+        // 第 i 条记录占 [record_start, record_end)：终点是下一条的起点，最后一条到数据区末尾。
+        let record_start = read_u16(encoded, data_end + i * SIZEOF_U16) as usize;
+        let record_end = if i + 1 < count {
+            read_u16(encoded, data_end + (i + 1) * SIZEOF_U16) as usize
+        } else {
+            data_end
+        };
+        if i == 0 && record_start != 0 {
+            return Err(corrupt_block("第一条记录的起点不是 0"));
+        }
+        if record_start >= record_end || record_end > data_end {
+            return Err(corrupt_block("记录的起点没有递增，或者超出了数据区"));
+        }
+
+        // 记录里依次是：key 长度、key、value 长度、value，合起来要恰好等于记录的长度。
+        let record_len = record_end - record_start;
+        if record_len < SIZEOF_U16 * 2 {
+            return Err(corrupt_block("记录太短，放不下两个长度字段"));
+        }
+        let key_len = read_u16(encoded, record_start) as usize;
+        if key_len == 0 {
+            return Err(corrupt_block("key 的长度为 0"));
+        }
+        let value_len_at = record_start + SIZEOF_U16 + key_len;
+        if value_len_at + SIZEOF_U16 > record_end {
+            return Err(corrupt_block("key 的长度超出了记录"));
+        }
+        let value_len = read_u16(encoded, value_len_at) as usize;
+        if value_len_at + SIZEOF_U16 + value_len != record_end {
+            return Err(corrupt_block("value 的长度与记录的范围对不上"));
+        }
+    }
+    Ok(())
+}
+
+/// 造一个"数据块损坏"的错误。
+fn corrupt_block(message: &str) -> Error {
+    Error::Corruption(format!("数据块：{message}"))
 }
 
 /// 读出 `bytes[at]` 与 `bytes[at + 1]` 这 2 个字节表示的整数（大端：高位字节在前）。
@@ -177,7 +241,7 @@ mod tests {
             0, 2,
         ];
 
-        let block = Block::decode(&encoded);
+        let block = Block::decode(&encoded).unwrap();
 
         assert_eq!(block.record_count(), 2);
         assert_eq!(block.offsets, vec![0, 6]);
@@ -189,7 +253,7 @@ mod tests {
     fn decode_is_the_inverse_of_encode() {
         let block = block_of(&[("a", "1"), ("b", ""), ("cc", "333"), ("dddd", "4")]);
 
-        let decoded = Block::decode(&block.encode());
+        let decoded = Block::decode(&block.encode()).unwrap();
 
         assert_eq!(decoded.data, block.data);
         assert_eq!(decoded.offsets, block.offsets);
@@ -200,7 +264,7 @@ mod tests {
     fn decode_handles_a_single_record() {
         let block = block_of(&[("only", "one")]);
 
-        let decoded = Block::decode(&block.encode());
+        let decoded = Block::decode(&block.encode()).unwrap();
 
         assert_eq!(decoded.record_count(), 1);
         assert_eq!(decoded.data, block.data);
@@ -214,7 +278,7 @@ mod tests {
         let block = block_of(&[("a", long_value.as_str()), ("b", "2"), ("c", "3")]);
         assert_eq!(block.offsets, vec![0, 305, 311]);
 
-        let decoded = Block::decode(&block.encode());
+        let decoded = Block::decode(&block.encode()).unwrap();
 
         assert_eq!(decoded.offsets, vec![0, 305, 311]);
         assert_eq!(decoded.data, block.data);
@@ -226,11 +290,148 @@ mod tests {
         let block = block_of(&[("a", "1"), ("b", "2")]);
         let mut encoded = block.encode();
 
-        let decoded = Block::decode(&encoded);
+        let decoded = Block::decode(&encoded).unwrap();
         encoded.fill(0xff);
 
         assert_eq!(decoded.data, block.data);
         assert_eq!(decoded.offsets, block.offsets);
+    }
+
+    // ---------- 解码坏数据 ----------
+
+    /// 一个合法的块编码后的字节：两条记录 "a" → "1"、"bb" → ""。
+    fn valid_bytes() -> Vec<u8> {
+        #[rustfmt::skip]
+        let bytes: Vec<u8> = vec![
+            0, 1, b'a', 0, 1, b'1',
+            0, 2, b'b', b'b', 0, 0,
+            0, 0, 0, 6,
+            0, 2,
+        ];
+        bytes
+    }
+
+    /// 解码应当失败，并且失败的原因是"内容损坏"。
+    fn assert_corruption(encoded: &[u8]) {
+        match Block::decode(encoded) {
+            Err(Error::Corruption(_)) => {}
+            Err(other) => panic!("应当是 Corruption，实际是 {other:?}"),
+            Ok(_) => panic!("这段字节不应该解码成功：{encoded:?}"),
+        }
+    }
+
+    // 上面那段字节本身是合法的，后面的测试都是在它上面改一处。
+    #[test]
+    fn decode_accepts_the_valid_sample() {
+        let block = Block::decode(&valid_bytes()).unwrap();
+
+        assert_eq!(block.record_count(), 2);
+        assert_eq!(block.entry(1), (&b"bb"[..], &b""[..]));
+    }
+
+    // 空的输入、只有 1 个字节的输入：连条数都读不出来。
+    #[test]
+    fn decode_rejects_input_too_short_for_the_count() {
+        assert_corruption(&[]);
+        assert_corruption(&[0]);
+    }
+
+    // 条数为 0：块里至少要有一条记录。
+    #[test]
+    fn decode_rejects_zero_count() {
+        assert_corruption(&[0, 0]);
+    }
+
+    // 条数比实际的大：偏移数组会超出块的开头。
+    #[test]
+    fn decode_rejects_count_larger_than_the_block() {
+        let mut bytes = valid_bytes();
+        let len = bytes.len();
+        bytes[len - 2] = 0xff;
+        bytes[len - 1] = 0xff;
+
+        assert_corruption(&bytes);
+    }
+
+    // 文件被截断：末尾少了几个字节，读到的"条数"其实是别的内容。
+    #[test]
+    fn decode_rejects_truncated_block() {
+        let bytes = valid_bytes();
+
+        for cut in 1..bytes.len() {
+            let truncated = &bytes[..bytes.len() - cut];
+            assert!(
+                Block::decode(truncated).is_err(),
+                "截掉末尾 {cut} 个字节之后不应该解码成功"
+            );
+        }
+    }
+
+    // 第一条记录的起点不是 0。
+    #[test]
+    fn decode_rejects_first_offset_not_zero() {
+        let mut bytes = valid_bytes();
+        bytes[13] = 1;
+
+        assert_corruption(&bytes);
+    }
+
+    // 第二条记录的起点指到了数据区外面，或者没有比第一条大。
+    #[test]
+    fn decode_rejects_offset_out_of_order_or_out_of_range() {
+        let mut beyond_data = valid_bytes();
+        beyond_data[15] = 200;
+        assert_corruption(&beyond_data);
+
+        let mut not_increasing = valid_bytes();
+        not_increasing[15] = 0;
+        assert_corruption(&not_increasing);
+    }
+
+    // 记录里的 key 长度或 value 长度被改大、改小，都与记录的范围对不上。
+    #[test]
+    fn decode_rejects_lengths_that_do_not_fill_the_record() {
+        let mut key_too_long = valid_bytes();
+        key_too_long[1] = 9;
+        assert_corruption(&key_too_long);
+
+        let mut key_empty = valid_bytes();
+        key_empty[1] = 0;
+        assert_corruption(&key_empty);
+
+        let mut value_too_long = valid_bytes();
+        value_too_long[4] = 2;
+        assert_corruption(&value_too_long);
+
+        let mut value_too_short = valid_bytes();
+        value_too_short[4] = 0;
+        assert_corruption(&value_too_short);
+    }
+
+    // 把合法的字节里任意一个字节改成任意值，解码要么成功、要么返回错误，不会 panic；
+    // 解码成功的块，每条记录都能取出来而不越界。
+    #[test]
+    fn decode_never_panics_on_single_byte_changes() {
+        let original = valid_bytes();
+
+        for position in 0..original.len() {
+            for new_value in [0u8, 1, 2, 7, 0x7f, 0xff] {
+                let mut bytes = original.clone();
+                bytes[position] = new_value;
+
+                if let Ok(block) = Block::decode(&bytes) {
+                    for index in 0..block.record_count() {
+                        let (key, value) = block.entry(index);
+                        black_box_len(key, value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 用一下取出来的两段字节，确认它们确实可以访问。
+    fn black_box_len(key: &[u8], value: &[u8]) -> usize {
+        key.len() + value.len()
     }
 
     // ---------- 按下标取记录 ----------
@@ -284,7 +485,7 @@ mod tests {
     fn entry_works_on_a_decoded_block() {
         let block = block_of(&[("a", "1"), ("b", ""), ("cc", "333")]);
 
-        let decoded = Block::decode(&block.encode());
+        let decoded = Block::decode(&block.encode()).unwrap();
 
         assert_eq!(decoded.entry(0), (&b"a"[..], &b"1"[..]));
         assert_eq!(decoded.entry(1), (&b"b"[..], &b""[..]));

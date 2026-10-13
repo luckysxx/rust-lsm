@@ -43,6 +43,13 @@ impl SsTableBuilder {
 
     /// 加入一条记录。value 为空表示墓碑，照常加入。
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
+        // 调用方保证 key 严格递增。调试编译下检查一下：喂数据的循环忘了让游标前进时，
+        // 这里会立刻报错，而不是把同一条记录无休止地加进来。
+        debug_assert!(
+            self.is_after_last_key(key),
+            "加入 SST 的 key 没有比上一条大：记录没有按顺序加入，或者同一条加了两次"
+        );
+
         // 先让这条记录进到某个块里：当前的块放不下，就封口，换一个新的块再加。
         if !self.builder.add(key, value) {
             self.finish_block();
@@ -57,6 +64,19 @@ impl SsTableBuilder {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
+    }
+
+    /// `key` 是否比已经加入的最后一条记录的 key 大。还没有加入过记录时为真。
+    fn is_after_last_key(&self, key: &[u8]) -> bool {
+        // 正在装的块里有记录：和它的末 key 比。
+        if !self.last_key.is_empty() {
+            return key > &self.last_key[..];
+        }
+        // 正在装的块是空的：和上一个封口的块的末 key 比。
+        match self.block_meta.last() {
+            Some(meta) => key > &meta.last_key[..],
+            None => true,
+        }
     }
 
     /// 把正在装的块封口：编码后接到 `data` 后面，在索引里记一项，换上一个新的空块。
@@ -97,9 +117,9 @@ impl SsTableBuilder {
 
         // 数据块之后是索引，然后是索引的起点，最后是魔数。
         // 索引的起点要在接上索引之前取。
-        let block_meta_offset = self.data.len();
+        let block_meta_start = self.data.len();
         encode_block_meta(&self.block_meta, &mut self.data);
-        self.data.put_u32(block_meta_offset as u32);
+        self.data.put_u32(block_meta_start as u32);
         self.data.put_u32(SST_MAGIC);
 
         let file = FileObject::create(path, &self.data)?;
@@ -110,7 +130,7 @@ impl SsTableBuilder {
             id,
             file,
             block_meta: self.block_meta,
-            block_meta_offset,
+            block_meta_start,
             first_key,
             last_key,
         })
@@ -145,9 +165,9 @@ mod tests {
         for (i, meta) in block_meta.iter().enumerate() {
             let block_end = match block_meta.get(i + 1) {
                 Some(next) => next.offset,
-                None => sst.block_meta_offset(),
+                None => sst.block_meta_start(),
             };
-            let block = Block::decode(&bytes[meta.offset..block_end]);
+            let block = Block::decode(&bytes[meta.offset..block_end]).unwrap();
             let mut iter = BlockIterator::new(Arc::new(block));
             records.extend(collect_all(&mut iter));
         }
@@ -258,7 +278,7 @@ mod tests {
         // 三条记录的块是 26 字节，一条记录的块是 10 字节。
         let offsets: Vec<usize> = sst.block_meta().iter().map(|meta| meta.offset).collect();
         assert_eq!(offsets, vec![0, 26, 52]);
-        assert_eq!(sst.block_meta_offset(), 62);
+        assert_eq!(sst.block_meta_start(), 62);
     }
 
     // 放不下而换块的那条记录没有丢：它是新块的第一条。
@@ -336,10 +356,10 @@ mod tests {
         let len = bytes.len();
         assert_eq!(&bytes[len - 4..], b"LSM1");
         let meta_offset = u32::from_be_bytes(bytes[len - 8..len - 4].try_into().unwrap());
-        assert_eq!(meta_offset as usize, sst.block_meta_offset());
+        assert_eq!(meta_offset as usize, sst.block_meta_start());
         // 索引紧跟在数据块后面，开头是块数。
         let block_count = u32::from_be_bytes(
-            bytes[sst.block_meta_offset()..sst.block_meta_offset() + 4]
+            bytes[sst.block_meta_start()..sst.block_meta_start() + 4]
                 .try_into()
                 .unwrap(),
         );

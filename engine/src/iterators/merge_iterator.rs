@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::StorageIterator;
+use crate::error::Result;
 
 /// 堆里的一项：一个来源的游标，加上这个来源的新旧序号。
 struct HeapItem<I: StorageIterator> {
@@ -80,7 +81,7 @@ impl<I: StorageIterator> StorageIterator for MergeIterator<I> {
         !self.heap.is_empty()
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<()> {
         // 当前这条记录的 key。接下来要改动堆，所以先复制一份留着比较。
         let current_key = self.key().to_vec();
 
@@ -92,12 +93,21 @@ impl<I: StorageIterator> StorageIterator for MergeIterator<I> {
 
             // 取出、前进、放回：前进后 key 变了，放回时堆会给它重新排位置。
             // 走到头的来源不放回，堆里只留有效的游标。
+            // 来源前进时出错：带着错误返回。这个来源已经从堆里取出，不再放回，
+            // 归并游标此后不能再使用。
             let mut item = self.heap.pop().unwrap();
-            item.iter.next();
+            item.iter.next()?;
             if item.iter.is_valid() {
+                // 每个来源自己是严格有序的，前进之后 key 一定变大。不成立的话这个循环
+                // 永远不会结束，所以在调试编译下检查，把"卡死"变成一句看得懂的报错。
+                debug_assert!(
+                    item.iter.key() > current_key.as_slice(),
+                    "来源前进之后 key 没有变大：来源不是严格有序的，或者它的 next 没有前进"
+                );
                 self.heap.push(item);
             }
         }
+        Ok(())
     }
 }
 

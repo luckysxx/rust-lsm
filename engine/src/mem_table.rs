@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
+use crate::error::Result;
 use crate::iterators::StorageIterator;
 
 #[derive(Default)]
@@ -109,17 +110,18 @@ impl StorageIterator for MemTableIterator {
         self.current.is_some()
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<()> {
         // 不保存位置：在表里重新查找比当前 key 大、且不越过上界的第一条。
         // 找不到时得到 None，游标随之变为无效。
         self.current = self
             .table
             .first_in_range(Bound::Excluded(self.key()), bound_as_slice(&self.upper));
+        Ok(())
     }
 }
 
 /// 把借来的边界复制成自己拥有的，好存进游标里。
-fn bound_to_owned(bound: Bound<&[u8]>) -> Bound<Bytes> {
+pub(crate) fn bound_to_owned(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
         Bound::Included(key) => Bound::Included(Bytes::copy_from_slice(key)),
         Bound::Excluded(key) => Bound::Excluded(Bytes::copy_from_slice(key)),
@@ -385,7 +387,7 @@ mod tests {
         let table = table_with(&[("b", "2"), ("d", "4")]);
         let mut iter =
             MemTableIterator::new(Arc::clone(&table), Bound::Unbounded, Bound::Unbounded);
-        iter.next();
+        iter.next().unwrap();
         assert_eq!(iter.key(), b"d");
 
         table.put(b"a", b"1");
