@@ -5,8 +5,9 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
+use lsm::db::Db;
 use lsm::iterators::StorageIterator;
-use lsm::lsm_storage::{LsmStorage, LsmStorageOptions};
+use lsm::lsm_storage::LsmStorageOptions;
 use lsm::mem_table::{MemTable, MemTableIterator};
 use lsm::stats::StatsSnapshot;
 
@@ -113,12 +114,13 @@ impl KvTarget for MemTableTarget {
     }
 }
 
-/// 引擎层：一张可写的 memtable 加若干张冻结的，写满即冻结；没有 WAL、没有文件。
+/// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；没有 WAL。
 ///
-/// 冻结的表目前不会被写成 SST，只会越积越多，点查与扫描都要逐张去看。
-/// 与 `MemTableTarget` 相比，差别是多了状态快照、冻结，以及跨多张表的查找与归并。
+/// 目前没有 compaction，L0 的文件只增不减，点查与扫描要逐个去看。
+/// 写入太快时冻结的表会在内存里排队，还没有让写入等一等的机制。
+/// 与 `MemTableTarget` 相比，差别是多了状态快照、冻结、落盘，以及跨表和文件的查找与归并。
 pub struct EngineTarget {
-    storage: LsmStorage,
+    db: Db,
     memtable_size_limit: usize,
     /// 引擎所在的临时目录，随被测对象一起清理。
     _dir: tempfile::TempDir,
@@ -131,9 +133,9 @@ impl EngineTarget {
             block_size: 4096,
         };
         let dir = tempfile::tempdir().expect("创建临时目录失败");
-        let storage = LsmStorage::open(dir.path(), options).expect("打开引擎失败");
+        let db = Db::open(dir.path(), options).expect("打开引擎失败");
         Self {
-            storage,
+            db,
             memtable_size_limit,
             _dir: dir,
         }
@@ -146,11 +148,11 @@ impl KvTarget for EngineTarget {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
-        self.storage.put(key, value);
+        self.db.put(key, value);
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.storage
+        self.db
             .get(key)
             .expect("点查失败")
             .map(|value| value.to_vec())
@@ -158,7 +160,7 @@ impl KvTarget for EngineTarget {
 
     fn scan(&self, start: &[u8], limit: usize) -> usize {
         let mut iter = self
-            .storage
+            .db
             .scan(Bound::Included(start), Bound::Unbounded)
             .expect("建立扫描的游标失败");
         read_up_to(&mut iter, limit)
@@ -166,9 +168,10 @@ impl KvTarget for EngineTarget {
 
     fn details(&self) -> Option<String> {
         let megabytes = self.memtable_size_limit / (1024 * 1024);
-        let frozen = self.storage.imm_memtable_count();
+        let frozen = self.db.imm_memtable_count();
+        let l0_files = self.db.l0_sstable_count();
         Some(format!(
-            "memtable 上限 {megabytes} MB；结束时有 {frozen} 张冻结的 memtable（不落盘，只增不减）"
+            "memtable 上限 {megabytes} MB；结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST"
         ))
     }
 }

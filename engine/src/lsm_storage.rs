@@ -3,7 +3,9 @@
 //! 同一时刻有一张可写的 memtable、若干张冻结的 memtable 和若干个 L0 的 SST。
 //! 写入只进可写的那张表；它写满后被冻结，换上一张新的。读取从新到旧依次查找：
 //! 可写的表、冻结的表、L0 的 SST。
-//! 冻结的表由 flush 写成 SST：目前要调用方自己触发，还没有后台线程。
+//! 冻结的表由 flush 写成 SST。
+//!
+//! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
 use std::fs::File;
 use std::ops::Bound;
@@ -193,23 +195,25 @@ impl LsmStorage {
     }
 
     /// 写入一条记录。key 与 value 都不能为空：空 value 留给墓碑使用。
-    pub fn put(&self, key: &[u8], value: &[u8]) {
+    ///
+    /// 返回这次写入有没有冻结一张表。冻结了，就有一张表等着 flush。
+    pub fn put(&self, key: &[u8], value: &[u8]) -> bool {
         assert!(!key.is_empty(), "key 不能为空");
         assert!(!value.is_empty(), "value 不能为空，空 value 表示删除");
-        self.write(key, value);
+        self.write(key, value)
     }
 
-    /// 删除一个 key：写入一条墓碑。
-    pub fn delete(&self, key: &[u8]) {
+    /// 删除一个 key：写入一条墓碑。返回值与 `put` 的含义相同。
+    pub fn delete(&self, key: &[u8]) -> bool {
         assert!(!key.is_empty(), "key 不能为空");
-        self.write(key, b"");
+        self.write(key, b"")
     }
 
     /// `put` 与 `delete` 共用的写入步骤。
     ///
     /// 写入期间持有 `state` 的读锁：冻结要拿写锁，所以不会有表在写入途中被冻结。
     /// 表本身允许多个线程同时写入，读锁也不会让写入之间互相等待。
-    fn write(&self, key: &[u8], value: &[u8]) {
+    fn write(&self, key: &[u8], value: &[u8]) -> bool {
         let size_after_write;
         {
             let guard = self.state.read().unwrap();
@@ -217,24 +221,43 @@ impl LsmStorage {
             size_after_write = guard.memtable.approximate_size();
         }
         // 读锁已经放开：冻结要拿写锁，持着读锁去冻结会等自己，造成死锁。
-        self.try_freeze(size_after_write);
+        self.try_freeze(size_after_write)
     }
 
-    /// 可写的表到了上限就冻结它。
+    /// 可写的表到了上限就冻结它。返回这一次有没有冻结。
     ///
     /// 先在锁外用写入时看到的大小快速判断；到了上限再拿 `state_lock` 排队。
     /// 排队期间别的线程可能已经冻结过了，所以拿到锁之后要重新检查当前的表。
-    fn try_freeze(&self, size_after_write: usize) {
+    fn try_freeze(&self, size_after_write: usize) -> bool {
         let limit = self.options.memtable_size_limit;
         if size_after_write < limit {
-            return;
+            return false;
         }
 
         let state_lock = self.state_lock.lock().unwrap();
         let current_size = self.snapshot().memtable.approximate_size();
-        if current_size >= limit {
-            self.force_freeze_memtable(&state_lock);
+        if current_size < limit {
+            return false;
         }
+        self.force_freeze_memtable(&state_lock);
+        true
+    }
+
+    /// 不管可写的表有多大，现在就冻结它。表是空的也照样冻结：flush 遇到空表会直接丢掉。
+    pub fn freeze_memtable(&self) {
+        let state_lock = self.state_lock.lock().unwrap();
+        self.force_freeze_memtable(&state_lock);
+    }
+
+    /// 把冻结的 memtable 一张一张写成 SST，直到一张不剩。
+    ///
+    /// 中途有一张写失败就停下并返回错误，那张表和它之后的表都留在冻结列表里。
+    pub fn flush_all_imm_memtables(&self) -> Result<()> {
+        // 每一圈都重新看列表：写文件的这段时间里可能又有表被冻结。
+        while self.imm_memtable_count() > 0 {
+            self.force_flush_next_imm_memtable()?;
+        }
+        Ok(())
     }
 
     /// 把最旧的一张冻结的 memtable 写成 SST，放进 L0。没有冻结的表时什么都不做。
@@ -352,6 +375,7 @@ fn visible_value(value: Bytes) -> Option<Bytes> {
 mod tests {
     use super::*;
     use crate::iterators::vec_iterator::{collect_all, expected};
+    use crate::test_util::run_with_deadline;
     use std::collections::BTreeMap;
     use std::thread;
 
@@ -412,8 +436,7 @@ mod tests {
     }
 
     fn freeze(storage: &LsmStorage) {
-        let state_lock = storage.state_lock.lock().unwrap();
-        storage.force_freeze_memtable(&state_lock);
+        storage.freeze_memtable();
     }
 
     // ---------- 写入、删除与读取 ----------
@@ -1490,5 +1513,105 @@ mod tests {
             }
         }
         assert_eq!(scan_all(&storage).len(), writers * puts_per_writer);
+    }
+
+    // ---------- 写路径：冻结的通知与 flush 到一张不剩 ----------
+
+    /// 调用 `flush_all_imm_memtables`，设了时限：循环停不下来时测试失败而不是卡死。
+    fn flush_all_with_deadline(storage: &Arc<TestStorage>) -> Result<()> {
+        let storage = Arc::clone(storage);
+        run_with_deadline("flush_all_imm_memtables ", move || {
+            storage.flush_all_imm_memtables()
+        })
+    }
+
+    // 写入的返回值：这一次写入让表到了上限并被冻结时为真，其余时候为假。
+    #[test]
+    fn write_reports_whether_it_froze_a_memtable() {
+        let storage = open_with_limit(40);
+
+        let first = storage.put(b"key-1", b"0123456789");
+        assert!(!first);
+        assert_eq!(storage.imm_memtable_count(), 0);
+
+        // 一直写到发生冻结为止：只有那一次返回真。
+        let mut froze_count = 0;
+        for i in 2..10 {
+            let froze = storage.put(format!("key-{i}").as_bytes(), b"0123456789");
+            if froze {
+                froze_count += 1;
+            }
+            assert_eq!(storage.imm_memtable_count(), froze_count);
+        }
+        assert!(froze_count >= 1);
+
+        // 删除写入的是墓碑，同样会让表变大、被冻结。
+        let frozen_before = storage.imm_memtable_count();
+        let mut froze_by_delete = false;
+        for i in 0..40 {
+            froze_by_delete |= storage.delete(format!("gone-{i:02}").as_bytes());
+        }
+        assert!(froze_by_delete);
+        assert!(storage.imm_memtable_count() > frozen_before);
+    }
+
+    // 立即冻结：不管表有多大，原来的表进冻结列表，换上一张空表。
+    #[test]
+    fn freeze_memtable_freezes_regardless_of_size() {
+        let storage = open_without_auto_freeze();
+        storage.put(b"a", b"1");
+
+        storage.freeze_memtable();
+        storage.freeze_memtable();
+
+        assert_eq!(storage.imm_memtable_count(), 2);
+        assert_eq!(storage.snapshot().memtable.approximate_size(), 0);
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+    }
+
+    // flush 到一张不剩：冻结了几张表，一次调用全部写成 SST。
+    #[test]
+    fn flush_all_leaves_no_frozen_memtable() {
+        let storage = Arc::new(open_without_auto_freeze());
+        put_and_freeze(&storage, &[("a", "1")]);
+        put_and_freeze(&storage, &[("b", "2")]);
+        put_and_freeze(&storage, &[("c", "3")]);
+
+        flush_all_with_deadline(&storage).unwrap();
+
+        assert_eq!(storage.imm_memtable_count(), 0);
+        assert_eq!(storage.l0_sstable_count(), 3);
+        assert_eq!(
+            scan_all(&storage),
+            expected(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    // 没有冻结的表：什么都不做，直接成功。
+    #[test]
+    fn flush_all_without_frozen_memtable_does_nothing() {
+        let storage = Arc::new(open_without_auto_freeze());
+        storage.put(b"a", b"1");
+
+        flush_all_with_deadline(&storage).unwrap();
+
+        assert_eq!(storage.l0_sstable_count(), 0);
+        assert!(storage.sst_file_names().is_empty());
+    }
+
+    // 中途写失败（目录被删掉了）：停下并返回错误，没写成的表都还在。
+    #[test]
+    fn flush_all_stops_at_the_first_error() {
+        let storage = Arc::new(open_without_auto_freeze());
+        put_and_freeze(&storage, &[("a", "1")]);
+        put_and_freeze(&storage, &[("b", "2")]);
+        std::fs::remove_dir_all(storage.dir()).unwrap();
+
+        let result = flush_all_with_deadline(&storage);
+
+        assert!(matches!(result, Err(crate::error::Error::Io(_))));
+        assert_eq!(storage.imm_memtable_count(), 2);
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
     }
 }
