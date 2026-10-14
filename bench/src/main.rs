@@ -18,14 +18,16 @@ const USAGE: &str = "\
   --num N            key 的个数，也是每种负载的操作次数（默认 1000000）
   --value-size N     value 的字节数（默认 100）
   --seed N           随机种子（默认 1）
-  --workloads A,B,C  按顺序执行的负载（默认五种全部执行）
+  --workloads A,B,C  按顺序执行的负载（默认 fillseq 以外的五种）
   --target NAME      被测对象（默认 btreemap）
   --threads N        同时发起操作的线程数（默认 1）
   --scan-length N    范围扫描每次读的记录数（默认 100）
   --memtable-mb N    被测对象为 engine 时，memtable 的上限，单位 MB（默认 64）
+  --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
   --help             显示本说明
 
-负载：fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）。
+负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）。
+每段负载计时结束后，等引擎把冻结的表全部写成文件，再开始下一段；等待的时间单独列出，不计入吞吐。
 被测对象：btreemap（互斥锁加 BTreeMap）、memtable（引擎的单张 memtable）、engine（引擎层）。
 读负载读的是前面的写负载留下的数据，所以要把 fillrandom 排在前面。";
 
@@ -34,6 +36,7 @@ struct Args {
     workloads: Vec<Workload>,
     target: String,
     memtable_megabytes: usize,
+    block_cache_megabytes: usize,
 }
 
 fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
@@ -44,9 +47,10 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         threads: 1,
         scan_length: 100,
     };
-    let mut workloads = Workload::ALL.to_vec();
+    let mut workloads = Workload::DEFAULT.to_vec();
     let mut target = "btreemap".to_string();
     let mut memtable_megabytes = 64;
+    let mut block_cache_megabytes = 64;
 
     let mut index = 0;
     while index < raw.len() {
@@ -67,6 +71,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--threads" => config.threads = parse_number(flag, value)? as usize,
             "--scan-length" => config.scan_length = parse_number(flag, value)? as usize,
             "--memtable-mb" => memtable_megabytes = parse_number(flag, value)? as usize,
+            "--block-cache-mb" => block_cache_megabytes = parse_number(flag, value)? as usize,
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -95,6 +100,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         workloads,
         target,
         memtable_megabytes,
+        block_cache_megabytes,
     }))
 }
 
@@ -128,8 +134,9 @@ fn main() -> ExitCode {
     };
 
     let memtable_size_limit = args.memtable_megabytes * 1024 * 1024;
-    let target =
-        create_target(&args.target, memtable_size_limit).expect("名字在解析参数时已经检查过");
+    let block_cache_size = args.block_cache_megabytes * 1024 * 1024;
+    let target = create_target(&args.target, memtable_size_limit, block_cache_size)
+        .expect("名字在解析参数时已经检查过");
 
     let mut results = Vec::new();
     for workload in &args.workloads {
@@ -162,7 +169,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("- 被测对象说明：{details}");
     }
     println!(
-        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --workloads {}`",
         args.target,
         config.threads,
         config.num,
@@ -170,6 +177,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         config.seed,
         config.scan_length,
         args.memtable_megabytes,
+        args.block_cache_megabytes,
         workload_names.join(",")
     );
     println!(
@@ -188,13 +196,13 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     println!("## 吞吐与延迟");
     println!();
     println!(
-        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到或读到的记录 |"
+        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到或读到的记录 | 之后等落盘 (s) |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for result in results {
         let latency = &result.latency_nanos;
         println!(
-            "| {} | {} | {:.3} | {:.0} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |",
+            "| {} | {} | {:.3} | {:.0} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {:.3} |",
             result.workload.name(),
             result.ops,
             result.elapsed.as_secs_f64(),
@@ -205,6 +213,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
             micros(latency.value_at_quantile(0.999)),
             micros(latency.max()),
             result.found,
+            result.drain.as_secs_f64(),
         );
     }
     println!();
@@ -274,8 +283,9 @@ mod tests {
         assert_eq!(args.config.threads, 1);
         assert_eq!(args.config.scan_length, 100);
         assert_eq!(args.memtable_megabytes, 64);
+        assert_eq!(args.block_cache_megabytes, 64);
         assert_eq!(args.target, "btreemap");
-        assert_eq!(args.workloads, Workload::ALL.to_vec());
+        assert_eq!(args.workloads, Workload::DEFAULT.to_vec());
     }
 
     // 命令行选项能覆盖各个默认值。
@@ -298,6 +308,8 @@ mod tests {
             "10",
             "--memtable-mb",
             "8",
+            "--block-cache-mb",
+            "0",
         ]);
         let args = parse_args(&raw).unwrap().unwrap();
 
@@ -307,6 +319,7 @@ mod tests {
         assert_eq!(args.config.threads, 4);
         assert_eq!(args.config.scan_length, 10);
         assert_eq!(args.memtable_megabytes, 8);
+        assert_eq!(args.block_cache_megabytes, 0);
         assert_eq!(args.target, "memtable");
         assert_eq!(
             args.workloads,

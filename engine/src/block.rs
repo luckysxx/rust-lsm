@@ -56,6 +56,13 @@ impl Block {
         self.offsets.len()
     }
 
+    /// 块在内存里大约占多少字节：数据区加偏移数组。块缓存用它计算容量。
+    ///
+    /// 不含两个 `Vec` 自身的字段和内存分配器的额外开销，所以是一个估计。
+    pub fn memory_size(&self) -> usize {
+        self.data.len() + self.offsets.len() * SIZEOF_U16
+    }
+
     /// 编码成字节：数据区，接着是偏移数组，最后是条数。
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = self.data.clone();
@@ -478,6 +485,14 @@ mod tests {
 
         assert_eq!(block.entry(0), (&[0x00, 0x01][..], &[0xff, 0x00, 0xff][..]));
         assert_eq!(block.entry(1), (&[0xff][..], &[0x00][..]));
+    }
+
+    // 内存里的大小是数据区的字节数，加上每条记录 2 字节的偏移。
+    #[test]
+    fn memory_size_counts_data_and_offsets() {
+        let block = block_of(&[("a", "1"), ("bb", "22"), ("ccc", "333")]);
+
+        assert_eq!(block.memory_size(), block.data.len() + 3 * 2);
     }
 
     // 解码出来的块与原来的块一样可以按下标取记录。

@@ -16,6 +16,7 @@
 //! 块的长度不记：它等于下一个块的起点减自己的起点，最后一个块用索引的起点来减。
 //!
 //! 打开文件时只把索引读进内存，数据块留在磁盘上，用到哪个读哪个。
+//! 读出来的块可以放进整个引擎共用的块缓存，下次直接从缓存里拿。
 
 mod builder;
 mod iterator;
@@ -25,6 +26,7 @@ pub use iterator::SsTableIterator;
 
 use std::fs::File;
 use std::io::Write;
+use std::ops::Bound;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +35,28 @@ use bytes::{BufMut, Bytes};
 
 use crate::block::Block;
 use crate::error::{Error, Result};
+use crate::stats::Stats;
+
+/// 块缓存：从 `(SST 编号, 块下标)` 找到解码好的块。整个引擎共用一个。
+///
+/// SST 写完不再修改，编号也不重复使用，所以缓存里的块永远不会过期，不需要失效。
+/// 多个线程可以同时读写；克隆它得到的是同一个缓存。
+pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
+
+/// 新建一个块缓存，最多放 `capacity_bytes` 字节的块。
+///
+/// 每个块按 [`Block::memory_size`] 计入容量。超过容量时由缓存自己挑出不常用的块淘汰，
+/// 淘汰稍有延迟，总量可能短暂超出。
+pub fn new_block_cache(capacity_bytes: u64) -> BlockCache {
+    BlockCache::builder()
+        // 告诉缓存每个块"有多重"。容量是这些重量的总和上限，不是块的个数。
+        .weigher(|_key, block: &Arc<Block>| {
+            // 重量的类型是 u32。一个块不会接近 4 GB，超出时按最大值算。
+            u32::try_from(block.memory_size()).unwrap_or(u32::MAX)
+        })
+        .max_capacity(capacity_bytes)
+        .build()
+}
 
 /// 文件最后 4 个字节的魔数，用来确认这是引擎写的 SST。四个字节是 ASCII 的 "LSM1"。
 pub const SST_MAGIC: u32 = 0x4C53_4D31;
@@ -212,13 +236,18 @@ pub struct SsTable {
     first_key: Bytes,
     /// 整个文件里最大的 key。
     last_key: Bytes,
+    /// 读块时先查的缓存。`None` 表示不用缓存，每次都从文件读。
+    block_cache: Option<Arc<BlockCache>>,
+    /// 从文件读出一个块，就在这里记一次。`None` 表示不记。
+    stats: Option<Arc<Stats>>,
 }
 
 impl SsTable {
     /// 打开一个已有的 SST 文件：从尾部读回索引，数据块留在磁盘上。
     ///
+    /// 读块时先查 `block_cache`；给 `None` 就不用缓存。
     /// 文件不符合格式时返回 [`Error::Corruption`]，读文件失败时返回 [`Error::Io`]。
-    pub fn open(id: usize, file: FileObject) -> Result<Self> {
+    pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // 从文件的尾巴倒着找。末尾固定的 8 个字节：索引的起点、魔数。
         // 先确认文件够长，再做减法：无符号数相减不能得到负数。
         let file_size = file.size();
@@ -252,13 +281,42 @@ impl SsTable {
             block_meta_start,
             first_key,
             last_key,
+            block_cache,
+            stats: None,
         })
     }
 
-    /// 从文件里读出第 `block_index` 个数据块并解码。
+    /// 让这个 SST 把"从文件读出了几个块"记进 `stats`。引擎在打开或写出 SST 之后调用。
+    pub fn with_stats(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// 第 `block_index` 个数据块：缓存里有就直接拿，没有就从文件读出、解码，再放进缓存。
+    /// 没有缓存时每次都从文件读。
+    ///
+    /// `block_index` 必须小于 `block_count()`。读文件失败或块的内容损坏时返回错误，
+    /// 这时缓存里不放任何东西。
+    pub fn read_block(&self, block_index: usize) -> Result<Arc<Block>> {
+        if let Some(cache) = &self.block_cache {
+            // 只用块下标不够：每个文件都有第 0 块。
+            let key = (self.id, block_index);
+            if let Some(block) = cache.get(&key) {
+                return Ok(block);
+            }
+            // 两个线程同时没命中同一个块时，两边都会读一遍文件、各放一次。
+            // 块的内容一样，后放的覆盖先放的，结果仍然正确，只是多读了一次。
+            let block = self.read_block_from_file(block_index)?;
+            cache.insert(key, Arc::clone(&block));
+            return Ok(block);
+        }
+        self.read_block_from_file(block_index)
+    }
+
+    /// 从文件里读出第 `block_index` 个数据块并解码，不经过缓存。
     ///
     /// `block_index` 必须小于 `block_count()`。读文件失败或块的内容损坏时返回错误。
-    pub fn read_block(&self, block_index: usize) -> Result<Arc<Block>> {
+    fn read_block_from_file(&self, block_index: usize) -> Result<Arc<Block>> {
         // 下标越界是调用方写错了，不是文件坏了，所以用断言而不是返回错误。
         assert!(
             block_index < self.block_count(),
@@ -277,6 +335,9 @@ impl SsTable {
         let block_len = block_end - block_start;
         let encoded = self.file.read(block_start, block_len)?;
         let block = Block::decode(&encoded)?;
+        if let Some(stats) = &self.stats {
+            stats.add_blocks_read(1);
+        }
         Ok(Arc::new(block))
     }
 
@@ -315,6 +376,33 @@ impl SsTable {
         &self.last_key
     }
 
+    /// `key` 有没有可能在这个文件里：它落在 `[首 key, 末 key]` 之内。
+    ///
+    /// 返回 `false` 时文件里一定没有它，不用读任何块；返回 `true` 时也不一定有，
+    /// 它可能落在两条记录之间。
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.first_key() <= key && key <= self.last_key()
+    }
+
+    /// 范围 `(lower, upper)` 与文件的 `[首 key, 末 key]` 有没有交集。
+    ///
+    /// 返回 `false` 时文件里一定没有这个范围里的记录，扫描可以不管这个文件。
+    pub fn overlaps_range(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        // 范围的下界不能在文件的末 key 之后。
+        let lower_ok = match lower {
+            Bound::Included(lower) => lower <= self.last_key(),
+            Bound::Excluded(lower) => lower < self.last_key(),
+            Bound::Unbounded => true,
+        };
+        // 范围的上界不能在文件的首 key 之前。
+        let upper_ok = match upper {
+            Bound::Included(upper) => self.first_key() <= upper,
+            Bound::Excluded(upper) => self.first_key() < upper,
+            Bound::Unbounded => true,
+        };
+        lower_ok && upper_ok
+    }
+
     /// 文件里有几个数据块。
     pub fn block_count(&self) -> usize {
         self.block_meta.len()
@@ -340,7 +428,7 @@ impl SsTable {
 mod tests {
     use super::*;
     use crate::block::BlockIterator;
-    use crate::iterators::vec_iterator::collect_all;
+    use crate::iterators::vec_iterator::{collect_all, expected};
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -361,13 +449,13 @@ mod tests {
         ] {
             builder.add(key.as_bytes(), value.as_bytes());
         }
-        builder.build(1, &path).unwrap();
+        builder.build(1, None, &path).unwrap();
         path
     }
 
     /// 打开路径上的 SST。
     fn open_sst(path: &Path) -> Result<SsTable> {
-        SsTable::open(1, FileObject::open(path)?)
+        SsTable::open(1, None, FileObject::open(path)?)
     }
 
     /// 把文件的内容换成 `bytes`，再尝试打开；应当因为内容损坏而失败。
@@ -548,9 +636,9 @@ mod tests {
         for key in ["a", "b", "c", "d", "e", "f", "g"] {
             builder.add(key.as_bytes(), b"1");
         }
-        let written = builder.build(7, &path).unwrap();
+        let written = builder.build(7, None, &path).unwrap();
 
-        let opened = SsTable::open(7, FileObject::open(&path).unwrap()).unwrap();
+        let opened = SsTable::open(7, None, FileObject::open(&path).unwrap()).unwrap();
 
         assert_eq!(opened.id(), 7);
         assert_eq!(opened.block_meta(), written.block_meta());
@@ -712,7 +800,7 @@ mod tests {
         let mut builder = SsTableBuilder::new(4096);
         builder.add(b"a", b"1");
         builder.add(b"b", b"");
-        let sst = builder.build(1, &path).unwrap();
+        let sst = builder.build(1, None, &path).unwrap();
 
         let records = records_in_block(&sst, 0);
 
@@ -829,5 +917,208 @@ mod tests {
             0, 0, 1, 0x2c,   0, 1, b'd',   0, 1, b'd',
         ];
         assert_eq!(buf, expected);
+    }
+
+    // ---------- 块缓存 ----------
+
+    /// 用 `cache` 打开 [`write_three_block_sst`] 写出的文件，编号是 `id`。
+    fn open_cached(path: &Path, id: usize, cache: &Arc<BlockCache>) -> SsTable {
+        SsTable::open(id, Some(Arc::clone(cache)), FileObject::open(path).unwrap()).unwrap()
+    }
+
+    // 有缓存时，同一个块第二次读到的就是第一次放进缓存的那一个，没有重新读文件。
+    #[test]
+    fn cached_read_returns_the_same_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let cache = Arc::new(new_block_cache(1 << 20));
+        let sst = open_cached(&path, 1, &cache);
+
+        let first = sst.read_block(1).unwrap();
+        let second = sst.read_block(1).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second), "第二次读没有用上缓存");
+        assert!(cache.contains_key(&(1, 1)));
+        assert_eq!(
+            records_in_block(&sst, 1),
+            expected(&[("d", "4"), ("e", "5"), ("f", "6")])
+        );
+    }
+
+    // 没有缓存时每次都从文件读，得到的是新解码出来的块。
+    #[test]
+    fn uncached_read_decodes_a_new_block_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let sst = open_sst(&path).unwrap();
+
+        let first = sst.read_block(1).unwrap();
+        let second = sst.read_block(1).unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    // 缓存命中之后，文件被改坏也不影响：块是从缓存里拿的。
+    #[test]
+    fn cached_block_survives_a_damaged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let cache = Arc::new(new_block_cache(1 << 20));
+        let sst = open_cached(&path, 1, &cache);
+        sst.read_block(0).unwrap();
+
+        // 把第 0 块的字节全部改成 0xff；文件长度不变。
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..26].fill(0xff);
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            records_in_block(&sst, 0),
+            expected(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    // 读文件失败时缓存里不放东西；文件恢复后能读到正确的块。
+    #[test]
+    fn failed_read_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let good_bytes = std::fs::read(&path).unwrap();
+        let cache = Arc::new(new_block_cache(1 << 20));
+        let sst = open_cached(&path, 1, &cache);
+
+        let mut bad_bytes = good_bytes.clone();
+        bad_bytes[..26].fill(0xff);
+        std::fs::write(&path, &bad_bytes).unwrap();
+        assert!(sst.read_block(0).is_err());
+        assert!(!cache.contains_key(&(1, 0)), "读失败的块不应当放进缓存");
+
+        std::fs::write(&path, &good_bytes).unwrap();
+        assert_eq!(
+            records_in_block(&sst, 0),
+            expected(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    // 两个 SST 共用一个缓存：块下标相同、编号不同，各读到各自的块。
+    #[test]
+    fn ssts_sharing_a_cache_do_not_mix_their_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(new_block_cache(1 << 20));
+        let first_path = dir.path().join("00001.sst");
+        let second_path = dir.path().join("00002.sst");
+        for (path, value) in [(&first_path, "first"), (&second_path, "second")] {
+            let mut builder = SsTableBuilder::new(4096);
+            builder.add(b"k", value.as_bytes());
+            builder.build(0, None, path).unwrap();
+        }
+        let first = open_cached(&first_path, 1, &cache);
+        let second = open_cached(&second_path, 2, &cache);
+
+        assert_eq!(records_in_block(&first, 0), expected(&[("k", "first")]));
+        assert_eq!(records_in_block(&second, 0), expected(&[("k", "second")]));
+    }
+
+    // 容量按块的字节数算：放不下所有的块时会淘汰，总量不超过容量。
+    #[test]
+    fn cache_capacity_is_counted_in_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let mut builder = SsTableBuilder::new(64);
+        for i in 0..200 {
+            builder.add(format!("key-{i:03}").as_bytes(), b"value");
+        }
+        builder.build(1, None, &path).unwrap();
+        // 每个块约 64 字节，容量只够放十来个。
+        let capacity = 1000;
+        let cache = Arc::new(new_block_cache(capacity));
+        let sst = open_cached(&path, 1, &cache);
+        assert!(sst.block_count() > 20);
+
+        for block_index in 0..sst.block_count() {
+            sst.read_block(block_index).unwrap();
+        }
+        // 缓存的淘汰稍有延迟，先让它把积压的工作做完再看。
+        cache.run_pending_tasks();
+
+        assert!(
+            cache.weighted_size() <= capacity,
+            "缓存里有 {} 字节",
+            cache.weighted_size()
+        );
+        assert!(
+            (cache.entry_count() as usize) < sst.block_count(),
+            "一个块都没有被淘汰"
+        );
+        assert!(cache.entry_count() > 0);
+    }
+
+    // ---------- 按 key 范围排除文件 ----------
+
+    /// 打开 [`write_three_block_sst`] 写出的文件：key 是 a 到 g。
+    fn a_to_g_sst(dir: &TempDir) -> SsTable {
+        open_sst(&write_three_block_sst(dir)).unwrap()
+    }
+
+    // 首 key 与末 key 本身算在范围内；范围之外的一定没有。
+    #[test]
+    fn may_contain_key_checks_both_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst = a_to_g_sst(&dir);
+
+        assert!(sst.may_contain_key(b"a"));
+        assert!(sst.may_contain_key(b"d"));
+        assert!(sst.may_contain_key(b"g"));
+        assert!(!sst.may_contain_key(b"0"));
+        assert!(!sst.may_contain_key(b"h"));
+        assert!(!sst.may_contain_key(b"gg"));
+    }
+
+    // 落在范围内、文件里却没有的 key，也回答"可能有"：这里只看两端。
+    #[test]
+    fn may_contain_key_is_only_about_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst = a_to_g_sst(&dir);
+
+        assert!(sst.may_contain_key(b"cc"));
+    }
+
+    // 下界的三种写法：恰好碰到末 key 时，包含算相交，不包含不算。
+    #[test]
+    fn overlaps_range_checks_the_lower_bound_against_the_last_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst = a_to_g_sst(&dir);
+
+        assert!(sst.overlaps_range(Bound::Included(b"g"), Bound::Unbounded));
+        assert!(!sst.overlaps_range(Bound::Excluded(b"g"), Bound::Unbounded));
+        assert!(!sst.overlaps_range(Bound::Included(b"h"), Bound::Unbounded));
+        assert!(sst.overlaps_range(Bound::Excluded(b"f"), Bound::Unbounded));
+        assert!(sst.overlaps_range(Bound::Unbounded, Bound::Unbounded));
+    }
+
+    // 上界的三种写法：恰好碰到首 key 时，包含算相交，不包含不算。
+    #[test]
+    fn overlaps_range_checks_the_upper_bound_against_the_first_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst = a_to_g_sst(&dir);
+
+        assert!(sst.overlaps_range(Bound::Unbounded, Bound::Included(b"a")));
+        assert!(!sst.overlaps_range(Bound::Unbounded, Bound::Excluded(b"a")));
+        assert!(!sst.overlaps_range(Bound::Unbounded, Bound::Included(b"0")));
+        assert!(sst.overlaps_range(Bound::Unbounded, Bound::Excluded(b"b")));
+    }
+
+    // 两端都给：范围在文件里面、盖住整个文件、在文件之前、在文件之后。
+    #[test]
+    fn overlaps_range_with_both_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst = a_to_g_sst(&dir);
+
+        assert!(sst.overlaps_range(Bound::Included(b"c"), Bound::Excluded(b"e")));
+        assert!(sst.overlaps_range(Bound::Included(b"0"), Bound::Included(b"z")));
+        assert!(!sst.overlaps_range(Bound::Included(b"0"), Bound::Excluded(b"a")));
+        assert!(!sst.overlaps_range(Bound::Excluded(b"g"), Bound::Included(b"z")));
+        // 只看范围，不看文件里实际有没有记录：(a, b) 里虽然没有记录，也算相交。
+        assert!(sst.overlaps_range(Bound::Excluded(b"a"), Bound::Excluded(b"b")));
     }
 }

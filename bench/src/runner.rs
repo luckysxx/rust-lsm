@@ -1,4 +1,6 @@
 //! 执行一种负载：把操作分给若干线程，逐个操作计时，记录延迟分布、总耗时与计数器的增量。
+//! 计时结束后等被测对象的后台工作做完（引擎把冻结的表写成文件），再读计数器，
+//! 这样每段负载的计数器只包含它自己引起的工作，下一段负载也从相同的状态开始。
 
 use std::sync::Barrier;
 use std::thread;
@@ -47,6 +49,8 @@ pub struct WorkloadResult {
     pub ops: u64,
     /// 从所有线程一起开始，到最后一个线程结束。不含生成操作序列的时间。
     pub elapsed: Duration,
+    /// 计时结束之后，等后台工作做完又花了多久。不计入吞吐。
+    pub drain: Duration,
     /// 每次操作的耗时，单位纳秒。所有线程的记录合在一起。
     pub latency_nanos: Histogram<u64>,
     /// 点查负载中查到值的次数；范围扫描中读到的记录总数；写负载为 0。
@@ -69,7 +73,8 @@ struct ThreadPlan {
     ops: u64,
     /// 这个线程自己的随机序列。
     rng: Rng,
-    /// 只用于 fillrandom：这个线程要写入的 key 编号，已经打乱。
+    /// 只用于 fillseq 与 fillrandom：这个线程要依次写入的 key 编号。
+    /// fillseq 是连续的一段，fillrandom 是打乱过的。
     fill_order: Vec<u64>,
 }
 
@@ -86,8 +91,13 @@ fn plan_threads(workload: Workload, config: &Config) -> Vec<ThreadPlan> {
     let threads = config.threads as u64;
     let total_ops = config.total_ops(workload);
 
-    // fillrandom 要保证每个 key 恰好写一次：先整体打乱，再切给各线程。
+    // 两种 fill 都要保证每个 key 恰好写一次：先排好全部编号，再切给各线程。
+    // fillseq 按顺序，fillrandom 整体打乱。
+    let is_fill = matches!(workload, Workload::FillSeq | Workload::FillRandom);
     let mut all_fill_order = Vec::new();
+    if workload == Workload::FillSeq {
+        all_fill_order = (0..config.num).collect();
+    }
     if workload == Workload::FillRandom {
         let mut rng = Rng::new(base_seed);
         all_fill_order = shuffled_indexes(config.num, &mut rng);
@@ -103,7 +113,7 @@ fn plan_threads(workload: Workload, config: &Config) -> Vec<ThreadPlan> {
         }
 
         let mut fill_order = Vec::new();
-        if workload == Workload::FillRandom {
+        if is_fill {
             let start = assigned as usize;
             let end = (assigned + ops) as usize;
             fill_order = all_fill_order[start..end].to_vec();
@@ -160,6 +170,11 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
         (thread_results, started.elapsed())
     });
 
+    // 计时已经结束：等后台工作做完再读计数器。
+    let drain_started = Instant::now();
+    target.wait_for_background();
+    let drain = drain_started.elapsed();
+
     let stats_after = target.stats();
     let stats = match (stats_before, stats_after) {
         (Some(before), Some(after)) => Some(after.since(&before)),
@@ -181,6 +196,7 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
         workload,
         ops: config.total_ops(workload),
         elapsed,
+        drain,
         latency_nanos,
         found,
         user_bytes,
@@ -206,7 +222,7 @@ fn run_thread(
     start_line.wait();
 
     match workload {
-        Workload::FillRandom => {
+        Workload::FillSeq | Workload::FillRandom => {
             for index in plan.fill_order {
                 let key = existing_key(index);
                 let op_started = Instant::now();
@@ -388,6 +404,31 @@ mod tests {
 
         let expected: Vec<u64> = (0..1000).collect();
         assert_eq!(all_indexes, expected);
+    }
+
+    // fillseq 按编号从小到大写；分给多个线程时，每个线程是连续的一段。
+    #[test]
+    fn plan_gives_fillseq_keys_in_order() {
+        let plans = plan_threads(Workload::FillSeq, &threaded_config(3));
+
+        assert_eq!(plans[0].fill_order, (0..334).collect::<Vec<u64>>());
+        assert_eq!(plans[1].fill_order, (334..667).collect::<Vec<u64>>());
+        assert_eq!(plans[2].fill_order, (667..1000).collect::<Vec<u64>>());
+    }
+
+    // fillseq 写入的 key 与 fillrandom 相同，只是顺序不同。
+    #[test]
+    fn fillseq_writes_every_key_once() {
+        let target = BTreeMapTarget::new();
+        let config = small_config();
+
+        let result = run_workload(&target, Workload::FillSeq, &config);
+
+        assert_eq!(result.user_bytes, 1000 * (16 + 100));
+        for index in 0..config.num {
+            assert!(target.get(&existing_key(index)).is_some());
+            assert!(target.get(&missing_key(index)).is_none());
+        }
     }
 
     // 多线程下 fillrandom 仍然把每个 key 写一次，每次操作都记了延迟。

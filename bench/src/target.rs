@@ -33,6 +33,9 @@ pub trait KvTarget: Sync {
     fn stats(&self) -> Option<StatsSnapshot> {
         None
     }
+
+    /// 等后台工作做完再返回。没有后台工作的对象直接返回。
+    fn wait_for_background(&self) {}
 }
 
 /// 内存基线：一把互斥锁保护的 `BTreeMap`。
@@ -116,27 +119,33 @@ impl KvTarget for MemTableTarget {
 
 /// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；没有 WAL。
 ///
-/// 目前没有 compaction，L0 的文件只增不减，点查与扫描要逐个去看。
-/// 写入太快时冻结的表会在内存里排队，还没有让写入等一等的机制。
+/// 目前没有 compaction，L0 的文件只增不减，点查与扫描要逐个去看，靠每个文件的
+/// 首末 key 排除范围之外的文件，读块先查块缓存。
+/// 写入太快时冻结的表会在内存里排队，还没有让写入等一等的机制；
+/// 每段负载结束后基准驱动等它们全部落盘，再开始下一段。
 /// 与 `MemTableTarget` 相比，差别是多了状态快照、冻结、落盘，以及跨表和文件的查找与归并。
 pub struct EngineTarget {
     db: Db,
     memtable_size_limit: usize,
+    block_cache_size: usize,
     /// 引擎所在的临时目录，随被测对象一起清理。
     _dir: tempfile::TempDir,
 }
 
 impl EngineTarget {
-    pub fn new(memtable_size_limit: usize) -> Self {
+    /// `block_cache_size` 为 0 时不用块缓存。
+    pub fn new(memtable_size_limit: usize, block_cache_size: usize) -> Self {
         let options = LsmStorageOptions {
             memtable_size_limit,
             block_size: 4096,
+            block_cache_size,
         };
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let db = Db::open(dir.path(), options).expect("打开引擎失败");
         Self {
             db,
             memtable_size_limit,
+            block_cache_size,
             _dir: dir,
         }
     }
@@ -167,12 +176,28 @@ impl KvTarget for EngineTarget {
     }
 
     fn details(&self) -> Option<String> {
-        let megabytes = self.memtable_size_limit / (1024 * 1024);
+        let memtable_megabytes = self.memtable_size_limit / (1024 * 1024);
+        let cache_megabytes = self.block_cache_size / (1024 * 1024);
         let frozen = self.db.imm_memtable_count();
         let l0_files = self.db.l0_sstable_count();
+        let (cached_blocks, cached_bytes) = self.db.block_cache_usage();
+        let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
         Some(format!(
-            "memtable 上限 {megabytes} MB；结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST"
+            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB；\
+             结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST，\
+             块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
         ))
+    }
+
+    fn stats(&self) -> Option<StatsSnapshot> {
+        Some(self.db.stats())
+    }
+
+    /// 等冻结的 memtable 全部写成 SST。
+    fn wait_for_background(&self) {
+        while self.db.imm_memtable_count() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -191,12 +216,19 @@ fn read_up_to(iter: &mut impl StorageIterator, limit: usize) -> usize {
 pub const TARGET_NAMES: [&str; 3] = ["btreemap", "memtable", "engine"];
 
 /// 按名字创建被测对象；名字不认识时返回 `None`。
-/// `memtable_size_limit` 只对 `engine` 有意义。
-pub fn create_target(name: &str, memtable_size_limit: usize) -> Option<Box<dyn KvTarget>> {
+/// `memtable_size_limit` 与 `block_cache_size` 只对 `engine` 有意义。
+pub fn create_target(
+    name: &str,
+    memtable_size_limit: usize,
+    block_cache_size: usize,
+) -> Option<Box<dyn KvTarget>> {
     match name {
         "btreemap" => Some(Box::new(BTreeMapTarget::new())),
         "memtable" => Some(Box::new(MemTableTarget::new())),
-        "engine" => Some(Box::new(EngineTarget::new(memtable_size_limit))),
+        "engine" => Some(Box::new(EngineTarget::new(
+            memtable_size_limit,
+            block_cache_size,
+        ))),
         _ => None,
     }
 }
@@ -237,10 +269,10 @@ mod tests {
     #[test]
     fn every_listed_target_can_be_created() {
         for name in TARGET_NAMES {
-            let target = create_target(name, 1024).unwrap();
+            let target = create_target(name, 1024, 1 << 20).unwrap();
             assert_eq!(target.name(), name);
         }
-        assert!(create_target("nosuch", 1024).is_none());
+        assert!(create_target("nosuch", 1024, 1 << 20).is_none());
     }
 
     // 三种被测对象的扫描结果一致：从起点（包含）开始，最多读指定的条数，到尾部为止。
@@ -248,7 +280,7 @@ mod tests {
     fn every_target_scans_from_start_up_to_limit() {
         for name in TARGET_NAMES {
             // 上限很小，让引擎在写入途中冻结几次，扫描要跨多张表。
-            let target = create_target(name, 8).unwrap();
+            let target = create_target(name, 8, 1 << 20).unwrap();
             for key in ["e", "a", "c", "b", "d"] {
                 target.put(key.as_bytes(), b"value");
             }
@@ -263,7 +295,7 @@ mod tests {
     // 引擎作为被测对象：读到最后一次写入的值；说明里带着 memtable 的上限。
     #[test]
     fn engine_target_reads_back_latest_value() {
-        let target = EngineTarget::new(4 * 1024 * 1024);
+        let target = EngineTarget::new(4 * 1024 * 1024, 1 << 20);
 
         assert_eq!(target.get(b"k"), None);
 
@@ -272,5 +304,23 @@ mod tests {
 
         assert_eq!(target.get(b"k"), Some(b"v2".to_vec()));
         assert!(target.details().unwrap().contains("4 MB"));
+    }
+
+    // 引擎作为被测对象有计数器；等后台工作做完之后，冻结的表全部落了盘。
+    #[test]
+    fn engine_target_reports_stats_and_drains_frozen_memtables() {
+        // 上限很小，写入途中会冻结很多次。
+        let target = EngineTarget::new(256, 0);
+        for i in 0..200 {
+            target.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        target.wait_for_background();
+
+        assert_eq!(target.db.imm_memtable_count(), 0);
+        assert!(target.db.l0_sstable_count() > 1);
+        let stats = target.stats().unwrap();
+        assert_eq!(stats.user_bytes_written, 200 * (7 + 5));
+        assert!(stats.flush_bytes_written > 0);
     }
 }

@@ -134,13 +134,13 @@ mod tests {
         for (key, value) in pairs {
             builder.add(key.as_bytes(), value.as_bytes());
         }
-        builder.build(1, &path).unwrap();
+        builder.build(1, None, &path).unwrap();
         open(&path)
     }
 
     fn open(path: &Path) -> Arc<SsTable> {
         let file = FileObject::open(path).unwrap();
-        Arc::new(SsTable::open(1, file).unwrap())
+        Arc::new(SsTable::open(1, None, file).unwrap())
     }
 
     /// 七条记录分在三个块里：[a, c]、[d, f]、[g, g]。

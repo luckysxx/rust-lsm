@@ -8,14 +8,15 @@
 
 | 目录 | crate | 作用 | 读代码的入口 |
 | --- | --- | --- | --- |
-| engine | `lsm` | 引擎。目前有 memtable、引擎层（可写与冻结的 memtable）、游标与归并、数据块（未接入引擎）、统计计数器 | [lib.rs](engine/src/lib.rs)、[block.rs](engine/src/block.rs)、[lsm_storage.rs](engine/src/lsm_storage.rs)、[mem_table.rs](engine/src/mem_table.rs)、[iterators.rs](engine/src/iterators.rs)、[iterators/merge_iterator.rs](engine/src/iterators/merge_iterator.rs)、[lsm_iterator.rs](engine/src/lsm_iterator.rs)、[stats.rs](engine/src/stats.rs) |
-| bench | `lsm-bench` | 基准驱动：固定负载、吞吐、延迟分位数、放大 | [main.rs](bench/src/main.rs)、[workload.rs](bench/src/workload.rs)、[runner.rs](bench/src/runner.rs)、[target.rs](bench/src/target.rs) |
+| engine | `lsm` | 引擎。对外的句柄 `Db`（后台 flush 线程、关闭）；memtable、引擎层、游标与归并、数据块、SST、错误类型、统计计数器 | [lib.rs](engine/src/lib.rs)、[db.rs](engine/src/db.rs)、[table.rs](engine/src/table.rs)、[block.rs](engine/src/block.rs)、[lsm_storage.rs](engine/src/lsm_storage.rs)、[mem_table.rs](engine/src/mem_table.rs)、[iterators.rs](engine/src/iterators.rs)、[iterators/merge_iterator.rs](engine/src/iterators/merge_iterator.rs)、[lsm_iterator.rs](engine/src/lsm_iterator.rs)、[stats.rs](engine/src/stats.rs) |
+| bench | `lsm-bench` | 基准驱动：固定负载、吞吐、延迟分位数、写放大与读放大 | [main.rs](bench/src/main.rs)、[workload.rs](bench/src/workload.rs)、[runner.rs](bench/src/runner.rs)、[target.rs](bench/src/target.rs) |
+| cli | `lsm-cli` | 交互式命令行程序：打开一个目录，一行一条命令地操作引擎，观察 SST 文件的出现 | [main.rs](cli/src/main.rs)、[command.rs](cli/src/command.rs)、[execute.rs](cli/src/execute.rs) |
 | bench/results | | 每次基准运行的记录 | [记录方式与列表](bench/results/README.md) |
 | notes | | 实现笔记 | [阅读索引](notes/README.md) |
 
 ## 为什么这样组织
 
-- **引擎与基准驱动是两个 package。** 依赖按 package 声明，分开后 `hdrhistogram` 不会变成引擎的依赖；基准驱动只能用引擎的 `pub` 接口，与真正的使用者处在同一位置。另一种做法是把可执行文件放在引擎 package 的 `src/bin/` 下，mini-lsm 采用的是那一种。
+- **引擎、基准驱动、命令行程序是三个 package。** 依赖按 package 声明，分开后 `hdrhistogram`、`anyhow` 不会变成引擎的依赖；引擎的错误是手写的枚举，两个程序用 `anyhow`。基准驱动与命令行程序只能用引擎的 `pub` 接口，与真正的使用者处在同一位置。另一种做法是把可执行文件放在引擎 package 的 `src/bin/` 下，mini-lsm 采用的是那一种。
 - **用 workspace。** 成员共用一份 `Cargo.lock` 与一个 `target/`，在 `lsm/` 下执行一次命令就作用于全部成员。之后的服务端也作为成员加入。
 - **固定工具链。** 基准数字与 clippy 的检查结果随编译器版本变化，固定后前后可比。命令要在 `lsm/` 目录内执行，rustup 才会选中这个版本。
 
@@ -33,6 +34,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo run --release -p lsm-bench
 cargo run --release -p lsm-bench -- --help
+cargo run -p lsm-cli -- target/demo-db
 ```
 
 在工作区根目录可用 `make test-lsm`、`make check-lsm`、`make lsm-bench`。
@@ -41,4 +43,4 @@ cargo run --release -p lsm-bench -- --help
 
 ## 当前边界
 
-引擎目前有 memtable（一张并发跳表）和把多张 memtable 组织起来的引擎层：写入、删除、点查、范围扫描、写满冻结；数据只在内存里，冻结的表还不会被写成 SST。基准驱动有三个被测对象：互斥锁保护的 `BTreeMap`（内存基线）、单张 memtable、引擎层，用 `--target` 选择；负载有 `fillrandom`、`overwrite`、`readrandom`、`readmissing`、`seekrandom`（范围扫描）五种，`--threads` 指定线程数，`--memtable-mb` 设定引擎的 memtable 上限；读写混合与空间放大的测量随引擎功能加入。详细状态见 [当前状态](../docs/status.md)。
+读写路径已经打通：写入进 memtable，写满冻结，后台线程把冻结的表写成 L0 的 SST；点查与扫描覆盖可写的表、冻结的表和 L0 的 SST；`close` 把内存里的数据全部写成 SST。还没有 WAL 与 manifest：重新打开不读取已有的文件，命令行程序因此拒绝打开已有 SST 的目录。读块先查整个引擎共用的块缓存，点查与扫描用每个 SST 的首末 key 跳过范围之外的文件。基准驱动有三个被测对象：互斥锁保护的 `BTreeMap`（内存基线）、单张 memtable、完整的引擎（写 SST 到临时目录），用 `--target` 选择；负载有 `fillseq`（顺序写，需显式指定）、`fillrandom`、`overwrite`、`readrandom`、`readmissing`、`seekrandom`（范围扫描），`--threads` 指定线程数，`--memtable-mb` 与 `--block-cache-mb` 设定引擎的 memtable 上限与块缓存容量；每段负载结束后等后台落盘再读计数器，报告列出写放大与每次点查进入的 SST、读的块。读写混合与空间放大的测量随引擎功能加入。详细状态见 [当前状态](../docs/status.md)。

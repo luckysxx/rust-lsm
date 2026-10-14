@@ -21,7 +21,8 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::LsmIterator;
 use crate::mem_table::{MemTable, MemTableIterator, bound_to_owned};
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::stats::{Stats, StatsSnapshot};
+use crate::table::{BlockCache, SsTable, SsTableBuilder, SsTableIterator, new_block_cache};
 
 /// `scan` 返回的游标类型，从里往外读：
 /// memtable 那一组归并成一个，SST 那一组归并成一个，两路归并把它们合起来，
@@ -49,6 +50,8 @@ pub struct LsmStorageOptions {
     pub memtable_size_limit: usize,
     /// SST 里每个数据块的目标大小，字节。
     pub block_size: usize,
+    /// 块缓存的容量，字节。为 0 时不用块缓存，每次读块都从文件读。
+    pub block_cache_size: usize,
 }
 
 pub struct LsmStorage {
@@ -63,6 +66,10 @@ pub struct LsmStorage {
     path: PathBuf,
     /// 下一个 SST 文件的编号。从 1 开始，只增不减，编号不重复使用。
     next_sst_id: AtomicUsize,
+    /// 所有 SST 共用的块缓存。容量设为 0 时没有缓存。
+    block_cache: Option<Arc<BlockCache>>,
+    /// 统计计数器：写入的字节、flush 写出的字节、点查进入的 SST、从文件读出的块。
+    stats: Arc<Stats>,
     options: LsmStorageOptions,
 }
 
@@ -78,12 +85,20 @@ impl LsmStorage {
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
         };
+        let block_cache = if options.block_cache_size == 0 {
+            None
+        } else {
+            let capacity_bytes = options.block_cache_size as u64;
+            Some(Arc::new(new_block_cache(capacity_bytes)))
+        };
         Ok(Self {
             state: RwLock::new(Arc::new(initial_state)),
             state_lock: Mutex::new(()),
             flush_lock: Mutex::new(()),
             path: path.to_path_buf(),
             next_sst_id: AtomicUsize::new(1),
+            block_cache,
+            stats: Arc::new(Stats::new()),
             options,
         })
     }
@@ -96,6 +111,21 @@ impl LsmStorage {
     /// 当前 L0 有几个 SST。
     pub fn l0_sstable_count(&self) -> usize {
         self.snapshot().l0_sstables.len()
+    }
+
+    /// 块缓存里现在有几个块、一共多少字节。没有缓存时都是 0。
+    pub fn block_cache_usage(&self) -> (u64, u64) {
+        let Some(block_cache) = &self.block_cache else {
+            return (0, 0);
+        };
+        // 缓存的计数稍有延迟，先让它把积压的工作做完。
+        block_cache.run_pending_tasks();
+        (block_cache.entry_count(), block_cache.weighted_size())
+    }
+
+    /// 统计计数器当前的值。
+    pub fn stats(&self) -> StatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// 编号为 `id` 的 SST 文件的路径，例如 `目录/00007.sst`。
@@ -127,6 +157,7 @@ impl LsmStorage {
     /// 从新到旧依次查找，遇到这个 key 的记录（值或墓碑）就停。查到 SST 时要读磁盘，
     /// 所以可能失败。
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.stats.add_get();
         let snapshot = self.snapshot();
 
         // 从新到旧：先查可写的表。
@@ -144,6 +175,11 @@ impl LsmStorage {
         // 最后查 L0 的 SST，列表里新的在前。在每个 SST 里定位到第一条不小于 key 的
         // 记录；它的 key 恰好相等才算这个 SST 里有，否则接着看更旧的。
         for sst in &snapshot.l0_sstables {
+            // 范围之外的文件一定没有它，一个块都不用读。
+            if !sst.may_contain_key(key) {
+                continue;
+            }
+            self.stats.add_tables_probed(1);
             let iterator = SsTableIterator::new_and_seek_to_key(Arc::clone(sst), key)?;
             if iterator.is_valid() && iterator.key() == key {
                 let value = Bytes::copy_from_slice(iterator.value());
@@ -183,6 +219,10 @@ impl LsmStorage {
         // SST 这一组：列表里也是新的在前。SST 的游标只管下界，上界由最外层处理。
         let mut sst_iters = Vec::new();
         for sst in &snapshot.l0_sstables {
+            // 与范围不相交的文件不建游标：建游标要读它的一个块。
+            if !sst.overlaps_range(lower, upper) {
+                continue;
+            }
             sst_iters.push(sst_iterator_from(Arc::clone(sst), lower)?);
         }
 
@@ -214,6 +254,8 @@ impl LsmStorage {
     /// 写入期间持有 `state` 的读锁：冻结要拿写锁，所以不会有表在写入途中被冻结。
     /// 表本身允许多个线程同时写入，读锁也不会让写入之间互相等待。
     fn write(&self, key: &[u8], value: &[u8]) -> bool {
+        self.stats
+            .add_user_bytes_written((key.len() + value.len()) as u64);
         let size_after_write;
         {
             let guard = self.state.read().unwrap();
@@ -325,7 +367,11 @@ impl LsmStorage {
         }
 
         let sst_id = self.allocate_sst_id();
-        let sst = sst_builder.build(sst_id, &self.path_of_sst(sst_id))?;
+        let block_cache = self.block_cache.clone();
+        let sst = sst_builder
+            .build(sst_id, block_cache, &self.path_of_sst(sst_id))?
+            .with_stats(Arc::clone(&self.stats));
+        self.stats.add_flush_bytes_written(sst.file_size());
         Ok(Some(Arc::new(sst)))
     }
 
@@ -425,6 +471,7 @@ mod tests {
             memtable_size_limit,
             // 块给得很小，让测试里的 SST 也有好几个块。
             block_size: 64,
+            block_cache_size: 1 << 20,
         };
         let storage = LsmStorage::open(dir.path(), options).unwrap();
         TestStorage { storage, dir }
@@ -828,7 +875,9 @@ mod tests {
         for (key, value) in pairs {
             builder.add(key.as_bytes(), value.as_bytes());
         }
-        let sst = Arc::new(builder.build(id, &path).unwrap());
+        let block_cache = storage.block_cache.clone();
+        let sst = builder.build(id, block_cache, &path).unwrap();
+        let sst = Arc::new(sst.with_stats(Arc::clone(&storage.stats)));
 
         let _state_lock = storage.state_lock.lock().unwrap();
         let mut guard = storage.state.write().unwrap();
@@ -1191,6 +1240,7 @@ mod tests {
         let options = LsmStorageOptions {
             memtable_size_limit: 1024,
             block_size: 64,
+            block_cache_size: 1 << 20,
         };
 
         let _storage = LsmStorage::open(&path, options).unwrap();
@@ -1613,5 +1663,164 @@ mod tests {
         assert_eq!(storage.imm_memtable_count(), 2);
         assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
         assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+    }
+
+    // flush 出来的 SST 用的是引擎的块缓存：点查读过的块留在缓存里，再查不增加块数。
+    #[test]
+    fn reads_fill_the_block_cache() {
+        let storage = open_with_limit(usize::MAX);
+        for i in 0..100 {
+            storage.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+        storage.freeze_memtable();
+        storage.flush_all_imm_memtables().unwrap();
+        assert_eq!(storage.block_cache_usage(), (0, 0));
+
+        assert_eq!(
+            storage.get(b"key-042").unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        let (blocks_after_first_get, bytes_after_first_get) = storage.block_cache_usage();
+        assert_eq!(blocks_after_first_get, 1);
+        assert!(bytes_after_first_get > 0);
+
+        assert_eq!(
+            storage.get(b"key-042").unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        assert_eq!(storage.block_cache_usage().0, 1);
+    }
+
+    // ---------- 按 key 范围跳过 SST ----------
+
+    /// 三个 key 范围互不重叠的 SST，从新到旧是 [g, i]、[a, c]、[d, f]。
+    /// 每个文件只有一个块，所以块缓存里的块数就是读过的文件数。
+    fn storage_with_three_disjoint_ssts() -> (TestStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        add_l0_sst(&storage, &dir, 1, &[("d", "4"), ("e", "5"), ("f", "6")]);
+        add_l0_sst(&storage, &dir, 2, &[("a", "1"), ("b", "2"), ("c", "3")]);
+        add_l0_sst(&storage, &dir, 3, &[("g", "7"), ("h", "8"), ("i", "9")]);
+        assert_eq!(storage.block_cache_usage().0, 0);
+        (storage, dir)
+    }
+
+    // 点查只读范围包含这个 key 的文件。比它新的两个文件，一个在它之后、一个在它之前，都被跳过。
+    #[test]
+    fn get_reads_only_the_sst_whose_range_contains_the_key() {
+        let (storage, _dir) = storage_with_three_disjoint_ssts();
+
+        assert_eq!(get_str(&storage, "e"), Some("5".to_string()));
+
+        assert_eq!(storage.block_cache_usage().0, 1, "读了范围之外的文件");
+    }
+
+    // 落在所有文件范围之外、或者两个文件之间的 key：一个块都不读。
+    #[test]
+    fn get_reads_no_block_for_keys_outside_every_sst() {
+        let (storage, _dir) = storage_with_three_disjoint_ssts();
+
+        assert_eq!(get_str(&storage, "0"), None);
+        assert_eq!(get_str(&storage, "cc"), None);
+        assert_eq!(get_str(&storage, "z"), None);
+
+        assert_eq!(storage.block_cache_usage().0, 0, "读了范围之外的文件");
+    }
+
+    // 扫描只为与范围相交的文件建游标，结果不受影响。
+    #[test]
+    fn scan_reads_only_the_ssts_overlapping_the_range() {
+        let (storage, _dir) = storage_with_three_disjoint_ssts();
+
+        let records = scan_range(&storage, Bound::Included(b"d"), Bound::Excluded(b"g"));
+
+        assert_eq!(records, expected(&[("d", "4"), ("e", "5"), ("f", "6")]));
+        assert_eq!(storage.block_cache_usage().0, 1, "读了与范围不相交的文件");
+    }
+
+    // 跨过文件边界的扫描与不设范围的扫描：结果完整，按 key 排好。
+    #[test]
+    fn scan_across_ssts_still_returns_everything_in_range() {
+        let (storage, _dir) = storage_with_three_disjoint_ssts();
+
+        let middle = scan_range(&storage, Bound::Excluded(b"b"), Bound::Included(b"h"));
+        let all = scan_range(&storage, Bound::Unbounded, Bound::Unbounded);
+
+        assert_eq!(
+            middle,
+            expected(&[
+                ("c", "3"),
+                ("d", "4"),
+                ("e", "5"),
+                ("f", "6"),
+                ("g", "7"),
+                ("h", "8")
+            ])
+        );
+        assert_eq!(all.len(), 9);
+    }
+
+    // ---------- 统计计数器 ----------
+
+    // 写入记下 key 与 value 的字节；flush 记下文件的长度；点查记下进入的 SST 与从文件读出的块。
+    #[test]
+    fn counters_follow_writes_flushes_and_gets() {
+        let storage = open_without_auto_freeze();
+        storage.put(b"a", b"1");
+        storage.put(b"bb", b"22");
+        storage.delete(b"c");
+        assert_eq!(storage.stats().user_bytes_written, 2 + 4 + 1);
+
+        storage.freeze_memtable();
+        storage.flush_all_imm_memtables().unwrap();
+        let sst_file_size = storage.snapshot().l0_sstables[0].file_size();
+        assert_eq!(storage.stats().flush_bytes_written, sst_file_size);
+
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        // 范围之外：不进入 SST。
+        assert_eq!(get_str(&storage, "z"), None);
+
+        let stats = storage.stats();
+        assert_eq!(stats.gets, 3);
+        assert_eq!(stats.tables_probed, 2);
+        // 第二次查同一个块命中缓存，不再读文件。
+        assert_eq!(stats.blocks_read, 1);
+    }
+
+    // 内存里查到的点查也算一次点查，但不进入任何 SST。
+    #[test]
+    fn gets_answered_from_memory_probe_no_sst() {
+        let storage = open_without_auto_freeze();
+        storage.put(b"a", b"1");
+
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+
+        let stats = storage.stats();
+        assert_eq!(stats.gets, 1);
+        assert_eq!(stats.tables_probed, 0);
+        assert_eq!(stats.blocks_read, 0);
+    }
+
+    // 块缓存的容量设为 0 时没有缓存：每次读块都从文件读，结果照样正确。
+    #[test]
+    fn zero_block_cache_size_disables_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = LsmStorageOptions {
+            memtable_size_limit: usize::MAX,
+            block_size: 64,
+            block_cache_size: 0,
+        };
+        let storage = LsmStorage::open(dir.path(), options).unwrap();
+        storage.put(b"a", b"1");
+        storage.freeze_memtable();
+        storage.flush_all_imm_memtables().unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        }
+
+        assert_eq!(storage.block_cache_usage(), (0, 0));
+        assert_eq!(storage.stats().blocks_read, 3);
     }
 }

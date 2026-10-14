@@ -22,6 +22,7 @@ use bytes::Bytes;
 
 use crate::error::Result;
 use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator};
+use crate::stats::StatsSnapshot;
 
 /// 后台线程等信号的最长时间。等满这么久还没有信号，它也会检查一次有没有冻结的
 /// memtable，有就写成 SST。
@@ -116,6 +117,16 @@ impl Db {
         self.storage.l0_sstable_count()
     }
 
+    /// 块缓存里现在有几个块、一共多少字节。
+    pub fn block_cache_usage(&self) -> (u64, u64) {
+        self.storage.block_cache_usage()
+    }
+
+    /// 统计计数器当前的值：写入与 flush 的字节、点查次数、进入的 SST、从文件读出的块。
+    pub fn stats(&self) -> StatsSnapshot {
+        self.storage.stats()
+    }
+
     /// 关闭数据库：停下后台线程，把还在内存里的数据全部写成 SST。
     ///
     /// 目前没有 WAL，memtable 里的数据只在内存里。正常退出前必须调用这个方法，
@@ -208,6 +219,7 @@ mod tests {
         LsmStorageOptions {
             memtable_size_limit,
             block_size: 64,
+            block_cache_size: 1 << 20,
         }
     }
 
@@ -227,7 +239,7 @@ mod tests {
         let mut records = Vec::new();
         for (index, name) in sst_file_names(dir).iter().enumerate() {
             let file = FileObject::open(&dir.join(name)).unwrap();
-            let sst = Arc::new(SsTable::open(index, file).unwrap());
+            let sst = Arc::new(SsTable::open(index, None, file).unwrap());
             let mut iter = SsTableIterator::new_and_seek_to_first(sst).unwrap();
             records.extend(collect_all(&mut iter));
         }

@@ -1,10 +1,11 @@
 //! SST 的构建器：记录按 key 从小到大一条一条加进来，最后写成一个文件。
 
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes};
 
-use super::{BlockMeta, FileObject, SST_MAGIC, SsTable, encode_block_meta};
+use super::{BlockCache, BlockMeta, FileObject, SST_MAGIC, SsTable, encode_block_meta};
 use crate::block::BlockBuilder;
 use crate::error::Result;
 
@@ -106,7 +107,12 @@ impl SsTableBuilder {
     /// 封口并写成文件，返回这个 SST。`id` 是文件的编号，`path` 是文件的路径。
     ///
     /// 至少要加入过一条记录。写文件失败时返回错误。
-    pub fn build(mut self, id: usize, path: &Path) -> Result<SsTable> {
+    pub fn build(
+        mut self,
+        id: usize,
+        block_cache: Option<Arc<BlockCache>>,
+        path: &Path,
+    ) -> Result<SsTable> {
         assert!(
             !self.builder.is_empty() || !self.block_meta.is_empty(),
             "SST 里至少要有一条记录"
@@ -133,6 +139,8 @@ impl SsTableBuilder {
             block_meta_start,
             first_key,
             last_key,
+            block_cache,
+            stats: None,
         })
     }
 }
@@ -153,7 +161,7 @@ mod tests {
         for (key, value) in pairs {
             builder.add(key.as_bytes(), value.as_bytes());
         }
-        let sst = builder.build(1, &path).unwrap();
+        let sst = builder.build(1, None, &path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         (sst, bytes)
     }
@@ -387,7 +395,7 @@ mod tests {
             builder.add(key.as_bytes(), b"1");
         }
 
-        let sst = builder.build(7, &path).unwrap();
+        let sst = builder.build(7, None, &path).unwrap();
 
         assert_eq!(sst.id(), 7);
         assert_eq!(sst.first_key(), b"a");
@@ -418,7 +426,7 @@ mod tests {
         let mut builder = SsTableBuilder::new(4096);
         builder.add(b"a", b"1");
 
-        let result = builder.build(1, &path);
+        let result = builder.build(1, None, &path);
 
         assert!(matches!(result, Err(Error::Io(_))));
     }
@@ -431,6 +439,6 @@ mod tests {
         let path = dir.path().join("1.sst");
         let builder = SsTableBuilder::new(4096);
 
-        let _ = builder.build(1, &path);
+        let _ = builder.build(1, None, &path);
     }
 }

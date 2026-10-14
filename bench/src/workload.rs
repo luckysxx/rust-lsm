@@ -87,6 +87,9 @@ pub fn make_value(size: usize, seed: u64) -> Vec<u8> {
 /// 一种固定的操作序列。名字沿用 `db_bench`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workload {
+    /// 按 key 从小到大写入 `num` 个不同的 key，每个恰好一次。
+    /// 每次 flush 写出的文件 key 范围互不重叠，点查可以按范围排除其余的文件。
+    FillSeq,
     /// 乱序写入 `num` 个不同的 key，每个恰好一次。
     FillRandom,
     /// `num` 次写入，每次随机挑一个已有的 key 覆盖。
@@ -101,7 +104,19 @@ pub enum Workload {
 }
 
 impl Workload {
-    pub const ALL: [Workload; 5] = [
+    /// 全部负载，命令行上的名字从这里查。
+    pub const ALL: [Workload; 6] = [
+        Workload::FillSeq,
+        Workload::FillRandom,
+        Workload::Overwrite,
+        Workload::ReadRandom,
+        Workload::ReadMissing,
+        Workload::SeekRandom,
+    ];
+
+    /// 不指定 `--workloads` 时依次执行的负载。不含 `fillseq`：它与 `fillrandom`
+    /// 写的是同一批 key，两个都执行时后一个相当于覆盖写。
+    pub const DEFAULT: [Workload; 5] = [
         Workload::FillRandom,
         Workload::Overwrite,
         Workload::ReadRandom,
@@ -111,6 +126,7 @@ impl Workload {
 
     pub fn name(self) -> &'static str {
         match self {
+            Workload::FillSeq => "fillseq",
             Workload::FillRandom => "fillrandom",
             Workload::Overwrite => "overwrite",
             Workload::ReadRandom => "readrandom",
@@ -133,6 +149,7 @@ impl Workload {
             Workload::ReadRandom => 3,
             Workload::ReadMissing => 4,
             Workload::SeekRandom => 5,
+            Workload::FillSeq => 6,
         }
     }
 }
@@ -222,5 +239,15 @@ mod tests {
             assert_eq!(Workload::parse(workload.name()), Some(workload));
         }
         assert_eq!(Workload::parse("nosuch"), None);
+    }
+
+    // 默认执行的负载都在全部负载里，只少了 fillseq。
+    #[test]
+    fn default_workloads_are_all_but_fillseq() {
+        for workload in Workload::DEFAULT {
+            assert!(Workload::ALL.contains(&workload));
+        }
+        assert!(!Workload::DEFAULT.contains(&Workload::FillSeq));
+        assert_eq!(Workload::DEFAULT.len() + 1, Workload::ALL.len());
     }
 }
