@@ -1,12 +1,12 @@
-//! SST：磁盘上的一个有序文件，由很多数据块加一份索引组成，写完之后不再修改。
+//! SST：磁盘上的一个有序文件，由很多数据块、一份索引和一个 Bloom filter 组成，写完之后不再修改。
 //!
 //! 文件的样子（所有整数都是大端）：
 //!
 //! ```text
-//! ┌──────┬──────┬───┬────────┬──────────────────┬────────────┬──────┐
-//! │ 块 0  │ 块 1 │ … │ 块 n-1 │ 索引              │  索引的起点  │ 魔数 │
-//! └──────┴──────┴───┴────────┴──────────────────┴────────────┴──────┘
-//!   数据块，一个接一个             每个块一项          4 字节       4 字节
+//! ┌─────┬─────┬───┬────────┬──────┬────────┬────────────┬──────────────┬───────┬──────┐
+//! │ 块 0 │ 块 1 │ … │ 块 n-1 │ 索引 │ filter │ 索引的起点 │ filter 的起点 │ 版本号 │ 魔数 │
+//! └─────┴─────┴───┴────────┴──────┴────────┴────────────┴──────────────┴───────┴──────┘
+//!   数据块，一个接一个        每块一项  见 bloom.rs   4 字节        4 字节        4 字节  4 字节
 //!
 //! 索引：      块数（4 字节）│ 第 0 项 │ 第 1 项 │ …
 //! 索引的一项： 块的起点（4 字节）│ 首 key 长度（2 字节）│ 首 key │ 末 key 长度（2 字节）│ 末 key
@@ -14,13 +14,18 @@
 //!
 //! 与块的尾巴是同一个办法：内容在前，索引在后，最后几个字节指回索引。
 //! 块的长度不记：它等于下一个块的起点减自己的起点，最后一个块用索引的起点来减。
+//! 索引的长度也不记：它到 filter 的起点为止；filter 到末尾固定的 16 个字节为止。
 //!
-//! 打开文件时只把索引读进内存，数据块留在磁盘上，用到哪个读哪个。
+//! 魔数确认"这是引擎写的 SST"，永远不变；版本号说明按哪一版格式写的，格式每改一次加一。
+//!
+//! 打开文件时把索引和 filter 读进内存，数据块留在磁盘上，用到哪个读哪个。
 //! 读出来的块可以放进整个引擎共用的块缓存，下次直接从缓存里拿。
 
+mod bloom;
 mod builder;
 mod iterator;
 
+pub use bloom::{Bloom, key_hash};
 pub use builder::SsTableBuilder;
 pub use iterator::SsTableIterator;
 
@@ -59,10 +64,20 @@ pub fn new_block_cache(capacity_bytes: u64) -> BlockCache {
 }
 
 /// 文件最后 4 个字节的魔数，用来确认这是引擎写的 SST。四个字节是 ASCII 的 "LSM1"。
+///
+/// 魔数不随格式改变；格式的变化记在 [`SST_FORMAT_VERSION`] 里。
 pub const SST_MAGIC: u32 = 0x4C53_4D31;
 
-/// 文件末尾固定的部分有多长：索引的起点 4 字节，魔数 4 字节。
-const FOOTER_SIZE: usize = 8;
+/// 现在写出的 SST 的格式版本，放在魔数前面。打开时只认这一个版本。
+///
+/// 版本 1：数据块、索引、Bloom filter。
+pub const SST_FORMAT_VERSION: u32 = 1;
+
+/// 写 SST 时 Bloom filter 的目标误判率。
+pub const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// 文件末尾固定的部分有多长：索引的起点、filter 的起点、版本号、魔数，各 4 字节。
+const FOOTER_SIZE: usize = 16;
 
 /// 索引里的一项：一个数据块在文件的哪里，装着哪个范围的 key。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +251,8 @@ pub struct SsTable {
     first_key: Bytes,
     /// 整个文件里最大的 key。
     last_key: Bytes,
+    /// 文件里全部 key 的 Bloom filter。
+    bloom: Bloom,
     /// 读块时先查的缓存。`None` 表示不用缓存，每次都从文件读。
     block_cache: Option<Arc<BlockCache>>,
     /// 从文件读出一个块，就在这里记一次。`None` 表示不记。
@@ -243,34 +260,47 @@ pub struct SsTable {
 }
 
 impl SsTable {
-    /// 打开一个已有的 SST 文件：从尾部读回索引，数据块留在磁盘上。
+    /// 打开一个已有的 SST 文件：从尾部读回索引和 Bloom filter，数据块留在磁盘上。
     ///
     /// 读块时先查 `block_cache`；给 `None` 就不用缓存。
-    /// 文件不符合格式时返回 [`Error::Corruption`]，读文件失败时返回 [`Error::Io`]。
+    /// 文件不符合格式（包括版本号不是 [`SST_FORMAT_VERSION`]）时返回 [`Error::Corruption`]，
+    /// 读文件失败时返回 [`Error::Io`]。
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        // 从文件的尾巴倒着找。末尾固定的 8 个字节：索引的起点、魔数。
+        // 从文件的尾巴倒着找。末尾固定的 16 个字节：索引的起点、filter 的起点、版本号、魔数。
         // 先确认文件够长，再做减法：无符号数相减不能得到负数。
         let file_size = file.size();
         if file_size < FOOTER_SIZE {
-            return Err(corrupt_sst("文件太短，放不下末尾的 8 个字节"));
+            return Err(corrupt_sst("文件太短，放不下末尾的 16 个字节"));
         }
         let footer_start = file_size - FOOTER_SIZE;
         let footer = file.read(footer_start, FOOTER_SIZE)?;
         let block_meta_start = read_u32(&footer, 0) as usize;
-        let sst_magic = read_u32(&footer, 4);
+        let bloom_start = read_u32(&footer, 4) as usize;
+        let format_version = read_u32(&footer, 8);
+        let sst_magic = read_u32(&footer, 12);
+
+        // 先认魔数，再认版本：魔数不对说明根本不是 SST，版本不对说明是别的版本写的 SST。
         if sst_magic != SST_MAGIC {
             return Err(corrupt_sst("末尾的魔数不对，这不是引擎写的 SST"));
         }
-        if block_meta_start > footer_start {
-            return Err(corrupt_sst("索引的起点超出了文件"));
+        if format_version != SST_FORMAT_VERSION {
+            return Err(corrupt_sst(&format!(
+                "格式版本是 {format_version}，只认得版本 {SST_FORMAT_VERSION}"
+            )));
+        }
+        if block_meta_start > bloom_start || bloom_start > footer_start {
+            return Err(corrupt_sst("索引或 filter 的起点超出了范围"));
         }
 
-        // 索引占 [block_meta_start, footer_start)。
-        let raw_block_meta_len = footer_start - block_meta_start;
-        let raw_block_meta = file.read(block_meta_start, raw_block_meta_len)?;
+        // 索引占 [block_meta_start, bloom_start)，filter 占 [bloom_start, footer_start)。
+        // 两段紧挨着，一次读出来再切开。
+        let raw_meta_len = footer_start - block_meta_start;
+        let raw_meta = file.read(block_meta_start, raw_meta_len)?;
+        let (raw_block_meta, raw_bloom) = raw_meta.split_at(bloom_start - block_meta_start);
 
-        let block_meta = decode_block_meta(&raw_block_meta)?;
+        let block_meta = decode_block_meta(raw_block_meta)?;
         check_block_meta(&block_meta, block_meta_start)?;
+        let bloom = Bloom::decode(raw_bloom)?;
 
         let first_key = block_meta[0].first_key.clone();
         let last_key = block_meta[block_meta.len() - 1].last_key.clone();
@@ -281,6 +311,7 @@ impl SsTable {
             block_meta_start,
             first_key,
             last_key,
+            bloom,
             block_cache,
             stats: None,
         })
@@ -384,6 +415,19 @@ impl SsTable {
         self.first_key() <= key && key <= self.last_key()
     }
 
+    /// 问这个文件的 Bloom filter：哈希值为 `key_hash` 的 key 可能在不在文件里。
+    ///
+    /// `key_hash` 要用 [`key_hash`] 算。返回 `false` 时文件里一定没有这个 key，
+    /// 不用读任何块；返回 `true` 时可能有，也可能是误报。
+    pub fn bloom_may_contain(&self, key_hash: u32) -> bool {
+        self.bloom.may_contain(key_hash)
+    }
+
+    /// 文件里全部 key 的 Bloom filter。
+    pub fn bloom(&self) -> &Bloom {
+        &self.bloom
+    }
+
     /// 范围 `(lower, upper)` 与文件的 `[首 key, 末 key]` 有没有交集。
     ///
     /// 返回 `false` 时文件里一定没有这个范围里的记录，扫描可以不管这个文件。
@@ -433,11 +477,11 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// 七条记录，块的目标大小 26 恰好放三条：三个块 [a, c]、[d, f]、[g, g]，
-    /// 起点依次是 0、26、52，索引从 62 开始。返回文件的路径。
+    /// 七条记录，块的目标大小 32 恰好放三条：三个块 [a, c]、[d, f]、[g, g]，
+    /// 起点依次是 0、32、64，索引从 76 开始。返回文件的路径。
     fn write_three_block_sst(dir: &TempDir) -> PathBuf {
         let path = dir.path().join("1.sst");
-        let mut builder = SsTableBuilder::new(26);
+        let mut builder = SsTableBuilder::new(32);
         for (key, value) in [
             ("a", "1"),
             ("b", "2"),
@@ -632,7 +676,7 @@ mod tests {
     fn open_reads_back_what_the_builder_wrote() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("7.sst");
-        let mut builder = SsTableBuilder::new(26);
+        let mut builder = SsTableBuilder::new(32);
         for key in ["a", "b", "c", "d", "e", "f", "g"] {
             builder.add(key.as_bytes(), b"1");
         }
@@ -657,7 +701,7 @@ mod tests {
         let sst = open_sst(&path).unwrap();
 
         assert_eq!(sst.block_count(), 3);
-        assert_eq!(sst.block_meta_start(), 62);
+        assert_eq!(sst.block_meta_start(), 76);
         let summary: Vec<(usize, &[u8], &[u8])> = sst
             .block_meta()
             .iter()
@@ -667,13 +711,13 @@ mod tests {
             summary,
             vec![
                 (0, &b"a"[..], &b"c"[..]),
-                (26, &b"d"[..], &b"f"[..]),
-                (52, &b"g"[..], &b"g"[..]),
+                (32, &b"d"[..], &b"f"[..]),
+                (64, &b"g"[..], &b"g"[..]),
             ]
         );
     }
 
-    // 文件短得连末尾的 8 个字节都放不下：内容损坏，而不是越界 panic。
+    // 文件短得连末尾的 16 个字节都放不下：内容损坏，而不是越界 panic。
     #[test]
     fn open_rejects_file_shorter_than_the_footer() {
         let dir = tempfile::tempdir().unwrap();
@@ -681,7 +725,10 @@ mod tests {
 
         assert_open_reports_corruption(&path, b"");
         assert_open_reports_corruption(&path, b"LSM1");
-        assert_open_reports_corruption(&path, &[0, 0, 0, 0, b'L', b'S', b'M']);
+        assert_open_reports_corruption(
+            &path,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, b'L', b'S', b'M'],
+        );
     }
 
     // 最后 4 个字节不是魔数：这不是引擎写的文件。
@@ -696,38 +743,67 @@ mod tests {
         assert_open_reports_corruption(&path, &bytes);
     }
 
-    // 魔数和索引的起点如果读反了位置，这里会发现：起点是 62，不等于魔数。
+    // 末尾 16 个字节依次是索引的起点、filter 的起点、版本号、魔数；读错位置这里会发现。
     #[test]
-    fn open_reads_meta_offset_before_magic() {
+    fn open_reads_footer_fields_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_three_block_sst(&dir);
         let bytes = std::fs::read(&path).unwrap();
         let len = bytes.len();
-        assert_eq!(&bytes[len - 8..len - 4], &[0, 0, 0, 62]);
+        // 索引：块数 4 字节，三项各 4 + 3 + 3 字节，共 34 字节，所以 filter 从 110 开始。
+        assert_eq!(&bytes[len - 16..len - 12], &[0, 0, 0, 76]);
+        assert_eq!(&bytes[len - 12..len - 8], &[0, 0, 0, 110]);
+        assert_eq!(&bytes[len - 8..len - 4], &[0, 0, 0, 1]);
         assert_eq!(&bytes[len - 4..], b"LSM1");
 
         let sst = open_sst(&path).unwrap();
 
-        assert_eq!(sst.block_meta_start(), 62);
+        assert_eq!(sst.block_meta_start(), 76);
+        assert_eq!(sst.block_count(), 3);
     }
 
-    // 索引的起点指到了文件外面，或者指进了末尾的 8 个字节里。
+    // 魔数对、版本号不认得：是别的版本写的 SST，拒绝打开。
+    #[test]
+    fn open_rejects_unknown_format_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let original = std::fs::read(&path).unwrap();
+        let len = original.len();
+
+        for version in [0u32, 2, 0xffff_ffff] {
+            let mut bytes = original.clone();
+            bytes[len - 8..len - 4].copy_from_slice(&version.to_be_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            match open_sst(&path) {
+                Err(Error::Corruption(message)) => assert!(message.contains("版本"), "{message}"),
+                Err(other) => panic!("应当是 Corruption，实际是 {other:?}"),
+                Ok(_) => panic!("版本 {version} 的文件不应该打得开"),
+            }
+        }
+    }
+
+    // 索引或 filter 的起点指到了文件外面、指进了末尾的 16 个字节，或者两者顺序颠倒。
     #[test]
     fn open_rejects_meta_offset_out_of_range() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_three_block_sst(&dir);
         let original = std::fs::read(&path).unwrap();
         let len = original.len();
+        let footer_start = (len - 16) as u32;
 
-        let mut far_beyond = original.clone();
-        far_beyond[len - 8..len - 4].copy_from_slice(&[0, 0, 0xff, 0xff]);
-        assert_open_reports_corruption(&path, &far_beyond);
+        let mut meta_far_beyond = original.clone();
+        meta_far_beyond[len - 16..len - 12].copy_from_slice(&[0, 0, 0xff, 0xff]);
+        assert_open_reports_corruption(&path, &meta_far_beyond);
 
-        // 起点恰好比"末尾 8 字节的开头"大 1。
-        let mut just_beyond = original.clone();
-        let footer_start = (len - 8) as u32;
-        just_beyond[len - 8..len - 4].copy_from_slice(&(footer_start + 1).to_be_bytes());
-        assert_open_reports_corruption(&path, &just_beyond);
+        // filter 的起点恰好比"末尾 16 字节的开头"大 1。
+        let mut bloom_just_beyond = original.clone();
+        bloom_just_beyond[len - 12..len - 8].copy_from_slice(&(footer_start + 1).to_be_bytes());
+        assert_open_reports_corruption(&path, &bloom_just_beyond);
+
+        // 索引的起点在 filter 的起点之后。
+        let mut meta_after_bloom = original.clone();
+        meta_after_bloom[len - 16..len - 12].copy_from_slice(&[0, 0, 0, 111]);
+        assert_open_reports_corruption(&path, &meta_after_bloom);
     }
 
     // 索引的起点指错了地方（指到了数据块中间）：索引解不出来。
@@ -737,9 +813,67 @@ mod tests {
         let path = write_three_block_sst(&dir);
         let mut bytes = std::fs::read(&path).unwrap();
         let len = bytes.len();
-        bytes[len - 8..len - 4].copy_from_slice(&[0, 0, 0, 5]);
+        bytes[len - 16..len - 12].copy_from_slice(&[0, 0, 0, 5]);
 
         assert_open_reports_corruption(&path, &bytes);
+    }
+
+    // filter 坏了（它的最后一个字节 k 变成 0）：打不开。
+    #[test]
+    fn open_rejects_corrupted_bloom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        bytes[len - 17] = 0;
+
+        assert_open_reports_corruption(&path, &bytes);
+    }
+
+    // 打开时读回的 filter 与写的时候一样：文件里的每个 key 都回答可能有。
+    #[test]
+    fn open_reads_back_the_bloom_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let mut builder = SsTableBuilder::new(32);
+        for key in ["a", "b", "c", "d", "e", "f", "g"] {
+            builder.add(key.as_bytes(), b"1");
+        }
+        let written = builder.build(1, None, &path).unwrap();
+
+        let opened = open_sst(&path).unwrap();
+
+        assert_eq!(opened.bloom(), written.bloom());
+        for key in ["a", "b", "c", "d", "e", "f", "g"] {
+            assert!(opened.bloom_may_contain(key_hash(key.as_bytes())), "{key}");
+        }
+    }
+
+    // 落在文件的 key 范围里、文件里却没有的 key，filter 能排除掉绝大多数。
+    #[test]
+    fn bloom_rejects_most_absent_keys_inside_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let mut builder = SsTableBuilder::new(4096);
+        // 只写 0 到 1998 的偶数号 key；1 到 1997 的奇数号 key 落在范围里但不存在。
+        for i in (0..2000).step_by(2) {
+            builder.add(format!("key-{i:05}").as_bytes(), b"1");
+        }
+        let sst = builder.build(1, None, &path).unwrap();
+
+        let absent_keys: Vec<String> = (1..1999)
+            .step_by(2)
+            .map(|i| format!("key-{i:05}"))
+            .collect();
+        let mut false_positives = 0;
+        for key in &absent_keys {
+            assert!(sst.may_contain_key(key.as_bytes()));
+            if sst.bloom_may_contain(key_hash(key.as_bytes())) {
+                false_positives += 1;
+            }
+        }
+        // 999 个不存在的 key，目标误判率 1%，留出余量。
+        assert!(false_positives < 30, "误报了 {false_positives} 次");
     }
 
     // 文件从末尾被截掉任意多个字节，都打不开，也不会 panic。
@@ -820,9 +954,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_three_block_sst(&dir);
         let mut bytes = std::fs::read(&path).unwrap();
-        // 第一个块占 [0, 26)，它的条数在最后两个字节。
-        bytes[24] = 0;
-        bytes[25] = 0;
+        // 第一个块占 [0, 32)，它的条数在最后两个字节。
+        bytes[30] = 0;
+        bytes[31] = 0;
         std::fs::write(&path, &bytes).unwrap();
         let sst = open_sst(&path).unwrap();
 
@@ -969,7 +1103,7 @@ mod tests {
 
         // 把第 0 块的字节全部改成 0xff；文件长度不变。
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[..26].fill(0xff);
+        bytes[..32].fill(0xff);
         std::fs::write(&path, &bytes).unwrap();
 
         assert_eq!(
@@ -988,7 +1122,7 @@ mod tests {
         let sst = open_cached(&path, 1, &cache);
 
         let mut bad_bytes = good_bytes.clone();
-        bad_bytes[..26].fill(0xff);
+        bad_bytes[..32].fill(0xff);
         std::fs::write(&path, &bad_bytes).unwrap();
         assert!(sst.read_block(0).is_err());
         assert!(!cache.contains_key(&(1, 0)), "读失败的块不应当放进缓存");

@@ -22,7 +22,9 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::LsmIterator;
 use crate::mem_table::{MemTable, MemTableIterator, bound_to_owned};
 use crate::stats::{Stats, StatsSnapshot};
-use crate::table::{BlockCache, SsTable, SsTableBuilder, SsTableIterator, new_block_cache};
+use crate::table::{
+    BlockCache, SsTable, SsTableBuilder, SsTableIterator, key_hash, new_block_cache,
+};
 
 /// `scan` 返回的游标类型，从里往外读：
 /// memtable 那一组归并成一个，SST 那一组归并成一个，两路归并把它们合起来，
@@ -174,9 +176,16 @@ impl LsmStorage {
 
         // 最后查 L0 的 SST，列表里新的在前。在每个 SST 里定位到第一条不小于 key 的
         // 记录；它的 key 恰好相等才算这个 SST 里有，否则接着看更旧的。
+        // 哈希值只和 key 有关，每个文件的 filter 都用同一个，循环之前算一次。
+        let hash = key_hash(key);
         for sst in &snapshot.l0_sstables {
             // 范围之外的文件一定没有它，一个块都不用读。
             if !sst.may_contain_key(key) {
+                continue;
+            }
+            // filter 说一定没有，也一个块都不用读。
+            if !sst.bloom_may_contain(hash) {
+                self.stats.add_tables_skipped_by_bloom(1);
                 continue;
             }
             self.stats.add_tables_probed(1);
@@ -1786,6 +1795,52 @@ mod tests {
         assert_eq!(stats.tables_probed, 2);
         // 第二次查同一个块命中缓存，不再读文件。
         assert_eq!(stats.blocks_read, 1);
+    }
+
+    // 两个文件的 key 范围重叠：较新的文件里没有要查的 key，被 filter 排除，只进入较旧的那个。
+    #[test]
+    fn get_skips_sst_rejected_by_bloom_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        add_l0_sst(
+            &storage,
+            &dir,
+            1,
+            &[("a", "1"), ("c", "3"), ("e", "5"), ("g", "7")],
+        );
+        add_l0_sst(
+            &storage,
+            &dir,
+            2,
+            &[("b", "2"), ("d", "4"), ("f", "6"), ("h", "8")],
+        );
+
+        assert_eq!(get_str(&storage, "c"), Some("3".to_string()));
+
+        let stats = storage.stats();
+        assert_eq!(stats.tables_skipped_by_bloom, 1);
+        assert_eq!(stats.tables_probed, 1);
+    }
+
+    // 查一个落在每个文件范围里、却哪里都没有的 key：全部被 filter 排除，一个块都不读。
+    // 被 key 范围排除的文件不算在 filter 排除的个数里。
+    #[test]
+    fn get_missing_key_inside_every_range_reads_no_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        for id in 1..=5 {
+            // 每个文件都有 "a" 和 "z"，范围都覆盖 "m"。
+            add_l0_sst(&storage, &dir, id, &[("a", "1"), ("z", "26")]);
+        }
+        // 这个文件的范围不覆盖 "m"。
+        add_l0_sst(&storage, &dir, 6, &[("x", "1"), ("y", "2")]);
+
+        assert_eq!(get_str(&storage, "m"), None);
+
+        let stats = storage.stats();
+        assert_eq!(stats.tables_skipped_by_bloom, 5);
+        assert_eq!(stats.tables_probed, 0);
+        assert_eq!(stats.blocks_read, 0);
     }
 
     // 内存里查到的点查也算一次点查，但不进入任何 SST。

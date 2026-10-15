@@ -5,14 +5,18 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes};
 
-use super::{BlockCache, BlockMeta, FileObject, SST_MAGIC, SsTable, encode_block_meta};
+use super::{
+    BLOOM_FALSE_POSITIVE_RATE, BlockCache, BlockMeta, Bloom, FileObject, SST_FORMAT_VERSION,
+    SST_MAGIC, SsTable, encode_block_meta, key_hash,
+};
 use crate::block::BlockBuilder;
 use crate::error::Result;
 
 /// 构建一个 SST。
 ///
 /// 手里有一个正在装的块；它装满了就封口、编码，接到已经攒下的字节后面，
-/// 在索引里记一项，再换一个新的空块。全部内容攒在内存里，`build` 时一次写出。
+/// 在索引里记一项，再换一个新的空块。每加一条记录，还记下它的 key 的哈希值，
+/// `build` 时用来做 Bloom filter。全部内容攒在内存里，`build` 时一次写出。
 /// 调用方保证记录按 key 从小到大加入，同一个 key 不出现两次。
 pub struct SsTableBuilder {
     /// 正在装的块。
@@ -25,6 +29,8 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     /// 已经封口的块的索引，每个块一项。
     block_meta: Vec<BlockMeta>,
+    /// 已经加入的每条记录的 key 的哈希值，按加入的顺序。
+    key_hashes: Vec<u32>,
     /// 每个块的目标大小。
     block_size: usize,
 }
@@ -38,6 +44,7 @@ impl SsTableBuilder {
             last_key: Vec::new(),
             data: Vec::new(),
             block_meta: Vec::new(),
+            key_hashes: Vec::new(),
             block_size,
         }
     }
@@ -65,6 +72,8 @@ impl SsTableBuilder {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
+
+        self.key_hashes.push(key_hash(key));
     }
 
     /// `key` 是否比已经加入的最后一条记录的 key 大。还没有加入过记录时为真。
@@ -121,11 +130,19 @@ impl SsTableBuilder {
         // 最后一个块还没有封口。
         self.finish_block();
 
-        // 数据块之后是索引，然后是索引的起点，最后是魔数。
-        // 索引的起点要在接上索引之前取。
+        // 数据块之后依次是索引、filter、末尾固定的 16 个字节。
+        // 每一段的起点都要在接上这一段之前取。
         let block_meta_start = self.data.len();
         encode_block_meta(&self.block_meta, &mut self.data);
+
+        let bloom_start = self.data.len();
+        let bits_per_key = Bloom::bits_per_key(BLOOM_FALSE_POSITIVE_RATE);
+        let bloom = Bloom::build(&self.key_hashes, bits_per_key);
+        bloom.encode(&mut self.data);
+
         self.data.put_u32(block_meta_start as u32);
+        self.data.put_u32(bloom_start as u32);
+        self.data.put_u32(SST_FORMAT_VERSION);
         self.data.put_u32(SST_MAGIC);
 
         let file = FileObject::create(path, &self.data)?;
@@ -139,6 +156,7 @@ impl SsTableBuilder {
             block_meta_start,
             first_key,
             last_key,
+            bloom,
             block_cache,
             stats: None,
         })
@@ -191,30 +209,41 @@ mod tests {
 
     // ---------- 第 2 步之一：add 与 finish_block ----------
 
-    // 文件的内容逐字节确定：两个数据块、索引、索引的起点、魔数。
+    // 文件的内容逐字节确定：两个数据块、索引、filter、末尾的 16 个字节。
+    // filter 的内容由 bloom.rs 的测试管，这里只确认它放在索引之后、由两个 key 做成。
     #[test]
     fn file_layout_is_exact() {
         let dir = tempfile::tempdir().unwrap();
-        // 一条记录编码成块是 10 字节；目标大小 16 放不下第二条，所以每块一条。
+        // 一条记录编码成块是 12 字节；目标大小 16 放不下第二条，所以每块一条。
         let (_sst, bytes) = build_sst(&dir, 16, &[("a", "1"), ("b", "2")]);
 
+        // 两个 key 的 filter：64 位，即 8 个字节，加上 1 字节的 k，共 9 字节。
+        let mut expected_bloom = Vec::new();
+        Bloom::build(&[key_hash(b"a"), key_hash(b"b")], 10).encode(&mut expected_bloom);
+        assert_eq!(expected_bloom.len(), 9);
+
         #[rustfmt::skip]
-        let expected: Vec<u8> = vec![
-            // 块 0，占 [0, 10)：记录 "a" → "1"，偏移数组 [0]，条数 1
-            0, 1, b'a', 0, 1, b'1',   0, 0,   0, 1,
-            // 块 1，占 [10, 20)：记录 "b" → "2"，偏移数组 [0]，条数 1
-            0, 1, b'b', 0, 1, b'2',   0, 0,   0, 1,
-            // 索引从 20 开始：块数 2
+        let mut expected: Vec<u8> = vec![
+            // 块 0，占 [0, 12)：记录 "a" → "1"（共有前缀 0），偏移数组 [0]，条数 1
+            0, 0, 0, 1, b'a', 0, 1, b'1',   0, 0,   0, 1,
+            // 块 1，占 [12, 24)：记录 "b" → "2"（块的第一条，共有前缀 0），偏移数组 [0]，条数 1
+            0, 0, 0, 1, b'b', 0, 1, b'2',   0, 0,   0, 1,
+            // 索引从 24 开始：块数 2
             0, 0, 0, 2,
             // 第 0 项：起点 0，首 key "a"，末 key "a"
             0, 0, 0, 0,   0, 1, b'a',   0, 1, b'a',
-            // 第 1 项：起点 10，首 key "b"，末 key "b"
-            0, 0, 0, 10,   0, 1, b'b',   0, 1, b'b',
-            // 索引的起点 20
-            0, 0, 0, 20,
+            // 第 1 项：起点 12，首 key "b"，末 key "b"
+            0, 0, 0, 12,   0, 1, b'b',   0, 1, b'b',
+        ];
+        // filter 从 48 开始。
+        expected.extend_from_slice(&expected_bloom);
+        #[rustfmt::skip]
+        expected.extend_from_slice(&[
+            // 索引的起点 24，filter 的起点 48，版本号 1
+            0, 0, 0, 24,   0, 0, 0, 48,   0, 0, 0, 1,
             // 魔数 "LSM1"
             b'L', b'S', b'M', b'1',
-        ];
+        ]);
         assert_eq!(bytes, expected);
     }
 
@@ -235,10 +264,10 @@ mod tests {
     #[test]
     fn block_meta_records_first_and_last_key_of_each_block() {
         let dir = tempfile::tempdir().unwrap();
-        // 每条记录在块里占 8 字节（含偏移），块本身 2 字节；目标 26 恰好放三条。
+        // 每条记录在块里占 10 字节（含偏移），块本身 2 字节；目标 32 恰好放三条。
         let (sst, _bytes) = build_sst(
             &dir,
-            26,
+            32,
             &[
                 ("a", "1"),
                 ("b", "2"),
@@ -271,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (sst, _bytes) = build_sst(
             &dir,
-            26,
+            32,
             &[
                 ("a", "1"),
                 ("b", "2"),
@@ -283,10 +312,10 @@ mod tests {
             ],
         );
 
-        // 三条记录的块是 26 字节，一条记录的块是 10 字节。
+        // 三条记录的块是 32 字节，一条记录的块是 12 字节。
         let offsets: Vec<usize> = sst.block_meta().iter().map(|meta| meta.offset).collect();
-        assert_eq!(offsets, vec![0, 26, 52]);
-        assert_eq!(sst.block_meta_start(), 62);
+        assert_eq!(offsets, vec![0, 32, 64]);
+        assert_eq!(sst.block_meta_start(), 76);
     }
 
     // 放不下而换块的那条记录没有丢：它是新块的第一条。
@@ -350,9 +379,9 @@ mod tests {
 
     // ---------- 第 2 步之二：build ----------
 
-    // 文件的最后 4 字节是魔数，再往前 4 字节是索引的起点。
+    // 文件的最后 16 字节依次是索引的起点、filter 的起点、版本号、魔数。
     #[test]
-    fn file_ends_with_meta_offset_and_magic() {
+    fn file_ends_with_footer() {
         let dir = tempfile::tempdir().unwrap();
         let pairs = numbered_pairs(100);
         let borrowed: Vec<(&str, &str)> = pairs
@@ -362,9 +391,14 @@ mod tests {
         let (sst, bytes) = build_sst(&dir, 256, &borrowed);
 
         let len = bytes.len();
+        let read_u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
         assert_eq!(&bytes[len - 4..], b"LSM1");
-        let meta_offset = u32::from_be_bytes(bytes[len - 8..len - 4].try_into().unwrap());
+        assert_eq!(read_u32_at(len - 8), SST_FORMAT_VERSION);
+        let meta_offset = read_u32_at(len - 16);
         assert_eq!(meta_offset as usize, sst.block_meta_start());
+        // filter 从索引之后开始，到末尾的 16 字节之前为止。
+        let bloom_offset = read_u32_at(len - 12) as usize;
+        assert_eq!(len - 16 - bloom_offset, sst.bloom().encoded_len());
         // 索引紧跟在数据块后面，开头是块数。
         let block_count = u32::from_be_bytes(
             bytes[sst.block_meta_start()..sst.block_meta_start() + 4]
@@ -374,12 +408,29 @@ mod tests {
         assert_eq!(block_count as usize, sst.block_count());
     }
 
+    // 加入的每个 key 都进了 filter，跨块的也一样。
+    #[test]
+    fn every_added_key_is_in_the_bloom_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let pairs = numbered_pairs(500);
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let (sst, _bytes) = build_sst(&dir, 256, &borrowed);
+        assert!(sst.block_count() > 1);
+
+        for (key, _value) in &pairs {
+            assert!(sst.bloom_may_contain(key_hash(key.as_bytes())), "{key}");
+        }
+    }
+
     // 最后一个没装满的块也要封口写出去。
     #[test]
     fn last_partial_block_is_written() {
         let dir = tempfile::tempdir().unwrap();
-        // 目标 26 放三条；四条记录，最后一条在第二个块里。
-        let (sst, bytes) = build_sst(&dir, 26, &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
+        // 目标 32 放三条；四条记录，最后一条在第二个块里。
+        let (sst, bytes) = build_sst(&dir, 32, &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
 
         assert_eq!(sst.block_count(), 2);
         assert_eq!(records_in_file(&sst, &bytes).len(), 4);
@@ -390,7 +441,7 @@ mod tests {
     fn built_sst_knows_its_key_range_id_and_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("7.sst");
-        let mut builder = SsTableBuilder::new(26);
+        let mut builder = SsTableBuilder::new(32);
         for key in ["a", "b", "c", "d", "e", "f", "g"] {
             builder.add(key.as_bytes(), b"1");
         }

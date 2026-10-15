@@ -14,6 +14,7 @@ pub struct Stats {
     compaction_bytes_written: AtomicU64,
     gets: AtomicU64,
     tables_probed: AtomicU64,
+    tables_skipped_by_bloom: AtomicU64,
     blocks_read: AtomicU64,
 }
 
@@ -53,6 +54,12 @@ impl Stats {
         self.tables_probed.fetch_add(tables, Ordering::Relaxed);
     }
 
+    /// 点查中落在 key 范围内、但被 Bloom filter 排除的 SST 个数。
+    pub fn add_tables_skipped_by_bloom(&self, tables: u64) {
+        self.tables_skipped_by_bloom
+            .fetch_add(tables, Ordering::Relaxed);
+    }
+
     /// 从文件读出的数据块个数（命中 block cache 的不算）。
     pub fn add_blocks_read(&self, blocks: u64) {
         self.blocks_read.fetch_add(blocks, Ordering::Relaxed);
@@ -70,6 +77,7 @@ impl Stats {
             compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
             gets: self.gets.load(Ordering::Relaxed),
             tables_probed: self.tables_probed.load(Ordering::Relaxed),
+            tables_skipped_by_bloom: self.tables_skipped_by_bloom.load(Ordering::Relaxed),
             blocks_read: self.blocks_read.load(Ordering::Relaxed),
         }
     }
@@ -84,6 +92,7 @@ pub struct StatsSnapshot {
     pub compaction_bytes_written: u64,
     pub gets: u64,
     pub tables_probed: u64,
+    pub tables_skipped_by_bloom: u64,
     pub blocks_read: u64,
 }
 
@@ -98,6 +107,7 @@ impl StatsSnapshot {
                 - earlier.compaction_bytes_written,
             gets: self.gets - earlier.gets,
             tables_probed: self.tables_probed - earlier.tables_probed,
+            tables_skipped_by_bloom: self.tables_skipped_by_bloom - earlier.tables_skipped_by_bloom,
             blocks_read: self.blocks_read - earlier.blocks_read,
         }
     }
@@ -125,6 +135,14 @@ impl StatsSnapshot {
         Some(self.tables_probed as f64 / self.gets as f64)
     }
 
+    /// 平均每次点查有几个 SST 被 Bloom filter 排除。没有点查时无定义。
+    pub fn tables_skipped_by_bloom_per_get(&self) -> Option<f64> {
+        if self.gets == 0 {
+            return None;
+        }
+        Some(self.tables_skipped_by_bloom as f64 / self.gets as f64)
+    }
+
     /// 平均每次点查从文件读了几个数据块。没有点查时无定义。
     pub fn blocks_read_per_get(&self) -> Option<f64> {
         if self.gets == 0 {
@@ -149,6 +167,7 @@ mod tests {
         assert_eq!(snapshot, StatsSnapshot::default());
         assert_eq!(snapshot.write_amplification(), None);
         assert_eq!(snapshot.tables_probed_per_get(), None);
+        assert_eq!(snapshot.tables_skipped_by_bloom_per_get(), None);
         assert_eq!(snapshot.blocks_read_per_get(), None);
     }
 
@@ -175,11 +194,13 @@ mod tests {
             stats.add_get();
         }
         stats.add_tables_probed(6);
+        stats.add_tables_skipped_by_bloom(10);
         stats.add_blocks_read(2);
 
         let snapshot = stats.snapshot();
 
         assert_eq!(snapshot.tables_probed_per_get(), Some(1.5));
+        assert_eq!(snapshot.tables_skipped_by_bloom_per_get(), Some(2.5));
         assert_eq!(snapshot.blocks_read_per_get(), Some(0.5));
     }
 

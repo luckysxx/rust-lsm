@@ -148,7 +148,7 @@ mod tests {
         write_and_open(
             dir,
             "1.sst",
-            26,
+            32,
             &[
                 ("a", "1"),
                 ("b", "2"),
@@ -404,10 +404,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table = three_block_sst(&dir);
         let mut iter = SsTableIterator::new_and_seek_to_first(table).unwrap();
-        // 第一个块占 [0, 26)，已经读进内存。把文件截到只剩这一个块。
+        // 第一个块占 [0, 32)，已经读进内存。把文件截到只剩这一个块。
         let path = dir.path().join("1.sst");
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(26).unwrap();
+        file.set_len(32).unwrap();
 
         // 第一个块里的三条照常能走。
         assert_eq!(iter.key(), b"a");
@@ -429,9 +429,9 @@ mod tests {
         let table = three_block_sst(&dir);
         let path = dir.path().join("1.sst");
         let mut bytes = std::fs::read(&path).unwrap();
-        // 第二个块占 [26, 52)，把它的条数改成 0。
-        bytes[50] = 0;
-        bytes[51] = 0;
+        // 第二个块占 [32, 64)，把它的条数改成 0。
+        bytes[62] = 0;
+        bytes[63] = 0;
         std::fs::write(&path, &bytes).unwrap();
         let table_after_damage = open(&path);
         drop(table);

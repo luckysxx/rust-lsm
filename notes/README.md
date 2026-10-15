@@ -113,7 +113,7 @@ db/
 | L05 | [SST 格式](05-sst-format.md) | 部分已整理 | 文件的组成与索引、构建、落盘的步骤、`pread` 与 mmap、错误类型、打开与读块、按末 key 找块、SST 的游标、对文件内容的检查、块缓存（为什么缓存块、LRU 与 TinyLFU、按字节计容量）、块的压缩 | 第一周第 4 章 |
 | L06 | [读路径](06-read-path.md) | 部分已整理 | 状态里的 L0、跨来源的点查、两路归并、范围的两端、读放大、按 key 范围排除文件；状态快照与文件的生命周期未展开 | 第一周第 5 章 |
 | L07 | [写路径](07-write-path.md) | 部分已整理 | flush 做什么、顺序与加锁、后台线程、关闭、写入为什么暂时不返回错误；写入停顿未展开 | 第一周第 6 章 |
-| L08 | [Bloom filter 与 key 前缀压缩](08-bloom-filter-and-prefix-compression.md) | 未教学 | Bloom filter、前缀压缩、基准对比 | 第一周第 7 章 |
+| L08 | [Bloom filter 与 key 前缀压缩](08-bloom-filter-and-prefix-compression.md) | 已有正文 | Bloom filter 的原理与误判率推导、k 个位置的取法、不会漏报的三条要求、存放与点查路径、扫描用不上；前缀压缩的原理、参照第一个 key 与上一个 key 的取舍、还原 key 的代价、为以后改格式留余地；mito2 按列建 filter 的导读；两次基准 | 第一周第 7 章 |
 
 ## compaction 与持久化
 

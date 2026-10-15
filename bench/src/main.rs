@@ -225,20 +225,21 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         return;
     }
     println!(
-        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查读的数据块 |"
+        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for result in results {
         let Some(stats) = result.stats else {
             continue;
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             result.workload.name(),
             stats.user_bytes_written,
             stats.disk_bytes_written(),
             ratio(stats.write_amplification()),
             ratio(stats.tables_probed_per_get()),
+            ratio(stats.tables_skipped_by_bloom_per_get()),
             ratio(stats.blocks_read_per_get()),
         );
     }

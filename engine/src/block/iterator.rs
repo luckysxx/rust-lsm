@@ -9,23 +9,33 @@ use crate::iterators::StorageIterator;
 /// 一个块上的游标。墓碑原样给出。
 ///
 /// 块是一段不再变化的字节，位置用"第几条记录"这个下标表示就够了，
-/// 所以游标里只有一个 `Arc`（让块活着）和一个整数，没有指向块内部的引用。
+/// 游标里没有指向块内部的引用。key 做过前缀压缩，在块里不是连续的一段，
+/// 所以游标自己带一份完整的 key，每次移动之后重新拼好，`key()` 借出的是它。
 pub struct BlockIterator {
     /// 让块在游标用完之前不被释放。
     block: Arc<Block>,
     /// 游标现在指着第几条记录。等于记录的条数表示已经走到头。
     index: usize,
+    /// 当前记录的完整 key；游标无效时为空。反复使用，容量够时不再分配内存。
+    key: Vec<u8>,
 }
 
 impl BlockIterator {
     /// 创建游标，指着块里的第一条记录。
     pub fn new(block: Arc<Block>) -> Self {
-        Self { block, index: 0 }
+        let mut iterator = Self {
+            block,
+            index: 0,
+            key: Vec::new(),
+        };
+        iterator.load_key();
+        iterator
     }
 
     /// 回到块里的第一条记录。
     pub fn seek_to_first(&mut self) {
         self.index = 0;
+        self.load_key();
     }
 
     /// 定位到第一条 key 大于等于 `target` 的记录；没有这样的记录时游标变为无效。
@@ -37,28 +47,39 @@ impl BlockIterator {
         // 这一段空了，low 就是第一条大于等于 target 的记录；全都小于时它等于条数。
         let mut low = 0;
         let mut high = self.block.record_count();
+        // 中间那条的 key 先拼进 `self.key` 再比较；它只是临时借用，最后会按 `low` 重新拼。
         while low < high {
             let mid = low + (high - low) / 2;
-            let (mid_key, _mid_value) = self.block.entry(mid);
-            if mid_key < target {
+            self.block.key_at(mid, &mut self.key);
+            if self.key.as_slice() < target {
                 low = mid + 1;
             } else {
                 high = mid;
             }
         }
         self.index = low;
+        self.load_key();
+    }
+
+    /// 按 `index` 重新拼好 `key`；走到头时清空。每次移动位置之后调用。
+    fn load_key(&mut self) {
+        if self.is_valid() {
+            self.block.key_at(self.index, &mut self.key);
+        } else {
+            self.key.clear();
+        }
     }
 }
 
 impl StorageIterator for BlockIterator {
     fn key(&self) -> &[u8] {
         assert!(self.is_valid(), "游标无效时不能读取 key");
-        self.block.entry(self.index).0
+        &self.key
     }
 
     fn value(&self) -> &[u8] {
         assert!(self.is_valid(), "游标无效时不能读取 value");
-        self.block.entry(self.index).1
+        self.block.value_at(self.index)
     }
 
     fn is_valid(&self) -> bool {
@@ -67,6 +88,7 @@ impl StorageIterator for BlockIterator {
 
     fn next(&mut self) -> Result<()> {
         self.index += 1;
+        self.load_key();
         Ok(())
     }
 }
@@ -302,6 +324,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- 前缀压缩过的 key ----------
+
+    /// 共有前缀长短不一的一组 key：都和第一个 key "a/10/01" 比较。
+    fn prefixed_block() -> Arc<Block> {
+        block_of(&[
+            ("a/10/01", "1"),
+            ("a/10/02", "2"),
+            ("a/10/021", "3"),
+            ("a/11/07", "4"),
+            ("a/11/08", "5"),
+            ("b", "6"),
+        ])
+    }
+
+    // 顺序走的时候，每一步给出的都是还原好的完整 key。
+    #[test]
+    fn iteration_restores_compressed_keys() {
+        let mut iter = BlockIterator::new(prefixed_block());
+
+        let collected = collect_all(&mut iter);
+
+        assert_eq!(
+            collected,
+            expected(&[
+                ("a/10/01", "1"),
+                ("a/10/02", "2"),
+                ("a/10/021", "3"),
+                ("a/11/07", "4"),
+                ("a/11/08", "5"),
+                ("b", "6"),
+            ])
+        );
+    }
+
+    // 二分时比较的是完整的 key：目标落在共有前缀相同的几条之间也能找对。
+    #[test]
+    fn seek_compares_full_keys() {
+        let block = prefixed_block();
+        let mut iter = BlockIterator::new(block);
+
+        let mut key_after_seek = |target: &str| {
+            iter.seek_to_key(target.as_bytes());
+            if iter.is_valid() {
+                Some(String::from_utf8_lossy(iter.key()).into_owned())
+            } else {
+                None
+            }
+        };
+
+        assert_eq!(key_after_seek("a/10/02"), Some("a/10/02".to_string()));
+        assert_eq!(key_after_seek("a/10/020"), Some("a/10/021".to_string()));
+        assert_eq!(key_after_seek("a/10/03"), Some("a/11/07".to_string()));
+        assert_eq!(key_after_seek("a/11/0"), Some("a/11/07".to_string()));
+        assert_eq!(key_after_seek("a/11/08"), Some("a/11/08".to_string()));
+        assert_eq!(key_after_seek("a/2"), Some("b".to_string()));
+        assert_eq!(key_after_seek("a"), Some("a/10/01".to_string()));
+        assert_eq!(key_after_seek("c"), None);
+    }
+
+    // 定位之后接着往前走，key 仍然按位置重新还原，不残留二分时拼过的内容。
+    #[test]
+    fn next_after_seek_restores_the_following_key() {
+        let mut iter = BlockIterator::new(prefixed_block());
+        iter.seek_to_key(b"a/10/021");
+
+        iter.next().unwrap();
+
+        assert_eq!(iter.key(), b"a/11/07");
+        assert_eq!(iter.value(), b"4");
     }
 
     // ---------- 与上层配合 ----------
