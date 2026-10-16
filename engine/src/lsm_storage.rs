@@ -7,6 +7,8 @@
 //!
 //! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
+mod compact;
+
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use bytes::Bytes;
 
 use crate::error::Result;
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::{SstConcatIterator, find_sst_index};
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::LsmIterator;
@@ -27,10 +30,15 @@ use crate::table::{
 };
 
 /// `scan` 返回的游标类型，从里往外读：
-/// memtable 那一组归并成一个，SST 那一组归并成一个，两路归并把它们合起来，
-/// 最外面去掉墓碑并在上界处停下。
-pub type ScanIterator =
-    LsmIterator<TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>>;
+/// memtable 那一组归并成一个，L0 的 SST 归并成一个，两路归并把它们合起来；
+/// L1 的 SST 串接成一个，再用两路归并接在后面；最外面去掉墓碑并在上界处停下。
+/// 两路归并里同一个 key 都是前一个胜出，前一个总是更新的一侧。
+pub type ScanIterator = LsmIterator<
+    TwoMergeIterator<
+        TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
+        SstConcatIterator,
+    >,
+>;
 
 /// 某一时刻引擎由哪些表组成。
 ///
@@ -44,6 +52,9 @@ pub struct LsmStorageState {
     pub imm_memtables: Vec<Arc<MemTable>>,
     /// L0 的 SST，新的在前。它们之间的 key 范围可以重叠，所以读的时候都要看。
     pub l0_sstables: Vec<Arc<SsTable>>,
+    /// L1 的 SST，按 key 从小到大，范围互不重叠：合起来是一个排好序的序列。
+    /// 由 compaction 产生，其中的数据都比 L0 的旧。
+    pub l1_sstables: Vec<Arc<SsTable>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,16 +65,22 @@ pub struct LsmStorageOptions {
     pub block_size: usize,
     /// 块缓存的容量，字节。为 0 时不用块缓存，每次读块都从文件读。
     pub block_cache_size: usize,
+    /// compaction 写出的每个 SST 的目标大小，字节。一个文件写到这么大就封口，换下一个；
+    /// 和块一样是一条软线，文件会稍大一点。flush 不受它限制，一张 memtable 写成一个文件。
+    pub target_sst_size: usize,
 }
 
 pub struct LsmStorage {
     /// 指向当前状态的指针。读写锁保护的是"当前状态是哪一份"，不是表里的内容。
     state: RwLock<Arc<LsmStorageState>>,
-    /// 让改变结构的操作（冻结、flush 最后换状态的那一步）排队。
+    /// 让改变结构的操作（冻结、flush 与 compaction 最后换状态的那一步）排队。
     state_lock: Mutex<()>,
     /// 同一时刻只做一次 flush。写文件比较慢，这期间不占着 `state_lock`，
     /// 冻结和写入照常进行。
     flush_lock: Mutex<()>,
+    /// 同一时刻只做一次 compaction。它与 flush 可以同时进行：两者只在最后换状态时
+    /// 通过 `state_lock` 排队。
+    compaction_lock: Mutex<()>,
     /// 数据库所在的目录，SST 文件都放在这里。
     path: PathBuf,
     /// 下一个 SST 文件的编号。从 1 开始，只增不减，编号不重复使用。
@@ -86,6 +103,7 @@ impl LsmStorage {
             memtable: Arc::new(MemTable::new()),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
+            l1_sstables: Vec::new(),
         };
         let block_cache = if options.block_cache_size == 0 {
             None
@@ -97,6 +115,7 @@ impl LsmStorage {
             state: RwLock::new(Arc::new(initial_state)),
             state_lock: Mutex::new(()),
             flush_lock: Mutex::new(()),
+            compaction_lock: Mutex::new(()),
             path: path.to_path_buf(),
             next_sst_id: AtomicUsize::new(1),
             block_cache,
@@ -113,6 +132,11 @@ impl LsmStorage {
     /// 当前 L0 有几个 SST。
     pub fn l0_sstable_count(&self) -> usize {
         self.snapshot().l0_sstables.len()
+    }
+
+    /// 当前 L1 有几个 SST。
+    pub fn l1_sstable_count(&self) -> usize {
+        self.snapshot().l1_sstables.len()
     }
 
     /// 块缓存里现在有几个块、一共多少字节。没有缓存时都是 0。
@@ -174,28 +198,47 @@ impl LsmStorage {
             }
         }
 
-        // 最后查 L0 的 SST，列表里新的在前。在每个 SST 里定位到第一条不小于 key 的
-        // 记录；它的 key 恰好相等才算这个 SST 里有，否则接着看更旧的。
+        // 再查 L0 的 SST，列表里新的在前。
         // 哈希值只和 key 有关，每个文件的 filter 都用同一个，循环之前算一次。
         let hash = key_hash(key);
         for sst in &snapshot.l0_sstables {
-            // 范围之外的文件一定没有它，一个块都不用读。
-            if !sst.may_contain_key(key) {
-                continue;
-            }
-            // filter 说一定没有，也一个块都不用读。
-            if !sst.bloom_may_contain(hash) {
-                self.stats.add_tables_skipped_by_bloom(1);
-                continue;
-            }
-            self.stats.add_tables_probed(1);
-            let iterator = SsTableIterator::new_and_seek_to_key(Arc::clone(sst), key)?;
-            if iterator.is_valid() && iterator.key() == key {
-                let value = Bytes::copy_from_slice(iterator.value());
+            if let Some(value) = self.get_from_sst(sst, key, hash)? {
                 return Ok(visible_value(value));
             }
         }
 
+        // 最后查 L1。它的文件范围互不重叠，最多一个文件可能有这个 key。
+        let sst_index = find_sst_index(&snapshot.l1_sstables, key);
+        if let Some(sst) = snapshot.l1_sstables.get(sst_index)
+            && let Some(value) = self.get_from_sst(sst, key, hash)?
+        {
+            return Ok(visible_value(value));
+        }
+
+        Ok(None)
+    }
+
+    /// 在一个 SST 里找 `key`；`hash` 是 `key_hash(key)`。
+    ///
+    /// 文件里有这个 key 时返回它的 value（墓碑是空的 value），没有时返回 `None`。
+    /// 范围或 Bloom filter 能排除时一个块都不读。
+    fn get_from_sst(&self, sst: &Arc<SsTable>, key: &[u8], hash: u32) -> Result<Option<Bytes>> {
+        // 范围之外的文件一定没有它。
+        if !sst.may_contain_key(key) {
+            return Ok(None);
+        }
+        // filter 说一定没有。
+        if !sst.bloom_may_contain(hash) {
+            self.stats.add_tables_skipped_by_bloom(1);
+            return Ok(None);
+        }
+        // 定位到第一条不小于 key 的记录；它的 key 恰好相等才算文件里有。
+        self.stats.add_tables_probed(1);
+        let iterator = SsTableIterator::new_and_seek_to_key(Arc::clone(sst), key)?;
+        if iterator.is_valid() && iterator.key() == key {
+            let value = Bytes::copy_from_slice(iterator.value());
+            return Ok(Some(value));
+        }
         Ok(None)
     }
 
@@ -225,22 +268,32 @@ impl LsmStorage {
             ));
         }
 
-        // SST 这一组：列表里也是新的在前。SST 的游标只管下界，上界由最外层处理。
-        let mut sst_iters = Vec::new();
+        // L0 这一组：列表里也是新的在前。SST 的游标只管下界，上界由最外层处理。
+        let mut l0_iters = Vec::new();
         for sst in &snapshot.l0_sstables {
             // 与范围不相交的文件不建游标：建游标要读它的一个块。
             if !sst.overlaps_range(lower, upper) {
                 continue;
             }
-            sst_iters.push(sst_iterator_from(Arc::clone(sst), lower)?);
+            l0_iters.push(sst_iterator_from(Arc::clone(sst), lower)?);
         }
 
-        // memtable 比 SST 新，放在两路归并的前一个位置。
-        let two_merge_iterator = TwoMergeIterator::new(
+        // L1：只留下与范围相交的文件，串接起来。它们仍然按 key 排好、互不重叠。
+        let l1_sstables: Vec<Arc<SsTable>> = snapshot
+            .l1_sstables
+            .iter()
+            .filter(|sst| sst.overlaps_range(lower, upper))
+            .cloned()
+            .collect();
+        let l1_iter = concat_iterator_from(l1_sstables, lower)?;
+
+        // 从新到旧：memtable 比 L0 新，L0 比 L1 新，新的一侧放在两路归并的前一个位置。
+        let memtable_and_l0 = TwoMergeIterator::new(
             MergeIterator::new(memtable_iters),
-            MergeIterator::new(sst_iters),
+            MergeIterator::new(l0_iters),
         )?;
-        LsmIterator::new(two_merge_iterator, bound_to_owned(upper))
+        let all = TwoMergeIterator::new(memtable_and_l0, l1_iter)?;
+        LsmIterator::new(all, bound_to_owned(upper))
     }
 
     /// 写入一条记录。key 与 value 都不能为空：空 value 留给墓碑使用。
@@ -330,9 +383,15 @@ impl LsmStorage {
             None => return Ok(()),
         };
 
-        // 写文件。表是空的时候不写，得到 None。
-        let sst = self.build_sst_from_memtable(&memtable)?;
-        if sst.is_some() {
+        // 写文件：墓碑照常写进去，更旧的 SST 里可能还有这个 key 的值，要靠它盖住。
+        // 不限大小，一张表写成一个文件；表是空的时候不写，得到 None。
+        let mut memtable_iter =
+            MemTableIterator::new(Arc::clone(&memtable), Bound::Unbounded, Bound::Unbounded);
+        let mut ssts = self.write_ssts(&mut memtable_iter, usize::MAX, false)?;
+        assert!(ssts.len() <= 1, "不限大小时最多写出一个文件");
+        let sst = ssts.pop();
+        if let Some(sst) = &sst {
+            self.stats.add_flush_bytes_written(sst.file_size());
             self.sync_dir()?;
         }
 
@@ -355,33 +414,56 @@ impl LsmStorage {
         Ok(())
     }
 
-    /// 把一张 memtable 里的全部记录按顺序写成一个 SST 文件。
+    /// 把游标从当前位置走到头，按顺序写成一个或多个 SST 文件，返回它们（按 key 排列）。
     ///
-    /// 墓碑照常写进去：更旧的 SST 里可能还有这个 key 的值，要靠它盖住。
-    /// 表里一条记录都没有时不写文件，返回 `None`。
-    fn build_sst_from_memtable(&self, memtable: &Arc<MemTable>) -> Result<Option<Arc<SsTable>>> {
-        let mut memtable_iter =
-            MemTableIterator::new(Arc::clone(memtable), Bound::Unbounded, Bound::Unbounded);
-
-        // 游标一开始就无效，说明表里一条记录都没有。
-        if !memtable_iter.is_valid() {
-            return Ok(None);
+    /// flush 与 compaction 共用这一段：
+    ///
+    /// - 每个文件写到大约 `target_sst_size` 字节就封口，后面的记录写进下一个文件。
+    ///   给 `usize::MAX` 就只写一个文件。游标按 key 有序，所以写出的文件按 key 排好、
+    ///   范围互不重叠。
+    /// - `drop_tombstones` 为真时墓碑不写进文件。只有输出是最底层、下面不可能再有
+    ///   这个 key 的更旧版本时才可以这样做，否则被删除的值会复活。
+    ///
+    /// 一条要写的记录都没有时不写文件，返回空的列表。文件同步到磁盘，但目录的同步
+    /// 与计数器由调用方负责。
+    fn write_ssts(
+        &self,
+        iter: &mut impl StorageIterator,
+        target_sst_size: usize,
+        drop_tombstones: bool,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        let mut ssts = Vec::new();
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        while iter.is_valid() {
+            let key = iter.key();
+            let value = iter.value();
+            // 要丢掉的墓碑不写，其余照写。
+            if !(drop_tombstones && value.is_empty()) {
+                builder.add(key, value);
+                // 写够了就封口，换一个新的构建器接着写。
+                if builder.estimated_size() >= target_sst_size {
+                    let new_builder = SsTableBuilder::new(self.options.block_size);
+                    let full_builder = std::mem::replace(&mut builder, new_builder);
+                    ssts.push(self.finish_sst(full_builder)?);
+                }
+            }
+            iter.next()?;
         }
-
-        // 把全部记录按顺序交给构建器。墓碑也照常交。
-        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
-        while memtable_iter.is_valid() {
-            sst_builder.add(memtable_iter.key(), memtable_iter.value());
-            memtable_iter.next()?;
+        // 最后一个文件没写满也要写出去；它是空的就不写。
+        if !builder.is_empty() {
+            ssts.push(self.finish_sst(builder)?);
         }
+        Ok(ssts)
+    }
 
+    /// 给构建器分配一个文件编号，写成文件，接上块缓存与计数器。构建器至少要有一条记录。
+    fn finish_sst(&self, builder: SsTableBuilder) -> Result<Arc<SsTable>> {
         let sst_id = self.allocate_sst_id();
         let block_cache = self.block_cache.clone();
-        let sst = sst_builder
+        let sst = builder
             .build(sst_id, block_cache, &self.path_of_sst(sst_id))?
             .with_stats(Arc::clone(&self.stats));
-        self.stats.add_flush_bytes_written(sst.file_size());
-        Ok(Some(Arc::new(sst)))
+        Ok(Arc::new(sst))
     }
 
     /// 把可写的表移进冻结列表，换上一张新的空表。
@@ -421,6 +503,24 @@ fn sst_iterator_from(sst: Arc<SsTable>, lower: Bound<&[u8]>) -> Result<SsTableIt
     }
 }
 
+/// 在一层按 key 排好的 SST 上建串接游标，指着范围下界之后的第一条记录。
+fn concat_iterator_from(
+    sstables: Vec<Arc<SsTable>>,
+    lower: Bound<&[u8]>,
+) -> Result<SstConcatIterator> {
+    match lower {
+        Bound::Included(key) => SstConcatIterator::create_and_seek_to_key(sstables, key),
+        Bound::Excluded(key) => {
+            let mut iterator = SstConcatIterator::create_and_seek_to_key(sstables, key)?;
+            if iterator.is_valid() && iterator.key() == key {
+                iterator.next()?;
+            }
+            Ok(iterator)
+        }
+        Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables),
+    }
+}
+
 /// 读到的记录怎样呈现给调用方：空 value 是墓碑，表现为不存在。
 fn visible_value(value: Bytes) -> Option<Bytes> {
     if value.is_empty() { None } else { Some(value) }
@@ -435,7 +535,7 @@ mod tests {
     use std::thread;
 
     /// 扫描整个引擎，收集结果。
-    fn scan_all(storage: &LsmStorage) -> Vec<(String, String)> {
+    pub(super) fn scan_all(storage: &LsmStorage) -> Vec<(String, String)> {
         let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
         collect_all(&mut iter)
     }
@@ -443,7 +543,7 @@ mod tests {
     /// 测试用的引擎：开在一个临时目录里，目录随它一起清理。
     ///
     /// 实现了 `Deref`，所以可以直接当作 `LsmStorage` 用：`storage.put(…)`、`&storage`。
-    struct TestStorage {
+    pub(super) struct TestStorage {
         storage: LsmStorage,
         dir: tempfile::TempDir,
     }
@@ -463,7 +563,7 @@ mod tests {
         }
 
         /// 目录里现有的 SST 文件名，按名字排序。
-        fn sst_file_names(&self) -> Vec<String> {
+        pub(super) fn sst_file_names(&self) -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(self.dir())
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -475,19 +575,24 @@ mod tests {
     }
 
     fn open_with_limit(memtable_size_limit: usize) -> TestStorage {
-        let dir = tempfile::tempdir().unwrap();
-        let options = LsmStorageOptions {
+        open_with_options(LsmStorageOptions {
             memtable_size_limit,
             // 块给得很小，让测试里的 SST 也有好几个块。
             block_size: 64,
             block_cache_size: 1 << 20,
-        };
+            target_sst_size: 1024,
+        })
+    }
+
+    /// 用给定的选项在一个新的临时目录里打开引擎。
+    pub(super) fn open_with_options(options: LsmStorageOptions) -> TestStorage {
+        let dir = tempfile::tempdir().unwrap();
         let storage = LsmStorage::open(dir.path(), options).unwrap();
         TestStorage { storage, dir }
     }
 
     /// 上限大到测试里不会触发自动冻结。
-    fn open_without_auto_freeze() -> TestStorage {
+    pub(super) fn open_without_auto_freeze() -> TestStorage {
         open_with_limit(usize::MAX)
     }
 
@@ -872,7 +977,7 @@ mod tests {
 
     /// 把一串记录写成一个 SST 文件，放到 L0 的最前面（它成为最新的 SST）。
     /// 记录必须已经按 key 从小到大排好。空字符串的 value 是墓碑。
-    fn add_l0_sst(
+    pub(super) fn add_l0_sst(
         storage: &LsmStorage,
         dir: &tempfile::TempDir,
         id: usize,
@@ -895,7 +1000,7 @@ mod tests {
         *guard = Arc::new(new_state);
     }
 
-    fn get_str(storage: &LsmStorage, key: &str) -> Option<String> {
+    pub(super) fn get_str(storage: &LsmStorage, key: &str) -> Option<String> {
         storage
             .get(key.as_bytes())
             .unwrap()
@@ -1221,6 +1326,189 @@ mod tests {
         }
     }
 
+    // ---------- 读路径：L1 ----------
+
+    /// 把几组记录各写成一个 SST，按给出的顺序整层换成 L1。每组记录必须已经按 key 排好，
+    /// 组与组之间按 key 从小到大、范围互不重叠。空字符串的 value 是墓碑。
+    pub(super) fn set_l1_ssts(
+        storage: &LsmStorage,
+        dir: &tempfile::TempDir,
+        files: &[(usize, &[(&str, &str)])],
+    ) {
+        let mut l1_sstables = Vec::new();
+        for (id, pairs) in files {
+            let path = dir.path().join(format!("{id:05}.sst"));
+            let mut builder = crate::table::SsTableBuilder::new(32);
+            for (key, value) in pairs.iter() {
+                builder.add(key.as_bytes(), value.as_bytes());
+            }
+            let block_cache = storage.block_cache.clone();
+            let sst = builder.build(*id, block_cache, &path).unwrap();
+            l1_sstables.push(Arc::new(sst.with_stats(Arc::clone(&storage.stats))));
+        }
+
+        let _state_lock = storage.state_lock.lock().unwrap();
+        let mut guard = storage.state.write().unwrap();
+        let mut new_state = guard.as_ref().clone();
+        new_state.l1_sstables = l1_sstables;
+        *guard = Arc::new(new_state);
+    }
+
+    /// 三个 L1 文件：[a, c]、[e, g]、[i, k]，文件之间留着空隙。
+    fn set_three_l1_ssts(storage: &LsmStorage, dir: &tempfile::TempDir) {
+        set_l1_ssts(
+            storage,
+            dir,
+            &[
+                (1, &[("a", "1"), ("b", "2"), ("c", "3")]),
+                (2, &[("e", "5"), ("f", "6"), ("g", "7")]),
+                (3, &[("i", "9"), ("k", "11")]),
+            ],
+        );
+    }
+
+    // L1 里每个文件的 key 都查得到；落在文件里的空隙、文件之间、两端之外的都查不到。
+    #[test]
+    fn get_finds_keys_in_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+
+        for (key, value) in [
+            ("a", "1"),
+            ("c", "3"),
+            ("e", "5"),
+            ("g", "7"),
+            ("i", "9"),
+            ("k", "11"),
+        ] {
+            assert_eq!(get_str(&storage, key), Some(value.to_string()), "{key}");
+        }
+        for key in ["0", "bb", "d", "h", "j", "z"] {
+            assert_eq!(get_str(&storage, key), None, "{key}");
+        }
+    }
+
+    // L1 的点查最多进入一个文件：范围互不重叠，按 key 直接找到那一个。
+    #[test]
+    fn get_probes_at_most_one_l1_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+
+        assert_eq!(get_str(&storage, "k"), Some("11".to_string()));
+        assert_eq!(storage.stats().tables_probed, 1);
+
+        // 落在文件之间的空隙里：找到的那个文件范围也不覆盖它，一个文件都不进入。
+        assert_eq!(get_str(&storage, "h"), None);
+        assert_eq!(storage.stats().tables_probed, 1);
+    }
+
+    // 同一个 key 在 L0 和 L1 都有：L0 的更新，胜出。
+    #[test]
+    fn get_prefers_l0_over_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+        add_l0_sst(&storage, &dir, 10, &[("b", "new"), ("f", "new")]);
+
+        assert_eq!(get_str(&storage, "b"), Some("new".to_string()));
+        assert_eq!(get_str(&storage, "f"), Some("new".to_string()));
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+    }
+
+    // L0 里的墓碑盖住 L1 里的值；memtable 里的值盖住 L1 里的值。
+    #[test]
+    fn get_newer_tombstone_and_memtable_hide_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+        add_l0_sst(&storage, &dir, 10, &[("e", "")]);
+        storage.put(b"i", b"mem");
+
+        assert_eq!(get_str(&storage, "e"), None);
+        assert_eq!(get_str(&storage, "i"), Some("mem".to_string()));
+    }
+
+    // L1 里的墓碑照样表现为不存在。
+    #[test]
+    fn get_l1_tombstone_reads_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_l1_ssts(&storage, &dir, &[(1, &[("a", "1"), ("b", "")])]);
+
+        assert_eq!(get_str(&storage, "b"), None);
+    }
+
+    // 扫描把 memtable、L0、L1 按 key 交错归并，同一个 key 取最新的，墓碑不出现。
+    #[test]
+    fn scan_merges_l0_and_l1_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+        add_l0_sst(
+            &storage,
+            &dir,
+            10,
+            &[("b", "new"), ("d", "4"), ("g", ""), ("x", "24")],
+        );
+        storage.put(b"h", b"8");
+
+        assert_eq!(
+            scan_all(&storage),
+            expected(&[
+                ("a", "1"),
+                ("b", "new"),
+                ("c", "3"),
+                ("d", "4"),
+                ("e", "5"),
+                ("f", "6"),
+                ("h", "8"),
+                ("i", "9"),
+                ("k", "11"),
+                ("x", "24"),
+            ])
+        );
+    }
+
+    // 扫描的两端落在 L1 的文件中间、文件之间，包含与不包含两种下界。
+    #[test]
+    fn scan_respects_bounds_in_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+
+        assert_eq!(
+            scan_range(&storage, Bound::Included(b"b"), Bound::Excluded(b"f")),
+            expected(&[("b", "2"), ("c", "3"), ("e", "5")])
+        );
+        assert_eq!(
+            scan_range(&storage, Bound::Excluded(b"c"), Bound::Included(b"i")),
+            expected(&[("e", "5"), ("f", "6"), ("g", "7"), ("i", "9")])
+        );
+        assert_eq!(
+            scan_range(&storage, Bound::Included(b"d"), Bound::Included(b"h")),
+            expected(&[("e", "5"), ("f", "6"), ("g", "7")])
+        );
+        assert_eq!(
+            scan_range(&storage, Bound::Excluded(b"k"), Bound::Unbounded),
+            expected(&[])
+        );
+    }
+
+    // 扫描范围之外的 L1 文件一个块都不读。
+    #[test]
+    fn scan_skips_l1_files_outside_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_three_l1_ssts(&storage, &dir);
+
+        let collected = scan_range(&storage, Bound::Included(b"e"), Bound::Included(b"g"));
+
+        assert_eq!(collected, expected(&[("e", "5"), ("f", "6"), ("g", "7")]));
+        assert_eq!(storage.stats().blocks_read, 1);
+    }
+
     // ---------- 写路径：flush ----------
 
     /// 写入几条记录，然后冻结。
@@ -1250,6 +1538,7 @@ mod tests {
             memtable_size_limit: 1024,
             block_size: 64,
             block_cache_size: 1 << 20,
+            target_sst_size: 1024,
         };
 
         let _storage = LsmStorage::open(&path, options).unwrap();
@@ -1574,6 +1863,118 @@ mod tests {
         assert_eq!(scan_all(&storage).len(), writers * puts_per_writer);
     }
 
+    // ---------- 游标写成 SST：write_ssts ----------
+
+    /// 在一个新引擎上把记录交给 `write_ssts`，返回引擎和写出的文件。
+    ///
+    /// 放在另一个线程里、设了时限：循环里漏了让游标前进时，测试报"卡住"而不是停在那里。
+    fn write_strs(
+        pairs: &[(&str, &str)],
+        target_sst_size: usize,
+        drop_tombstones: bool,
+    ) -> (TestStorage, Vec<Arc<SsTable>>) {
+        let storage = open_without_auto_freeze();
+        let records: Vec<(Bytes, Bytes)> = pairs
+            .iter()
+            .map(|(key, value)| {
+                (
+                    Bytes::copy_from_slice(key.as_bytes()),
+                    Bytes::copy_from_slice(value.as_bytes()),
+                )
+            })
+            .collect();
+        run_with_deadline("write_ssts", move || {
+            let mut iter = crate::iterators::vec_iterator::VecIterator::new(records);
+            let ssts = storage
+                .write_ssts(&mut iter, target_sst_size, drop_tombstones)
+                .unwrap();
+            (storage, ssts)
+        })
+    }
+
+    /// 一组按 key 排好、互不重叠的 SST 里的全部记录，墓碑原样给出。
+    fn records_of(ssts: &[Arc<SsTable>]) -> Vec<(String, String)> {
+        let mut iter = SstConcatIterator::create_and_seek_to_first(ssts.to_vec()).unwrap();
+        collect_all(&mut iter)
+    }
+
+    // 游标里一条记录都没有：不写文件。
+    #[test]
+    fn write_ssts_writes_nothing_for_empty_input() {
+        let (storage, ssts) = write_strs(&[], usize::MAX, false);
+
+        assert!(ssts.is_empty());
+        assert!(storage.sst_file_names().is_empty());
+    }
+
+    // 不限大小：全部记录写进一个文件，墓碑照常写。
+    #[test]
+    fn write_ssts_without_limit_writes_one_file_with_tombstones() {
+        let pairs = [("a", "1"), ("b", ""), ("c", "3")];
+
+        let (_storage, ssts) = write_strs(&pairs, usize::MAX, false);
+
+        assert_eq!(ssts.len(), 1);
+        assert_eq!(records_of(&ssts), expected(&pairs));
+    }
+
+    // 要求丢掉墓碑时，墓碑不写进文件，其余记录照写。
+    #[test]
+    fn write_ssts_drops_tombstones_when_asked() {
+        let (_storage, ssts) = write_strs(&[("a", "1"), ("b", ""), ("c", "3")], usize::MAX, true);
+
+        assert_eq!(records_of(&ssts), expected(&[("a", "1"), ("c", "3")]));
+    }
+
+    // 只有墓碑、又要求丢掉墓碑：一条要写的都没有，不写文件。
+    #[test]
+    fn write_ssts_writes_nothing_when_only_dropped_tombstones() {
+        let (storage, ssts) = write_strs(&[("a", ""), ("b", "")], usize::MAX, true);
+
+        assert!(ssts.is_empty());
+        assert!(storage.sst_file_names().is_empty());
+    }
+
+    // 写到目标大小就换文件：除最后一个外每个文件都不小于目标大小，文件按 key 排好、
+    // 互不重叠，合起来正好是全部记录。
+    #[test]
+    fn write_ssts_splits_at_target_size() {
+        let keys: Vec<String> = (0..100).map(|i| format!("key-{i:03}")).collect();
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "value")).collect();
+
+        let (storage, ssts) = write_strs(&pairs, 300, false);
+
+        assert!(ssts.len() > 1);
+        for sst in &ssts[..ssts.len() - 1] {
+            assert!(sst.file_size() >= 300, "文件只有 {} 字节", sst.file_size());
+        }
+        for pair in ssts.windows(2) {
+            assert!(pair[0].last_key() < pair[1].first_key());
+        }
+        assert_eq!(records_of(&ssts), expected(&pairs));
+        assert_eq!(storage.sst_file_names().len(), ssts.len());
+    }
+
+    // 目标大小小到一条记录就超过：每条记录独占一个文件。
+    #[test]
+    fn write_ssts_tiny_target_puts_each_record_in_its_own_file() {
+        let pairs = [("a", "1"), ("b", "2"), ("c", "3")];
+
+        let (_storage, ssts) = write_strs(&pairs, 1, false);
+
+        assert_eq!(ssts.len(), 3);
+        assert_eq!(records_of(&ssts), expected(&pairs));
+    }
+
+    // 刚换了新文件、后面只剩要丢掉的墓碑：不写出空文件。
+    #[test]
+    fn write_ssts_does_not_write_empty_file_after_split() {
+        let (_storage, ssts) = write_strs(&[("a", "1"), ("b", ""), ("c", "")], 1, true);
+
+        assert_eq!(ssts.len(), 1);
+        assert_eq!(records_of(&ssts), expected(&[("a", "1")]));
+    }
+
     // ---------- 写路径：冻结的通知与 flush 到一张不剩 ----------
 
     /// 调用 `flush_all_imm_memtables`，设了时限：循环停不下来时测试失败而不是卡死。
@@ -1865,6 +2266,7 @@ mod tests {
             memtable_size_limit: usize::MAX,
             block_size: 64,
             block_cache_size: 0,
+            target_sst_size: 1024,
         };
         let storage = LsmStorage::open(dir.path(), options).unwrap();
         storage.put(b"a", b"1");

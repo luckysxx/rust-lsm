@@ -9,11 +9,14 @@
 //! - 直接读数据的（没有参数），和它读的数据放在一起：
 //!   `mem_table::MemTableIterator`、`block::BlockIterator`、`table::SsTableIterator`，
 //!   以及只在测试里用的 `vec_iterator::VecIterator`。
+//! - 直接读数据、但跨好几个文件的（没有参数）：`concat_iterator::SstConcatIterator`，
+//!   在一层里按 key 排好的一组 SST 上一个接一个地走。
 //! - 包着别的游标、对它们的结果做加工的（有参数 `I`，就是里面那层的类型）：
 //!   `merge_iterator::MergeIterator<I>`（多个同一种类型的合成一个）、
 //!   `two_merge_iterator::TwoMergeIterator<A, B>`（两个可以不同类型的合成一个）、
 //!   `lsm_iterator::LsmIterator<I>`（跳过墓碑，到上界为止）。
 
+pub mod concat_iterator;
 pub mod merge_iterator;
 pub mod two_merge_iterator;
 #[cfg(test)]

@@ -36,6 +36,23 @@ pub trait KvTarget: Sync {
 
     /// 等后台工作做完再返回。没有后台工作的对象直接返回。
     fn wait_for_background(&self) {}
+
+    /// 把磁盘上的全部 SST 合并成一层。没有 compaction 的对象什么也不做。
+    fn compact(&self) {}
+
+    /// 此刻磁盘上的 SST：L0、L1 各有几个文件，一共多少字节。不写磁盘的对象没有，返回 `None`。
+    fn sst_layout(&self) -> Option<SstLayout> {
+        None
+    }
+}
+
+/// 某一时刻磁盘上的 SST 怎样分布。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SstLayout {
+    pub l0_files: usize,
+    pub l1_files: usize,
+    /// 目录里全部 SST 文件的长度之和。
+    pub total_bytes: u64,
 }
 
 /// 内存基线：一把互斥锁保护的 `BTreeMap`。
@@ -119,8 +136,9 @@ impl KvTarget for MemTableTarget {
 
 /// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；没有 WAL。
 ///
-/// 目前没有 compaction，L0 的文件只增不减，点查与扫描要逐个去看，靠每个文件的
-/// 首末 key 排除范围之外的文件，读块先查块缓存。
+/// 没有自动的 compaction：L0 的文件只增不减，只有执行 `compact` 负载时才全部合并成 L1。
+/// 点查与扫描要逐个去看 L0 的文件，靠每个文件的首末 key 与 Bloom filter 排除，
+/// L1 只看一个文件；读块先查块缓存。
 /// 写入太快时冻结的表会在内存里排队，还没有让写入等一等的机制；
 /// 每段负载结束后基准驱动等它们全部落盘，再开始下一段。
 /// 与 `MemTableTarget` 相比，差别是多了状态快照、冻结、落盘，以及跨表和文件的查找与归并。
@@ -129,7 +147,7 @@ pub struct EngineTarget {
     memtable_size_limit: usize,
     block_cache_size: usize,
     /// 引擎所在的临时目录，随被测对象一起清理。
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl EngineTarget {
@@ -139,6 +157,8 @@ impl EngineTarget {
             memtable_size_limit,
             block_size: 4096,
             block_cache_size,
+            // compaction 写出的文件与 flush 写出的一样大，与 RocksDB 默认的做法相同。
+            target_sst_size: memtable_size_limit,
         };
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let db = Db::open(dir.path(), options).expect("打开引擎失败");
@@ -146,7 +166,7 @@ impl EngineTarget {
             db,
             memtable_size_limit,
             block_cache_size,
-            _dir: dir,
+            dir,
         }
     }
 }
@@ -180,12 +200,13 @@ impl KvTarget for EngineTarget {
         let cache_megabytes = self.block_cache_size / (1024 * 1024);
         let frozen = self.db.imm_memtable_count();
         let l0_files = self.db.l0_sstable_count();
+        let l1_files = self.db.l1_sstable_count();
         let (cached_blocks, cached_bytes) = self.db.block_cache_usage();
         let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
         Some(format!(
             "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB；\
              结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST，\
-             块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
+             L1 有 {l1_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
         ))
     }
 
@@ -198,6 +219,26 @@ impl KvTarget for EngineTarget {
         while self.db.imm_memtable_count() > 0 {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn compact(&self) {
+        self.db.force_full_compaction().expect("compaction 失败");
+    }
+
+    fn sst_layout(&self) -> Option<SstLayout> {
+        let mut total_bytes = 0;
+        for entry in std::fs::read_dir(self.dir.path()).expect("读目录失败") {
+            let entry = entry.expect("读目录失败");
+            let is_sst = entry.file_name().to_string_lossy().ends_with(".sst");
+            if is_sst {
+                total_bytes += entry.metadata().expect("读文件信息失败").len();
+            }
+        }
+        Some(SstLayout {
+            l0_files: self.db.l0_sstable_count(),
+            l1_files: self.db.l1_sstable_count(),
+            total_bytes,
+        })
     }
 }
 

@@ -117,6 +117,18 @@ impl Db {
         self.storage.l0_sstable_count()
     }
 
+    /// 当前 L1 有几个 SST。
+    pub fn l1_sstable_count(&self) -> usize {
+        self.storage.l1_sstable_count()
+    }
+
+    /// 把 L0 与 L1 的全部文件合并成新的 L1，见 [`LsmStorage::force_full_compaction`]。
+    ///
+    /// 在调用它的线程里做完才返回；后台的 flush 照常进行。
+    pub fn force_full_compaction(&self) -> Result<()> {
+        self.storage.force_full_compaction()
+    }
+
     /// 块缓存里现在有几个块、一共多少字节。
     pub fn block_cache_usage(&self) -> (u64, u64) {
         self.storage.block_cache_usage()
@@ -220,6 +232,7 @@ mod tests {
             memtable_size_limit,
             block_size: 64,
             block_cache_size: 1 << 20,
+            target_sst_size: 1024,
         }
     }
 
@@ -553,6 +566,44 @@ mod tests {
         assert!(wait_until(|| db.imm_memtable_count() == 0));
         assert!(db.l0_sstable_count() > 1);
         assert_eq!(db.scan_all().len(), writers * puts_per_writer);
+    }
+
+    // 写入、后台 flush、compaction 同时进行：每条记录写完立刻读得到；
+    // 最后再合并一次，L0 清空，数据一条不少，目录里只剩 L1 的文件。
+    // 整个测试设了时限：几把锁的先后顺序出错时，测试报"卡住"而不是停在那里。
+    #[test]
+    fn db_compacts_while_writing_and_flushing() {
+        run_with_deadline("写入、flush 与 compaction 同时进行", || {
+            let db = TestDb::open(256, SOON);
+            let writers = 2;
+            let puts_per_writer = 500;
+
+            thread::scope(|scope| {
+                let db = &db;
+                for writer in 0..writers {
+                    scope.spawn(move || {
+                        for i in 0..puts_per_writer {
+                            let key = format!("w{writer}-{i:04}");
+                            db.put(key.as_bytes(), b"v");
+                            assert_eq!(db.get_str(&key), Some("v".to_string()));
+                        }
+                    });
+                }
+                // 写入期间反复合并：每次都可能撞上正在进行的 flush。
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        db.force_full_compaction().unwrap();
+                    }
+                });
+            });
+
+            assert!(wait_until(|| db.imm_memtable_count() == 0));
+            db.force_full_compaction().unwrap();
+            assert_eq!(db.l0_sstable_count(), 0);
+            assert!(db.l1_sstable_count() > 0);
+            assert_eq!(db.scan_all().len(), writers * puts_per_writer);
+            assert_eq!(sst_file_names(db.dir()).len(), db.l1_sstable_count());
+        });
     }
 
     // 关闭：可写的表里的数据也被写成 SST。直接读文件核对，墓碑也在里面。

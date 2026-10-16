@@ -383,8 +383,7 @@ impl SsTable {
         let mut high = self.block_meta.len();
         while low < high {
             let mid = low + (high - low) / 2;
-            let mid_key = &self.block_meta[mid].last_key;
-            if mid_key < key {
+            if self.block_meta[mid].last_key < key {
                 low = mid + 1;
             } else {
                 high = mid;

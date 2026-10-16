@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use lsm::stats::StatsSnapshot;
 
-use crate::target::KvTarget;
+use crate::target::{KvTarget, SstLayout};
 use crate::workload::{
     KEY_SIZE, Rng, Workload, existing_key, make_value, missing_key, shuffled_indexes,
 };
@@ -38,6 +38,7 @@ impl Config {
     pub fn total_ops(&self, workload: Workload) -> u64 {
         match workload {
             Workload::SeekRandom => (self.num / self.scan_length as u64).max(1),
+            Workload::Compact => 1,
             _ => self.num,
         }
     }
@@ -59,6 +60,8 @@ pub struct WorkloadResult {
     pub user_bytes: u64,
     /// 这段负载期间引擎计数器的增量；被测对象没有计数器时为 `None`。
     pub stats: Option<StatsSnapshot>,
+    /// 这段负载结束、后台工作做完之后，磁盘上的 SST；不写磁盘的被测对象为 `None`。
+    pub sst_layout: Option<SstLayout>,
 }
 
 impl WorkloadResult {
@@ -88,7 +91,12 @@ struct ThreadResult {
 /// 把一种负载的操作分给各个线程。
 fn plan_threads(workload: Workload, config: &Config) -> Vec<ThreadPlan> {
     let base_seed = config.seed.wrapping_add(workload.seed_offset());
-    let threads = config.threads as u64;
+    // compaction 只做一次，不分给多个线程。
+    let threads = if workload == Workload::Compact {
+        1
+    } else {
+        config.threads as u64
+    };
     let total_ops = config.total_ops(workload);
 
     // 两种 fill 都要保证每个 key 恰好写一次：先排好全部编号，再切给各线程。
@@ -176,6 +184,7 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
     let drain = drain_started.elapsed();
 
     let stats_after = target.stats();
+    let sst_layout = target.sst_layout();
     let stats = match (stats_before, stats_after) {
         (Some(before), Some(after)) => Some(after.since(&before)),
         _ => None,
@@ -201,6 +210,7 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
         found,
         user_bytes,
         stats,
+        sst_layout,
     }
 }
 
@@ -274,6 +284,11 @@ fn run_thread(
                 record(&mut latency_nanos, op_started.elapsed());
                 found += records_read as u64;
             }
+        }
+        Workload::Compact => {
+            let op_started = Instant::now();
+            target.compact();
+            record(&mut latency_nanos, op_started.elapsed());
         }
     }
 
@@ -367,6 +382,39 @@ mod tests {
         assert!(target.get(&existing_key(config.num)).is_none());
     }
 
+    // compact 只执行一次，线程数设多少都只用一个线程。
+    #[test]
+    fn compact_runs_once_on_one_thread() {
+        let plans = plan_threads(Workload::Compact, &threaded_config(4));
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].ops, 1);
+        assert_eq!(threaded_config(4).total_ops(Workload::Compact), 1);
+    }
+
+    // 对引擎执行 compact：L0 清空，数据进了 L1，读到的不变；计数器记下了 compaction 写的字节。
+    #[test]
+    fn compact_moves_engine_data_into_l1() {
+        use crate::target::EngineTarget;
+
+        // memtable 上限 16 KB，1000 条记录写出好几个 L0 文件。
+        let target = EngineTarget::new(16 * 1024, 1 << 20);
+        let config = small_config();
+        run_workload(&target, Workload::FillRandom, &config);
+        let before = target.sst_layout().unwrap();
+        assert!(before.l0_files > 1);
+
+        let result = run_workload(&target, Workload::Compact, &config);
+
+        let after = result.sst_layout.unwrap();
+        assert_eq!(result.ops, 1);
+        assert_eq!(after.l0_files, 0);
+        assert!(after.l1_files > 0);
+        assert!(result.stats.unwrap().compaction_bytes_written > 0);
+        let hits = run_workload(&target, Workload::ReadRandom, &config);
+        assert_eq!(hits.found, config.num);
+    }
+
     // 被测对象没有计数器时，结果里的放大数据为空。
     #[test]
     fn target_without_counters_reports_no_stats() {
@@ -374,6 +422,7 @@ mod tests {
         let result = run_workload(&target, Workload::FillRandom, &small_config());
 
         assert!(result.stats.is_none());
+        assert!(result.sst_layout.is_none());
     }
 
     // 操作数除不尽线程数时，各线程的份额相差不超过 1，合计等于总数。

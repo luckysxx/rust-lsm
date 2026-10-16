@@ -50,6 +50,8 @@ fn main() -> anyhow::Result<()> {
         memtable_size_limit,
         block_size: BLOCK_SIZE,
         block_cache_size: BLOCK_CACHE_SIZE,
+        // compaction 写出的文件与 flush 写出的一样大。
+        target_sst_size: memtable_size_limit,
     };
     let db = Db::open(&dir, options).with_context(|| format!("打开数据库：{}", dir.display()))?;
     println!("已打开 {}。输入 help 查看命令。", dir.display());

@@ -119,7 +119,7 @@ db/
 
 | 编号 | 笔记 | 状态 | 主要范围 | mini-lsm |
 | --- | --- | --- | --- | --- |
-| L09 | [compaction 的执行](09-compaction-execution.md) | 未教学 | 归并执行、保留与丢弃、状态切换、旧文件删除 | 第二周第 1 章 |
+| L09 | [compaction 的执行](09-compaction-execution.md) | 已有正文 | 只增不减的代价、层（L0、sorted run、为什么要 L0）、墓碑何时可以丢、读 L1 与串接游标、扫描为什么要归并、执行步骤与丢失更新、删除旧文件与 Unix 语义、输出切分、tiered 与 leveled；mito2 换状态与删文件的导读；基准 | 第二周第 1 章 |
 | L10 | [简单分层 compaction](10-simple-leveled-compaction.md) | 未教学 | 文件数触发、层间比例触发、compaction 线程 | 第二周第 2 章 |
 | L11 | [tiered compaction](11-tiered-compaction.md) | 未教学 | 有序段、三种触发条件、放大的取舍 | 第二周第 3 章 |
 | L12 | [leveled compaction](12-leveled-compaction.md) | 未教学 | 目标大小、基准层、优先级、选文件 | 第二周第 4 章 |

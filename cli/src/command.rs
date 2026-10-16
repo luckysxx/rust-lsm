@@ -24,7 +24,9 @@ pub enum Command {
     /// `fill COUNT`：写入 `COUNT` 条 `key-000000 = value-000000` 这样的记录，
     /// 用来很快写满 memtable、看到 SST 文件出现。
     Fill { count: u64 },
-    /// `status`：冻结的 memtable 个数、L0 的 SST 个数、块缓存的用量，以及目录里的 SST 文件。
+    /// `compact`：把 L0 与 L1 的全部 SST 合并成新的 L1。
+    Compact,
+    /// `status`：冻结的 memtable 个数、L0 与 L1 的 SST 个数、块缓存的用量，以及目录里的 SST 文件。
     Status,
     /// `help`：列出所有命令。
     Help,
@@ -33,8 +35,8 @@ pub enum Command {
 }
 
 /// 所有的命令名。用来区分"不认识的命令"和"认识的命令、参数个数不对"。
-const COMMAND_NAMES: [&str; 8] = [
-    "put", "get", "delete", "scan", "fill", "status", "help", "quit",
+const COMMAND_NAMES: [&str; 9] = [
+    "put", "get", "delete", "scan", "fill", "compact", "status", "help", "quit",
 ];
 
 /// `help` 打印的内容。
@@ -44,7 +46,8 @@ get KEY              查找一个 key
 delete KEY           删除一个 key
 scan [LOWER [UPPER]] 按 key 从小到大列出记录，包含 LOWER、不包含 UPPER
 fill COUNT           写入 COUNT 条 key-000000 = value-000000 这样的记录
-status               冻结的 memtable 个数、L0 的 SST 个数、块缓存的用量、目录里的 SST 文件
+compact              把 L0 与 L1 的全部 SST 合并成新的 L1
+status               冻结的 memtable 个数、L0 与 L1 的 SST 个数、块缓存的用量、目录里的 SST 文件
 help                 显示本说明
 quit                 关闭数据库并退出（Ctrl-D 也一样）";
 
@@ -87,6 +90,7 @@ pub fn parse(line: &str) -> anyhow::Result<Command> {
         ["status"] => Command::Status,
         ["help"] => Command::Help,
         ["quit"] => Command::Quit,
+        ["compact"] => Command::Compact,
         [] => bail!("空行"),
         // 认识的命令名、参数个数不对。要放在下一个分支之前，否则会被当成不认识的命令。
         [name, ..] if COMMAND_NAMES.contains(name) => {
@@ -133,6 +137,7 @@ mod tests {
         );
         assert_eq!(parse("fill 100").unwrap(), Command::Fill { count: 100 });
         assert_eq!(parse("status").unwrap(), Command::Status);
+        assert_eq!(parse("compact").unwrap(), Command::Compact);
         assert_eq!(parse("help").unwrap(), Command::Help);
         assert_eq!(parse("quit").unwrap(), Command::Quit);
     }
@@ -202,6 +207,7 @@ mod tests {
             "scan a b c",
             "fill",
             "status now",
+            "compact now",
             "quit now",
         ] {
             let message = parse_error(line);

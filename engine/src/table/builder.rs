@@ -49,6 +49,19 @@ impl SsTableBuilder {
         }
     }
 
+    /// 还没有加入任何记录。
+    pub fn is_empty(&self) -> bool {
+        self.builder.is_empty() && self.block_meta.is_empty()
+    }
+
+    /// 已经加入的记录编码后大约占多少字节：封口的块加上正在装的块。
+    ///
+    /// 不含索引、Bloom filter 与文件末尾的 16 字节，所以写出的文件会比它稍大。
+    /// 用来判断一个文件写得够不够大、该不该换下一个。
+    pub fn estimated_size(&self) -> usize {
+        self.data.len() + self.builder.encoded_size()
+    }
+
     /// 加入一条记录。value 为空表示墓碑，照常加入。
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
         // 调用方保证 key 严格递增。调试编译下检查一下：喂数据的循环忘了让游标前进时，
@@ -423,6 +436,37 @@ mod tests {
         for (key, _value) in &pairs {
             assert!(sst.bloom_may_contain(key_hash(key.as_bytes())), "{key}");
         }
+    }
+
+    // 新建的构建器是空的；加入一条之后不再是空的，哪怕这条还在没封口的块里。
+    #[test]
+    fn builder_is_empty_until_first_add() {
+        let mut builder = SsTableBuilder::new(4096);
+        assert!(builder.is_empty());
+
+        builder.add(b"a", b"1");
+
+        assert!(!builder.is_empty());
+    }
+
+    // 估算的大小随记录增加，等于封口的块加上正在装的块；写出的文件只多出索引、filter 和末尾。
+    #[test]
+    fn estimated_size_counts_finished_and_open_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = SsTableBuilder::new(32);
+        // 空的块也有 2 字节的条数。
+        assert_eq!(builder.estimated_size(), 2);
+
+        // 每条记录连同偏移 10 字节，目标 32 放三条；第四条开新块。
+        for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+            builder.add(key.as_bytes(), value.as_bytes());
+        }
+        // 封口的块 32 字节，正在装的块 2 + 10 字节。
+        assert_eq!(builder.estimated_size(), 32 + 12);
+
+        let estimated = builder.estimated_size();
+        let sst = builder.build(1, None, &dir.path().join("1.sst")).unwrap();
+        assert_eq!(sst.block_meta_start(), estimated);
     }
 
     // 最后一个没装满的块也要封口写出去。

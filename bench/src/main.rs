@@ -26,7 +26,8 @@ const USAGE: &str = "\
   --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
   --help             显示本说明
 
-负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）。
+负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）、
+compact（把磁盘上的全部 SST 合并成一层，只做一次；不在默认列表里）。
 每段负载计时结束后，等引擎把冻结的表全部写成文件，再开始下一段；等待的时间单独列出，不计入吞吐。
 被测对象：btreemap（互斥锁加 BTreeMap）、memtable（引擎的单张 memtable）、engine（引擎层）。
 读负载读的是前面的写负载留下的数据，所以要把 fillrandom 排在前面。";
@@ -224,16 +225,30 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("不适用：{} 不写磁盘，没有引擎计数器。", target.name());
         return;
     }
+    // 空间放大的分母：全部 key 各一份的大小。基准里没有删除，写满之后 key 的个数不变。
+    let live_bytes = args.config.num * (KEY_SIZE + args.config.value_size) as u64;
     println!(
-        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 |"
+        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 的 SST | 结束时 SST 的总字节 | 空间放大 |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let mut total_user_bytes = 0;
+    let mut total_disk_bytes = 0;
     for result in results {
         let Some(stats) = result.stats else {
             continue;
         };
+        total_user_bytes += stats.user_bytes_written;
+        total_disk_bytes += stats.disk_bytes_written();
+        let (layout, total_bytes, space_amplification) = match result.sst_layout {
+            Some(layout) => (
+                format!("{} / {}", layout.l0_files, layout.l1_files),
+                layout.total_bytes.to_string(),
+                ratio(Some(layout.total_bytes as f64 / live_bytes as f64)),
+            ),
+            None => ("—".to_string(), "—".to_string(), "—".to_string()),
+        };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             result.workload.name(),
             stats.user_bytes_written,
             stats.disk_bytes_written(),
@@ -241,8 +256,23 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
             ratio(stats.tables_probed_per_get()),
             ratio(stats.tables_skipped_by_bloom_per_get()),
             ratio(stats.blocks_read_per_get()),
+            layout,
+            total_bytes,
+            space_amplification,
         );
     }
+    // 整次运行的写放大：compaction 自己没有用户写入，它写的字节要摊到前面的写入上。
+    let total_write_amplification = if total_user_bytes == 0 {
+        None
+    } else {
+        Some(total_disk_bytes as f64 / total_user_bytes as f64)
+    };
+    println!(
+        "| 合计 | {total_user_bytes} | {total_disk_bytes} | {} | — | — | — | — | — | — |",
+        ratio(total_write_amplification)
+    );
+    println!();
+    println!("空间放大 = 结束时 SST 的总字节 ÷ 全部 key 各一份的大小（{live_bytes} 字节）。");
 }
 
 /// 写负载每秒交给被测对象多少 MB（key 加 value）；读负载没有这一项。

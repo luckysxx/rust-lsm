@@ -101,21 +101,26 @@ pub enum Workload {
     /// 范围扫描：每次随机挑一个已有的 key 作起点，按顺序读若干条。
     /// 扫描的次数是 `num` 除以每次读的条数，所以读到的记录总数与 `num` 相当。
     SeekRandom,
+    /// 把磁盘上的全部 SST 合并成一层，只做一次，在一个线程里做。
+    /// 名字沿用 RocksDB 的 `db_bench`。被测对象没有 compaction 时什么也不做。
+    Compact,
 }
 
 impl Workload {
     /// 全部负载，命令行上的名字从这里查。
-    pub const ALL: [Workload; 6] = [
+    pub const ALL: [Workload; 7] = [
         Workload::FillSeq,
         Workload::FillRandom,
         Workload::Overwrite,
         Workload::ReadRandom,
         Workload::ReadMissing,
         Workload::SeekRandom,
+        Workload::Compact,
     ];
 
     /// 不指定 `--workloads` 时依次执行的负载。不含 `fillseq`：它与 `fillrandom`
-    /// 写的是同一批 key，两个都执行时后一个相当于覆盖写。
+    /// 写的是同一批 key，两个都执行时后一个相当于覆盖写。也不含 `compact`：
+    /// 默认的这组负载用来和之前的记录对比，加进 compaction 会改变后面每段的数字。
     pub const DEFAULT: [Workload; 5] = [
         Workload::FillRandom,
         Workload::Overwrite,
@@ -132,6 +137,7 @@ impl Workload {
             Workload::ReadRandom => "readrandom",
             Workload::ReadMissing => "readmissing",
             Workload::SeekRandom => "seekrandom",
+            Workload::Compact => "compact",
         }
     }
 
@@ -150,6 +156,7 @@ impl Workload {
             Workload::ReadMissing => 4,
             Workload::SeekRandom => 5,
             Workload::FillSeq => 6,
+            Workload::Compact => 7,
         }
     }
 }
@@ -241,13 +248,14 @@ mod tests {
         assert_eq!(Workload::parse("nosuch"), None);
     }
 
-    // 默认执行的负载都在全部负载里，只少了 fillseq。
+    // 默认执行的负载都在全部负载里，只少了 fillseq 与 compact。
     #[test]
-    fn default_workloads_are_all_but_fillseq() {
+    fn default_workloads_are_all_but_fillseq_and_compact() {
         for workload in Workload::DEFAULT {
             assert!(Workload::ALL.contains(&workload));
         }
         assert!(!Workload::DEFAULT.contains(&Workload::FillSeq));
-        assert_eq!(Workload::DEFAULT.len() + 1, Workload::ALL.len());
+        assert!(!Workload::DEFAULT.contains(&Workload::Compact));
+        assert_eq!(Workload::DEFAULT.len() + 2, Workload::ALL.len());
     }
 }
