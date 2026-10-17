@@ -9,6 +9,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use lsm::compaction::simple_leveled::SimpleLeveledOptions;
 use lsm::db::Db;
 use lsm::lsm_storage::LsmStorageOptions;
 
@@ -28,6 +29,8 @@ const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4096;
 const BLOCK_SIZE: usize = 512;
 /// 块缓存的容量，字节。
 const BLOCK_CACHE_SIZE: usize = 1 << 20;
+/// L0 之下有几层。
+const MAX_LEVELS: usize = 4;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +55,13 @@ fn main() -> anyhow::Result<()> {
         block_cache_size: BLOCK_CACHE_SIZE,
         // compaction 写出的文件与 flush 写出的一样大。
         target_sst_size: memtable_size_limit,
+        max_levels: MAX_LEVELS,
+        // 后台自动合并：L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
+        // 取得小，用 status 很快就能看到文件一层一层往下沉。
+        compaction: Some(SimpleLeveledOptions {
+            level0_file_num_compaction_trigger: 2,
+            size_ratio_percent: 200,
+        }),
     };
     let db = Db::open(&dir, options).with_context(|| format!("打开数据库：{}", dir.display()))?;
     println!("已打开 {}。输入 help 查看命令。", dir.display());

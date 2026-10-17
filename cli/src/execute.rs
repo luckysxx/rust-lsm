@@ -66,15 +66,19 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
             db.force_full_compaction()?;
             writeln!(
                 out,
-                "合并完成：L0 有 {} 个 SST，L1 有 {} 个",
+                "合并完成：L0 有 {} 个 SST，L1 往下各层依次有 {} 个",
                 db.l0_sstable_count(),
-                db.l1_sstable_count()
+                join_counts(&db.level_sstable_counts())
             )?;
         }
         Command::Status => {
             writeln!(out, "冻结的 memtable：{}", db.imm_memtable_count())?;
             writeln!(out, "L0 的 SST：{}", db.l0_sstable_count())?;
-            writeln!(out, "L1 的 SST：{}", db.l1_sstable_count())?;
+            for (index, count) in db.level_sstable_counts().iter().enumerate() {
+                // 第 0 项是 L1。
+                let level = index + 1;
+                writeln!(out, "L{level} 的 SST：{count}")?;
+            }
             let (cached_blocks, cached_bytes) = db.block_cache_usage();
             writeln!(out, "块缓存：{cached_blocks} 个块，{cached_bytes} 字节")?;
             let files = sst_files(dir)?;
@@ -88,6 +92,12 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
         Command::Quit => {}
     }
     Ok(())
+}
+
+/// 把各层的文件数写成 `0 / 2 / 5` 的样子。
+fn join_counts(counts: &[usize]) -> String {
+    let texts: Vec<String> = counts.iter().map(|count| count.to_string()).collect();
+    texts.join(" / ")
 }
 
 /// 目录里的 SST 文件：文件名与长度（字节），按文件名排序。
@@ -150,6 +160,8 @@ mod tests {
                 block_size: 256,
                 block_cache_size: 1 << 20,
                 target_sst_size: 4096,
+                max_levels: 3,
+                compaction: None,
             };
             let db = Db::open(dir.path(), options).unwrap();
             Self { db, dir }
@@ -223,7 +235,7 @@ mod tests {
         let db = TestDb::open(usize::MAX);
         assert_eq!(
             db.run("status"),
-            "冻结的 memtable：0\nL0 的 SST：0\nL1 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：0\n"
+            "冻结的 memtable：0\nL0 的 SST：0\nL1 的 SST：0\nL2 的 SST：0\nL3 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：0\n"
         );
         db.run("put a 1");
 
@@ -232,16 +244,16 @@ mod tests {
         let status = db.run("status");
         assert!(
             status.starts_with(
-                "冻结的 memtable：0\nL0 的 SST：1\nL1 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：1\n"
+                "冻结的 memtable：0\nL0 的 SST：1\nL1 的 SST：0\nL2 的 SST：0\nL3 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：1\n"
             ),
             "{status}"
         );
         assert!(status.contains("00001.sst"), "{status}");
     }
 
-    // compact 把 L0 的文件全部合并进 L1，旧文件从目录里删掉；数据照常读得到。
+    // compact 把全部文件合并进最底层，旧文件从目录里删掉；数据照常读得到。
     #[test]
-    fn compact_merges_l0_into_l1() {
+    fn compact_merges_everything_into_the_bottom_level() {
         // memtable 上限很小，fill 写出好几个文件；关闭让它们全部落盘、后台线程停下。
         let db = TestDb::open(4096);
         db.run("fill 500");
@@ -250,13 +262,13 @@ mod tests {
 
         let output = db.run("compact");
 
-        let l1_count = db.db.l1_sstable_count();
+        let bottom_count = db.db.level_sstable_counts()[2];
         assert_eq!(
             output,
-            format!("合并完成：L0 有 0 个 SST，L1 有 {l1_count} 个\n")
+            format!("合并完成：L0 有 0 个 SST，L1 往下各层依次有 0 / 0 / {bottom_count} 个\n")
         );
-        assert!(l1_count > 0);
-        assert_eq!(sst_files(db.dir.path()).unwrap().len(), l1_count);
+        assert!(bottom_count > 0);
+        assert_eq!(sst_files(db.dir.path()).unwrap().len(), bottom_count);
         assert_eq!(db.run("get key-000123"), "value-000123\n");
     }
 

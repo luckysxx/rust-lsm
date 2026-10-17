@@ -1,9 +1,9 @@
 //! 引擎层：把 memtable 与 SST 组织起来，对外提供 `put`、`delete`、`get`、`scan`。
 //!
-//! 同一时刻有一张可写的 memtable、若干张冻结的 memtable 和若干个 L0 的 SST。
-//! 写入只进可写的那张表；它写满后被冻结，换上一张新的。读取从新到旧依次查找：
-//! 可写的表、冻结的表、L0 的 SST。
-//! 冻结的表由 flush 写成 SST。
+//! 同一时刻有一张可写的 memtable、若干张冻结的 memtable、L0 的若干个 SST，
+//! 以及 L1 往下固定数目的几层 SST。写入只进可写的那张表；它写满后被冻结，换上一张新的。
+//! 读取从新到旧依次查找：可写的表、冻结的表、L0 的 SST、L1、L2……
+//! 冻结的表由 flush 写成 L0 的 SST；compaction 把上层的文件合并进下层。
 //!
 //! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use bytes::Bytes;
 
+use crate::compaction::simple_leveled::SimpleLeveledOptions;
 use crate::error::Result;
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::{SstConcatIterator, find_sst_index};
@@ -31,12 +32,13 @@ use crate::table::{
 
 /// `scan` 返回的游标类型，从里往外读：
 /// memtable 那一组归并成一个，L0 的 SST 归并成一个，两路归并把它们合起来；
-/// L1 的 SST 串接成一个，再用两路归并接在后面；最外面去掉墓碑并在上界处停下。
+/// L1 往下每层的 SST 串接成一个，各层再归并成一个，用两路归并接在后面；
+/// 最外面去掉墓碑并在上界处停下。
 /// 两路归并里同一个 key 都是前一个胜出，前一个总是更新的一侧。
 pub type ScanIterator = LsmIterator<
     TwoMergeIterator<
         TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
-        SstConcatIterator,
+        MergeIterator<SstConcatIterator>,
     >,
 >;
 
@@ -52,9 +54,19 @@ pub struct LsmStorageState {
     pub imm_memtables: Vec<Arc<MemTable>>,
     /// L0 的 SST，新的在前。它们之间的 key 范围可以重叠，所以读的时候都要看。
     pub l0_sstables: Vec<Arc<SsTable>>,
-    /// L1 的 SST，按 key 从小到大，范围互不重叠：合起来是一个排好序的序列。
-    /// 由 compaction 产生，其中的数据都比 L0 的旧。
-    pub l1_sstables: Vec<Arc<SsTable>>,
+    /// L1 往下的各层，`levels[0]` 是 L1，`levels[i]` 是 L(i+1)；层数固定为
+    /// `max_levels`，空的层也占一项。每层的 SST 按 key 从小到大、范围互不重叠：
+    /// 合起来是一个排好序的序列。由 compaction 产生；上层的数据比下层的新，
+    /// L1 的数据比 L0 的旧。
+    pub levels: Vec<Vec<Arc<SsTable>>>,
+}
+
+impl LsmStorageState {
+    /// 第 `n` 层（Ln，n 从 1 开始）的 SST，可以修改。L0 不在这里，用 `l0_sstables`。
+    pub fn level_mut(&mut self, n: usize) -> &mut Vec<Arc<SsTable>> {
+        assert!(n >= 1, "level_mut 只管 L1 往下的层，L0 用 l0_sstables");
+        &mut self.levels[n - 1]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +80,13 @@ pub struct LsmStorageOptions {
     /// compaction 写出的每个 SST 的目标大小，字节。一个文件写到这么大就封口，换下一个；
     /// 和块一样是一条软线，文件会稍大一点。flush 不受它限制，一张 memtable 写成一个文件。
     pub target_sst_size: usize,
+    /// L0 之下有几层（L1 到 L`max_levels`），至少 1 层。最后一层是最底层：
+    /// 合并到这一层时，墓碑与被它盖住的值可以一起丢掉。
+    pub max_levels: usize,
+    /// 后台自动合并用的简单分层策略的参数。`None` 表示不自动合并，只有手动调用
+    /// `force_full_compaction` 时才合并。`LsmStorage` 自己不起线程，这一项由 `db::Db`
+    /// 读取：有它才启动后台的 compaction 线程。
+    pub compaction: Option<SimpleLeveledOptions>,
 }
 
 pub struct LsmStorage {
@@ -97,13 +116,14 @@ impl LsmStorage {
     ///
     /// 目前不会读取目录里已有的文件：每次打开都是空的，重启后数据不保留。
     pub fn open(path: &Path, options: LsmStorageOptions) -> Result<Self> {
+        assert!(options.max_levels >= 1, "L0 之下至少要有 1 层");
         std::fs::create_dir_all(path)?;
 
         let initial_state = LsmStorageState {
             memtable: Arc::new(MemTable::new()),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
-            l1_sstables: Vec::new(),
+            levels: vec![Vec::new(); options.max_levels],
         };
         let block_cache = if options.block_cache_size == 0 {
             None
@@ -134,9 +154,10 @@ impl LsmStorage {
         self.snapshot().l0_sstables.len()
     }
 
-    /// 当前 L1 有几个 SST。
-    pub fn l1_sstable_count(&self) -> usize {
-        self.snapshot().l1_sstables.len()
+    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。
+    pub fn level_sstable_counts(&self) -> Vec<usize> {
+        let snapshot = self.snapshot();
+        snapshot.levels.iter().map(|level| level.len()).collect()
     }
 
     /// 块缓存里现在有几个块、一共多少字节。没有缓存时都是 0。
@@ -173,7 +194,8 @@ impl LsmStorage {
     /// 取走当前状态的一份快照。
     ///
     /// 只在复制指针的一瞬间持有读锁；之后调用方在快照上慢慢查，不挡住别人。
-    fn snapshot(&self) -> Arc<LsmStorageState> {
+    /// crate 内的测试也用它查看各层的文件。
+    pub(crate) fn snapshot(&self) -> Arc<LsmStorageState> {
         let guard = self.state.read().unwrap();
         Arc::clone(&guard)
     }
@@ -207,12 +229,15 @@ impl LsmStorage {
             }
         }
 
-        // 最后查 L1。它的文件范围互不重叠，最多一个文件可能有这个 key。
-        let sst_index = find_sst_index(&snapshot.l1_sstables, key);
-        if let Some(sst) = snapshot.l1_sstables.get(sst_index)
-            && let Some(value) = self.get_from_sst(sst, key, hash)?
-        {
-            return Ok(visible_value(value));
+        // 最后从上往下逐层查 L1、L2……上层的更新，先查到的就是最新的。
+        // 每层的文件范围互不重叠，最多一个文件可能有这个 key。
+        for level in &snapshot.levels {
+            let sst_index = find_sst_index(level, key);
+            if let Some(sst) = level.get(sst_index)
+                && let Some(value) = self.get_from_sst(sst, key, hash)?
+            {
+                return Ok(visible_value(value));
+            }
         }
 
         Ok(None)
@@ -278,21 +303,24 @@ impl LsmStorage {
             l0_iters.push(sst_iterator_from(Arc::clone(sst), lower)?);
         }
 
-        // L1：只留下与范围相交的文件，串接起来。它们仍然按 key 排好、互不重叠。
-        let l1_sstables: Vec<Arc<SsTable>> = snapshot
-            .l1_sstables
-            .iter()
-            .filter(|sst| sst.overlaps_range(lower, upper))
-            .cloned()
-            .collect();
-        let l1_iter = concat_iterator_from(l1_sstables, lower)?;
+        // L1 往下：每层只留下与范围相交的文件，串接起来，它们仍然按 key 排好、互不重叠。
+        // 列表从 L1 开始，上层更新，排在前面。
+        let mut level_iters: Vec<SstConcatIterator> = Vec::new();
+        for level in &snapshot.levels {
+            let level_sstables: Vec<Arc<SsTable>> = level
+                .iter()
+                .filter(|sst| sst.overlaps_range(lower, upper))
+                .cloned()
+                .collect();
+            level_iters.push(concat_iterator_from(level_sstables, lower)?);
+        }
 
-        // 从新到旧：memtable 比 L0 新，L0 比 L1 新，新的一侧放在两路归并的前一个位置。
+        // 从新到旧：memtable 比 L0 新，L0 比 L1 往下的各层新，新的一侧放在两路归并的前一个位置。
         let memtable_and_l0 = TwoMergeIterator::new(
             MergeIterator::new(memtable_iters),
             MergeIterator::new(l0_iters),
         )?;
-        let all = TwoMergeIterator::new(memtable_and_l0, l1_iter)?;
+        let all = TwoMergeIterator::new(memtable_and_l0, MergeIterator::new(level_iters))?;
         LsmIterator::new(all, bound_to_owned(upper))
     }
 
@@ -581,6 +609,8 @@ mod tests {
             block_size: 64,
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
+            max_levels: 3,
+            compaction: None,
         })
     }
 
@@ -1326,16 +1356,18 @@ mod tests {
         }
     }
 
-    // ---------- 读路径：L1 ----------
+    // ---------- 读路径：L1 往下的各层 ----------
 
-    /// 把几组记录各写成一个 SST，按给出的顺序整层换成 L1。每组记录必须已经按 key 排好，
-    /// 组与组之间按 key 从小到大、范围互不重叠。空字符串的 value 是墓碑。
-    pub(super) fn set_l1_ssts(
+    /// 把几组记录各写成一个 SST，按给出的顺序整层换成第 `level` 层（1 是 L1）。
+    /// 每组记录必须已经按 key 排好，组与组之间按 key 从小到大、范围互不重叠。
+    /// 空字符串的 value 是墓碑。
+    pub(super) fn set_level_ssts(
         storage: &LsmStorage,
         dir: &tempfile::TempDir,
+        level: usize,
         files: &[(usize, &[(&str, &str)])],
     ) {
-        let mut l1_sstables = Vec::new();
+        let mut sstables = Vec::new();
         for (id, pairs) in files {
             let path = dir.path().join(format!("{id:05}.sst"));
             let mut builder = crate::table::SsTableBuilder::new(32);
@@ -1344,21 +1376,22 @@ mod tests {
             }
             let block_cache = storage.block_cache.clone();
             let sst = builder.build(*id, block_cache, &path).unwrap();
-            l1_sstables.push(Arc::new(sst.with_stats(Arc::clone(&storage.stats))));
+            sstables.push(Arc::new(sst.with_stats(Arc::clone(&storage.stats))));
         }
 
         let _state_lock = storage.state_lock.lock().unwrap();
         let mut guard = storage.state.write().unwrap();
         let mut new_state = guard.as_ref().clone();
-        new_state.l1_sstables = l1_sstables;
+        new_state.levels[level - 1] = sstables;
         *guard = Arc::new(new_state);
     }
 
     /// 三个 L1 文件：[a, c]、[e, g]、[i, k]，文件之间留着空隙。
     fn set_three_l1_ssts(storage: &LsmStorage, dir: &tempfile::TempDir) {
-        set_l1_ssts(
+        set_level_ssts(
             storage,
             dir,
+            1,
             &[
                 (1, &[("a", "1"), ("b", "2"), ("c", "3")]),
                 (2, &[("e", "5"), ("f", "6"), ("g", "7")]),
@@ -1435,7 +1468,7 @@ mod tests {
     fn get_l1_tombstone_reads_as_missing() {
         let dir = tempfile::tempdir().unwrap();
         let storage = open_without_auto_freeze();
-        set_l1_ssts(&storage, &dir, &[(1, &[("a", "1"), ("b", "")])]);
+        set_level_ssts(&storage, &dir, 1, &[(1, &[("a", "1"), ("b", "")])]);
 
         assert_eq!(get_str(&storage, "b"), None);
     }
@@ -1509,6 +1542,163 @@ mod tests {
         assert_eq!(storage.stats().blocks_read, 1);
     }
 
+    /// 每一层都有数据，同一个 key 在几层里有不同的版本：
+    ///
+    /// - L3：[a, c]、[m, n]，值都是 "L3"
+    /// - L2：[b, d]，另有一个文件只有 n 的墓碑
+    /// - L1：[c, d]，c 是墓碑
+    /// - L0：[e, m]
+    /// - memtable：a
+    ///
+    /// 读到的应当是：a=mem、b=L2、d=L1、e=L0、m=L0；c 被 L1 的墓碑删掉，n 被 L2 的墓碑删掉。
+    fn set_ssts_in_every_level(storage: &LsmStorage, dir: &tempfile::TempDir) {
+        set_level_ssts(
+            storage,
+            dir,
+            3,
+            &[
+                (101, &[("a", "L3"), ("b", "L3"), ("c", "L3")]),
+                (102, &[("m", "L3"), ("n", "L3")]),
+            ],
+        );
+        set_level_ssts(
+            storage,
+            dir,
+            2,
+            &[(103, &[("b", "L2"), ("d", "L2")]), (104, &[("n", "")])],
+        );
+        set_level_ssts(storage, dir, 1, &[(105, &[("c", ""), ("d", "L1")])]);
+        add_l0_sst(storage, dir, 110, &[("e", "L0"), ("m", "L0")]);
+        storage.put(b"a", b"mem");
+    }
+
+    // 每一层的 key 都查得到；同一个 key 在几层里都有时，上层的胜出；上层的墓碑盖住下层的值。
+    #[test]
+    fn get_reads_every_level_and_upper_levels_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_ssts_in_every_level(&storage, &dir);
+
+        assert_eq!(get_str(&storage, "a"), Some("mem".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("L2".to_string()));
+        assert_eq!(get_str(&storage, "c"), None);
+        assert_eq!(get_str(&storage, "d"), Some("L1".to_string()));
+        assert_eq!(get_str(&storage, "e"), Some("L0".to_string()));
+        assert_eq!(get_str(&storage, "m"), Some("L0".to_string()));
+        assert_eq!(get_str(&storage, "n"), None);
+        assert_eq!(get_str(&storage, "z"), None);
+    }
+
+    // 在某一层查到了就停，不再进入下面的层。
+    #[test]
+    fn get_stops_at_the_first_level_that_has_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_ssts_in_every_level(&storage, &dir);
+
+        // d 在 L1 就查到了，L2 里那个范围覆盖 d 的文件不再进入。
+        assert_eq!(get_str(&storage, "d"), Some("L1".to_string()));
+        assert_eq!(storage.stats().tables_probed, 1);
+    }
+
+    // 中间有空的层：跳过它，照样查到下面的层。
+    #[test]
+    fn get_and_scan_skip_empty_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_level_ssts(&storage, &dir, 1, &[(101, &[("a", "L1")])]);
+        set_level_ssts(&storage, &dir, 3, &[(102, &[("a", "L3"), ("b", "L3")])]);
+
+        assert_eq!(get_str(&storage, "a"), Some("L1".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("L3".to_string()));
+        assert_eq!(scan_all(&storage), expected(&[("a", "L1"), ("b", "L3")]));
+    }
+
+    // 扫描把 memtable、L0 与各层按 key 交错归并：同一个 key 取最上面一层的，墓碑不出现。
+    #[test]
+    fn scan_merges_every_level_and_upper_levels_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_ssts_in_every_level(&storage, &dir);
+
+        assert_eq!(
+            scan_all(&storage),
+            expected(&[
+                ("a", "mem"),
+                ("b", "L2"),
+                ("d", "L1"),
+                ("e", "L0"),
+                ("m", "L0"),
+            ])
+        );
+    }
+
+    // 扫描的两端落在各层文件的中间：包含与不包含两种下界都对。
+    #[test]
+    fn scan_respects_bounds_across_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_ssts_in_every_level(&storage, &dir);
+
+        assert_eq!(
+            scan_range(&storage, Bound::Excluded(b"b"), Bound::Included(b"m")),
+            expected(&[("d", "L1"), ("e", "L0"), ("m", "L0")])
+        );
+        assert_eq!(
+            scan_range(&storage, Bound::Included(b"c"), Bound::Excluded(b"e")),
+            expected(&[("d", "L1")])
+        );
+        assert_eq!(
+            scan_range(&storage, Bound::Included(b"n"), Bound::Unbounded),
+            expected(&[])
+        );
+    }
+
+    // 每一层里与扫描范围不相交的文件都不读：范围只碰到每层的一个文件，一共只读 3 个块。
+    #[test]
+    fn scan_skips_files_outside_the_range_in_every_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open_without_auto_freeze();
+        set_level_ssts(
+            &storage,
+            &dir,
+            1,
+            &[
+                (101, &[("a", "L1"), ("b", "L1")]),
+                (102, &[("e", "L1"), ("f", "L1")]),
+                (103, &[("x", "L1"), ("y", "L1")]),
+            ],
+        );
+        set_level_ssts(
+            &storage,
+            &dir,
+            2,
+            &[
+                (104, &[("a", "L2"), ("c", "L2")]),
+                (105, &[("e", "L2"), ("g", "L2")]),
+                (106, &[("w", "L2"), ("z", "L2")]),
+            ],
+        );
+        set_level_ssts(
+            &storage,
+            &dir,
+            3,
+            &[
+                (107, &[("b", "L3"), ("d", "L3")]),
+                (108, &[("f", "L3"), ("h", "L3")]),
+                (109, &[("v", "L3"), ("y", "L3")]),
+            ],
+        );
+
+        let collected = scan_range(&storage, Bound::Included(b"e"), Bound::Included(b"g"));
+
+        assert_eq!(
+            collected,
+            expected(&[("e", "L1"), ("f", "L1"), ("g", "L2")])
+        );
+        assert_eq!(storage.stats().blocks_read, 3);
+    }
+
     // ---------- 写路径：flush ----------
 
     /// 写入几条记录，然后冻结。
@@ -1539,6 +1729,8 @@ mod tests {
             block_size: 64,
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
+            max_levels: 3,
+            compaction: None,
         };
 
         let _storage = LsmStorage::open(&path, options).unwrap();
@@ -2267,6 +2459,8 @@ mod tests {
             block_size: 64,
             block_cache_size: 0,
             target_sst_size: 1024,
+            max_levels: 3,
+            compaction: None,
         };
         let storage = LsmStorage::open(dir.path(), options).unwrap();
         storage.put(b"a", b"1");

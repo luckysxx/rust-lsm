@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use super::StorageIterator;
 use crate::error::Result;
@@ -47,8 +48,15 @@ impl<I: StorageIterator> PartialEq for HeapItem<I> {
 impl<I: StorageIterator> Eq for HeapItem<I> {}
 
 /// 归并游标。`I` 是来源游标的类型，所有来源必须是同一种。
+///
+/// 当前胜出的来源单独拿在堆外（`current`），其余还没走到头的来源在堆里。
+/// 前进时当前来源的 key 一直留在原处可以比较，不必先复制一份。
 pub struct MergeIterator<I: StorageIterator> {
-    /// 还没走到头的来源。堆顶就是归并游标当前指着的那条记录。
+    /// 当前胜出的来源：它的 key 是所有来源里最小的，key 相同时它最新。归并游标指着的
+    /// 就是它的当前记录。为 `None` 表示所有来源都走到头了。
+    current: Option<HeapItem<I>>,
+    /// 其余还没走到头的来源。堆里的每一项都排在 `current` 之后：key 更大，或者 key 相同
+    /// 但更旧。
     heap: BinaryHeap<HeapItem<I>>,
 }
 
@@ -62,50 +70,69 @@ impl<I: StorageIterator> MergeIterator<I> {
                 heap.push(HeapItem { index, iter });
             }
         }
-        Self { heap }
+        // 最该排在前面的那个拿出来，作为当前来源。
+        let current = heap.pop();
+        Self { current, heap }
     }
 }
 
 impl<I: StorageIterator> StorageIterator for MergeIterator<I> {
     fn key(&self) -> &[u8] {
-        let top = self.heap.peek().expect("游标无效时不能读取 key");
-        top.iter.key()
+        let current = self.current.as_ref().expect("游标无效时不能读取 key");
+        current.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        let top = self.heap.peek().expect("游标无效时不能读取 value");
-        top.iter.value()
+        let current = self.current.as_ref().expect("游标无效时不能读取 value");
+        current.iter.value()
     }
 
     fn is_valid(&self) -> bool {
-        !self.heap.is_empty()
+        self.current.is_some()
     }
 
     fn next(&mut self) -> Result<()> {
-        // 当前这条记录的 key。接下来要改动堆，所以先复制一份留着比较。
-        let current_key = self.key().to_vec();
+        let current = self.current.as_mut().expect("游标无效时不能前进");
 
-        // 堆顶上所有 key 等于它的来源都要前进：第一个是刚给出的胜者，其余的是旧版本。
-        while let Some(top) = self.heap.peek() {
-            if top.iter.key() != current_key {
+        // 第一步：堆里 key 与当前相同的来源都是旧版本，各自前进一步跳过它，走到头的拿掉。
+        // `peek_mut` 借出堆顶而不取出；改动之后它离开作用域时，堆自动把它挪到该在的位置。
+        // 当前来源还没前进，它的 key 原样留着，可以直接拿来比较。
+        while let Some(mut top) = self.heap.peek_mut() {
+            if top.iter.key() != current.iter.key() {
                 break;
             }
-
-            // 取出、前进、放回：前进后 key 变了，放回时堆会给它重新排位置。
-            // 走到头的来源不放回，堆里只留有效的游标。
-            // 来源前进时出错：带着错误返回。这个来源已经从堆里取出，不再放回，
-            // 归并游标此后不能再使用。
-            let mut item = self.heap.pop().unwrap();
-            item.iter.next()?;
-            if item.iter.is_valid() {
-                // 每个来源自己是严格有序的，前进之后 key 一定变大。不成立的话这个循环
-                // 永远不会结束，所以在调试编译下检查，把"卡死"变成一句看得懂的报错。
-                debug_assert!(
-                    item.iter.key() > current_key.as_slice(),
-                    "来源前进之后 key 没有变大：来源不是严格有序的，或者它的 next 没有前进"
-                );
-                self.heap.push(item);
+            // 前进时出错：这个来源拿掉，带着错误返回，归并游标此后不能再使用。
+            if let Err(error) = top.iter.next() {
+                PeekMut::pop(top);
+                return Err(error);
             }
+            if !top.iter.is_valid() {
+                PeekMut::pop(top);
+                continue;
+            }
+            // 每个来源自己是严格有序的，前进之后 key 一定变大。不成立的话这个循环
+            // 永远不会结束，所以在调试编译下检查，把"卡死"变成一句看得懂的报错。
+            debug_assert!(
+                top.iter.key() > current.iter.key(),
+                "来源前进之后 key 没有变大：来源不是严格有序的，或者它的 next 没有前进"
+            );
+        }
+
+        // 第二步：当前来源前进。
+        current.iter.next()?;
+
+        // 第三步：当前来源走到头了，换堆里最该排在前面的上来；堆也空了就整个走到头。
+        if !current.iter.is_valid() {
+            self.current = self.heap.pop();
+            return Ok(());
+        }
+
+        // 第四步：当前来源换了一个 key，和堆顶比一比。堆顶应当排在前面（key 更小，
+        // 或者 key 相同但更新）就交换：堆顶成为当前来源，原来的当前来源进堆。
+        if let Some(mut top) = self.heap.peek_mut()
+            && *top > *current
+        {
+            std::mem::swap(&mut *top, current);
         }
         Ok(())
     }
@@ -363,5 +390,93 @@ mod tests {
 
             assert_eq!(collect_all(&mut iter), expected_records);
         }
+    }
+
+    // ---------- 当前来源与堆顶交换、前进出错 ----------
+
+    // 当前来源前进到一个 key，较新的来源也在这个 key 上等着：较新的那条胜出，旧的被跳过。
+    // 只比 key、不比新旧的话，这里会给出旧的那条。
+    #[test]
+    fn merge_hands_over_to_a_newer_source_on_an_equal_key() {
+        let mut merge = merge_of(&[&[("b", "new")], &[("a", "1"), ("b", "old"), ("c", "3")]]);
+
+        assert_eq!(
+            collect_all(&mut merge),
+            expected(&[("a", "1"), ("b", "new"), ("c", "3")])
+        );
+    }
+
+    // 当前来源走到头，换上来的是 key 最小的那个，而不是任意一个。
+    #[test]
+    fn merge_picks_the_smallest_remaining_source_after_one_ends() {
+        let mut merge = merge_of(&[&[("a", "1")], &[("d", "4")], &[("b", "2"), ("c", "3")]]);
+
+        assert_eq!(
+            collect_all(&mut merge),
+            expected(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")])
+        );
+    }
+
+    /// 在 `fail_at` 这条记录上调用 `next` 时返回错误的游标，其余行为与 `VecIterator` 相同。
+    struct FailingIterator {
+        inner: VecIterator,
+        fail_at: &'static str,
+    }
+
+    impl StorageIterator for FailingIterator {
+        fn key(&self) -> &[u8] {
+            self.inner.key()
+        }
+
+        fn value(&self) -> &[u8] {
+            self.inner.value()
+        }
+
+        fn is_valid(&self) -> bool {
+            self.inner.is_valid()
+        }
+
+        fn next(&mut self) -> Result<()> {
+            if self.inner.key() == self.fail_at.as_bytes() {
+                return Err(crate::error::Error::Corruption(
+                    "测试：前进失败".to_string(),
+                ));
+            }
+            self.inner.next()
+        }
+    }
+
+    /// 一个不会出错的来源（`fail_at` 设成不存在的 key）。
+    fn never_failing(pairs: &[(&str, &str)]) -> FailingIterator {
+        FailingIterator {
+            inner: VecIterator::from_strs(pairs),
+            fail_at: "不存在的 key",
+        }
+    }
+
+    // 跳过旧版本时，那个旧来源前进出错：错误交给调用方。
+    #[test]
+    fn merge_reports_error_while_skipping_an_older_version() {
+        let older = FailingIterator {
+            inner: VecIterator::from_strs(&[("a", "old"), ("c", "3")]),
+            fail_at: "a",
+        };
+        let mut merge = MergeIterator::new(vec![never_failing(&[("a", "new"), ("b", "2")]), older]);
+        assert_eq!(merge.key(), b"a");
+
+        assert!(merge.next().is_err());
+    }
+
+    // 当前来源自己前进出错：错误交给调用方。
+    #[test]
+    fn merge_reports_error_from_the_current_source() {
+        let current = FailingIterator {
+            inner: VecIterator::from_strs(&[("a", "1"), ("c", "3")]),
+            fail_at: "a",
+        };
+        let mut merge = MergeIterator::new(vec![current, never_failing(&[("b", "2")])]);
+        assert_eq!(merge.key(), b"a");
+
+        assert!(merge.next().is_err());
     }
 }

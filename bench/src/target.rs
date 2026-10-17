@@ -5,6 +5,7 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
+use lsm::compaction::simple_leveled::SimpleLeveledOptions;
 use lsm::db::Db;
 use lsm::iterators::StorageIterator;
 use lsm::lsm_storage::LsmStorageOptions;
@@ -47,10 +48,11 @@ pub trait KvTarget: Sync {
 }
 
 /// 某一时刻磁盘上的 SST 怎样分布。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SstLayout {
     pub l0_files: usize,
-    pub l1_files: usize,
+    /// L1 往下各层的文件数，第 0 项是 L1。
+    pub level_files: Vec<usize>,
     /// 目录里全部 SST 文件的长度之和。
     pub total_bytes: u64,
 }
@@ -136,38 +138,73 @@ impl KvTarget for MemTableTarget {
 
 /// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；没有 WAL。
 ///
-/// 没有自动的 compaction：L0 的文件只增不减，只有执行 `compact` 负载时才全部合并成 L1。
+/// `config.compaction` 为 `None` 时没有自动的 compaction：L0 的文件只增不减，只有执行
+/// `compact` 负载时才全部合并到最底层。给了参数时，后台线程按简单分层策略反复合并。
 /// 点查与扫描要逐个去看 L0 的文件，靠每个文件的首末 key 与 Bloom filter 排除，
-/// L1 只看一个文件；读块先查块缓存。
-/// 写入太快时冻结的表会在内存里排队，还没有让写入等一等的机制；
-/// 每段负载结束后基准驱动等它们全部落盘，再开始下一段。
+/// L1 往下每层只看一个文件；读块先查块缓存。
+/// 写入太快时冻结的表会在内存里排队，L0 的文件也会积压，还没有让写入等一等的机制；
+/// 每段负载结束后基准驱动等后台的 flush 与合并都做完，再开始下一段。
 /// 与 `MemTableTarget` 相比，差别是多了状态快照、冻结、落盘，以及跨表和文件的查找与归并。
 pub struct EngineTarget {
     db: Db,
-    memtable_size_limit: usize,
-    block_cache_size: usize,
+    config: EngineConfig,
     /// 引擎所在的临时目录，随被测对象一起清理。
     dir: tempfile::TempDir,
 }
 
-impl EngineTarget {
-    /// `block_cache_size` 为 0 时不用块缓存。
-    pub fn new(memtable_size_limit: usize, block_cache_size: usize) -> Self {
-        let options = LsmStorageOptions {
+/// 引擎作为被测对象时的配置。其余选项（块大小 4 KB、SST 目标大小与 memtable 上限相同）固定。
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// memtable 的上限，字节。compaction 写出的每个 SST 也是这么大。
+    pub memtable_size_limit: usize,
+    /// 块缓存的容量，字节；0 表示不用块缓存。
+    pub block_cache_size: usize,
+    /// L0 之下有几层。
+    pub max_levels: usize,
+    /// 后台自动合并的参数；`None` 表示不自动合并。
+    pub compaction: Option<SimpleLeveledOptions>,
+}
+
+#[cfg(test)]
+impl EngineConfig {
+    /// 给定 memtable 上限与块缓存容量，L0 之下 4 层，不自动合并。测试用它。
+    pub fn without_compaction(memtable_size_limit: usize, block_cache_size: usize) -> Self {
+        Self {
             memtable_size_limit,
-            block_size: 4096,
             block_cache_size,
+            max_levels: 4,
+            compaction: None,
+        }
+    }
+}
+
+impl EngineTarget {
+    pub fn new(config: EngineConfig) -> Self {
+        let options = LsmStorageOptions {
+            memtable_size_limit: config.memtable_size_limit,
+            block_size: 4096,
+            block_cache_size: config.block_cache_size,
             // compaction 写出的文件与 flush 写出的一样大，与 RocksDB 默认的做法相同。
-            target_sst_size: memtable_size_limit,
+            target_sst_size: config.memtable_size_limit,
+            max_levels: config.max_levels,
+            compaction: config.compaction.clone(),
         };
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let db = Db::open(dir.path(), options).expect("打开引擎失败");
-        Self {
-            db,
-            memtable_size_limit,
-            block_cache_size,
-            dir,
+        Self { db, config, dir }
+    }
+
+    /// 目录里现有几个 SST 文件。
+    fn sst_file_count(&self) -> usize {
+        let entries = std::fs::read_dir(self.dir.path()).expect("读目录失败");
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry.expect("读目录失败");
+            if entry.file_name().to_string_lossy().ends_with(".sst") {
+                count += 1;
+            }
         }
+        count
     }
 }
 
@@ -196,17 +233,26 @@ impl KvTarget for EngineTarget {
     }
 
     fn details(&self) -> Option<String> {
-        let memtable_megabytes = self.memtable_size_limit / (1024 * 1024);
-        let cache_megabytes = self.block_cache_size / (1024 * 1024);
+        let memtable_megabytes = self.config.memtable_size_limit / (1024 * 1024);
+        let cache_megabytes = self.config.block_cache_size / (1024 * 1024);
+        let max_levels = self.config.max_levels;
+        let compaction = match &self.config.compaction {
+            Some(options) => format!(
+                "后台按简单分层合并（L0 触发值 {}，层间比例 {}%）",
+                options.level0_file_num_compaction_trigger, options.size_ratio_percent
+            ),
+            None => "不自动合并".to_string(),
+        };
         let frozen = self.db.imm_memtable_count();
         let l0_files = self.db.l0_sstable_count();
-        let l1_files = self.db.l1_sstable_count();
+        let level_files = join_counts(&self.db.level_sstable_counts());
         let (cached_blocks, cached_bytes) = self.db.block_cache_usage();
         let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
         Some(format!(
-            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB；\
+            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，\
+             L0 之下 {max_levels} 层，{compaction}；\
              结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST，\
-             L1 有 {l1_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
+             L1 往下各层依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
         ))
     }
 
@@ -214,9 +260,20 @@ impl KvTarget for EngineTarget {
         Some(self.db.stats())
     }
 
-    /// 等冻结的 memtable 全部写成 SST。
+    /// 等冻结的 memtable 全部写成 SST，后台没有待做的合并，并且合并换下的旧文件都已删掉。
+    ///
+    /// 最后一项要单独等：合并先换状态、再删旧文件，状态里已经没有待做的任务时，
+    /// 旧文件可能还在目录里。目录里的 SST 个数与状态里的相同，才说明删完了。
     fn wait_for_background(&self) {
-        while self.db.imm_memtable_count() > 0 {
+        loop {
+            let flushing = self.db.imm_memtable_count() > 0;
+            let compacting = self.db.has_pending_compaction();
+            let files_in_state =
+                self.db.l0_sstable_count() + self.db.level_sstable_counts().iter().sum::<usize>();
+            let deleting = self.sst_file_count() != files_in_state;
+            if !flushing && !compacting && !deleting {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -236,10 +293,16 @@ impl KvTarget for EngineTarget {
         }
         Some(SstLayout {
             l0_files: self.db.l0_sstable_count(),
-            l1_files: self.db.l1_sstable_count(),
+            level_files: self.db.level_sstable_counts(),
             total_bytes,
         })
     }
+}
+
+/// 把各层的文件数写成 `0 / 2 / 5` 的样子。
+pub fn join_counts(counts: &[usize]) -> String {
+    let texts: Vec<String> = counts.iter().map(|count| count.to_string()).collect();
+    texts.join(" / ")
 }
 
 /// 从游标当前的位置起读最多 `limit` 条，返回读到的条数。
@@ -257,19 +320,12 @@ fn read_up_to(iter: &mut impl StorageIterator, limit: usize) -> usize {
 pub const TARGET_NAMES: [&str; 3] = ["btreemap", "memtable", "engine"];
 
 /// 按名字创建被测对象；名字不认识时返回 `None`。
-/// `memtable_size_limit` 与 `block_cache_size` 只对 `engine` 有意义。
-pub fn create_target(
-    name: &str,
-    memtable_size_limit: usize,
-    block_cache_size: usize,
-) -> Option<Box<dyn KvTarget>> {
+/// `engine_config` 只对 `engine` 有意义。
+pub fn create_target(name: &str, engine_config: &EngineConfig) -> Option<Box<dyn KvTarget>> {
     match name {
         "btreemap" => Some(Box::new(BTreeMapTarget::new())),
         "memtable" => Some(Box::new(MemTableTarget::new())),
-        "engine" => Some(Box::new(EngineTarget::new(
-            memtable_size_limit,
-            block_cache_size,
-        ))),
+        "engine" => Some(Box::new(EngineTarget::new(engine_config.clone()))),
         _ => None,
     }
 }
@@ -310,10 +366,12 @@ mod tests {
     #[test]
     fn every_listed_target_can_be_created() {
         for name in TARGET_NAMES {
-            let target = create_target(name, 1024, 1 << 20).unwrap();
+            let config = EngineConfig::without_compaction(1024, 1 << 20);
+            let target = create_target(name, &config).unwrap();
             assert_eq!(target.name(), name);
         }
-        assert!(create_target("nosuch", 1024, 1 << 20).is_none());
+        let config = EngineConfig::without_compaction(1024, 1 << 20);
+        assert!(create_target("nosuch", &config).is_none());
     }
 
     // 三种被测对象的扫描结果一致：从起点（包含）开始，最多读指定的条数，到尾部为止。
@@ -321,7 +379,8 @@ mod tests {
     fn every_target_scans_from_start_up_to_limit() {
         for name in TARGET_NAMES {
             // 上限很小，让引擎在写入途中冻结几次，扫描要跨多张表。
-            let target = create_target(name, 8, 1 << 20).unwrap();
+            let config = EngineConfig::without_compaction(8, 1 << 20);
+            let target = create_target(name, &config).unwrap();
             for key in ["e", "a", "c", "b", "d"] {
                 target.put(key.as_bytes(), b"value");
             }
@@ -336,7 +395,7 @@ mod tests {
     // 引擎作为被测对象：读到最后一次写入的值；说明里带着 memtable 的上限。
     #[test]
     fn engine_target_reads_back_latest_value() {
-        let target = EngineTarget::new(4 * 1024 * 1024, 1 << 20);
+        let target = EngineTarget::new(EngineConfig::without_compaction(4 * 1024 * 1024, 1 << 20));
 
         assert_eq!(target.get(b"k"), None);
 
@@ -351,7 +410,7 @@ mod tests {
     #[test]
     fn engine_target_reports_stats_and_drains_frozen_memtables() {
         // 上限很小，写入途中会冻结很多次。
-        let target = EngineTarget::new(256, 0);
+        let target = EngineTarget::new(EngineConfig::without_compaction(256, 0));
         for i in 0..200 {
             target.put(format!("key-{i:03}").as_bytes(), b"value");
         }
@@ -363,5 +422,32 @@ mod tests {
         let stats = target.stats().unwrap();
         assert_eq!(stats.user_bytes_written, 200 * (7 + 5));
         assert!(stats.flush_bytes_written > 0);
+    }
+
+    // 开了自动合并：等后台工作做完之后，冻结的表全部落了盘，也没有待做的合并；
+    // 有文件被合并进了 L1 往下的层。
+    #[test]
+    fn engine_target_waits_for_background_compaction() {
+        let config = EngineConfig {
+            memtable_size_limit: 256,
+            block_cache_size: 0,
+            max_levels: 3,
+            compaction: Some(SimpleLeveledOptions {
+                level0_file_num_compaction_trigger: 2,
+                size_ratio_percent: 200,
+            }),
+        };
+        let target = EngineTarget::new(config);
+        for i in 0..200 {
+            target.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        target.wait_for_background();
+
+        assert_eq!(target.db.imm_memtable_count(), 0);
+        assert!(!target.db.has_pending_compaction());
+        assert!(target.db.level_sstable_counts().iter().sum::<usize>() > 0);
+        assert!(target.stats().unwrap().compaction_bytes_written > 0);
+        assert!(target.details().unwrap().contains("简单分层"));
     }
 }

@@ -1,83 +1,122 @@
-//! 对外的句柄：拥有引擎，以及在后台做 flush 的那个线程。
+//! 对外的句柄：拥有引擎，以及在后台做 flush 与 compaction 的两个线程。
 //!
 //! `LsmStorage` 只管数据怎么组织，自己不起线程。`Db` 在它外面包一层：
 //!
-//! - 打开时起一个后台线程，有冻结的 memtable 就把它们写成 SST；
-//! - 写入冻结了一张表时给那个线程发 `Wake`，让它立刻开始 flush；
-//! - 关闭时让线程停下、等它结束，再把还在内存里的数据都写成 SST。
+//! - 打开时起一个后台 flush 线程，有冻结的 memtable 就把它们写成 SST；
+//!   选项里给了 compaction 的参数时，再起一个后台 compaction 线程，按策略反复合并；
+//! - 写入冻结了一张表时给 flush 线程发 `Wake`，让它立刻开始 flush；
+//! - 关闭时让两个线程停下、等它们结束，再把还在内存里的数据都写成 SST。
 //!
-//! 引擎用 `Arc` 包着，`Db` 和后台线程各拿一份指针。
+//! 引擎用 `Arc` 包着，`Db` 和每个后台线程各拿一份指针。
 //!
 //! 后台线程只有两种结束的方式：收到停止的信号，或者发信号的那一头没了。
-//! 它由 `Db` 启动，也由 `Db` 负责叫停并等它结束。
+//! 它们由 `Db` 启动，也由 `Db` 负责叫停并等它们结束。
 
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::compaction::simple_leveled::{self, SimpleLeveledOptions};
 use crate::error::Result;
 use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator};
 use crate::stats::StatsSnapshot;
 
-/// 后台线程等信号的最长时间。等满这么久还没有信号，它也会检查一次有没有冻结的
+/// flush 线程等信号的最长时间。等满这么久还没有信号，它也会检查一次有没有冻结的
 /// memtable，有就写成 SST。
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
-/// 发给后台线程的信号。
-enum FlushSignal {
-    /// 写入冻结了一张 memtable 时发出。
-    /// 线程收到后把冻结的 memtable 全部写成 SST，然后继续等下一个信号。
+/// compaction 线程两次检查之间等待的时间。没有人叫醒它，它就每隔这么久看一次
+/// 要不要合并。
+const COMPACTION_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 发给后台线程（flush 或 compaction）的信号。
+enum Signal {
+    /// 有活要干，立刻检查一次，不必等到下一次自己醒来。
+    /// 写入冻结了一张 memtable 时发给 flush 线程。
     Wake,
-    /// 关闭或释放 `Db` 时发出。
-    /// 线程收到后不再做 flush，`flush_loop` 返回，线程结束。
+    /// 关闭或释放 `Db` 时发出。线程收到后不再开始新的工作，函数返回，线程结束。
     Stop,
 }
 
 pub struct Db {
-    /// 引擎本身。后台线程手里有另一份指向它的指针。
+    /// 引擎本身。每个后台线程手里有另一份指向它的指针。
     storage: Arc<LsmStorage>,
-    /// 通道的发送端，用来给后台线程发信号。接收端在线程手里。
-    flush_sender: Sender<FlushSignal>,
-    /// 后台线程的把手，等它结束时要用。
+    /// 通道的发送端，用来给 flush 线程发信号。接收端在线程手里。
+    flush_sender: Sender<Signal>,
+    /// flush 线程的把手，等它结束时要用。
     ///
     /// 等待会把把手消耗掉，所以放在 `Option` 里：停线程时把它取走，原处留下 `None`。
     /// 外面套一把锁，是因为取走要修改这个字段，而停线程的方法拿到的只是 `&self`。
     flush_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 给 compaction 线程发信号的发送端。没有启动 compaction 线程时，接收端已经丢掉，
+    /// 往这里发送会失败，不会有任何效果。
+    compaction_sender: Sender<Signal>,
+    /// compaction 线程的把手，用法与 `flush_thread` 相同。选项里没有 compaction 的参数时
+    /// 不启动这个线程，一开始就是 `None`。
+    compaction_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 后台合并用的参数，与选项里的 `compaction` 相同；`None` 表示不自动合并。
+    compaction_options: Option<SimpleLeveledOptions>,
 }
 
 impl Db {
-    /// 在 `path` 这个目录里打开数据库，并启动后台的 flush 线程。
+    /// 在 `path` 这个目录里打开数据库，并启动后台线程。
     pub fn open(path: &Path, options: LsmStorageOptions) -> Result<Self> {
-        Self::open_with_flush_interval(path, options, FLUSH_INTERVAL)
+        Self::open_with_intervals(path, options, FLUSH_INTERVAL, COMPACTION_INTERVAL)
     }
 
-    /// 与 `open` 相同，只是后台线程自己醒来的间隔由调用方给出。测试用它。
-    fn open_with_flush_interval(
+    /// 与 `open` 相同，只是两个后台线程自己醒来的间隔由调用方给出。测试用它。
+    fn open_with_intervals(
         path: &Path,
         options: LsmStorageOptions,
         flush_interval: Duration,
+        compaction_interval: Duration,
     ) -> Result<Self> {
+        // 选项要整个交给引擎，先把 compaction 线程要用的那部分复制出来。
+        let compaction_options = options.compaction.clone();
         let storage = Arc::new(LsmStorage::open(path, options)?);
-        let (flush_sender, flush_receiver) = mpsc::channel();
 
         // 线程什么时候结束不由这个函数决定，所以它不能借用这里的任何东西，
         // 要用的都得整个交给它：一份指向引擎的指针，和通道的接收端。
-        // `move` 把这两个变量搬进闭包，之后这个函数里就不能再用它们了。
-        let storage_for_thread = Arc::clone(&storage);
+        // `move` 把这些变量搬进闭包，之后这个函数里就不能再用它们了。
+        let (flush_sender, flush_receiver) = mpsc::channel();
+        let storage_for_flush = Arc::clone(&storage);
         let flush_thread = thread::Builder::new()
             // 给线程起名字：panic 的信息和调试器里都会显示它。
             .name("lsm-flush".to_string())
-            .spawn(move || flush_loop(storage_for_thread, flush_receiver, flush_interval))?;
+            .spawn(move || flush_loop(storage_for_flush, flush_receiver, flush_interval))?;
+
+        let (compaction_sender, compaction_receiver) = mpsc::channel();
+        let compaction_thread = match compaction_options.clone() {
+            Some(compaction_options) => {
+                let storage_for_compaction = Arc::clone(&storage);
+                let handle = thread::Builder::new()
+                    .name("lsm-compaction".to_string())
+                    .spawn(move || {
+                        compaction_loop(
+                            storage_for_compaction,
+                            compaction_options,
+                            compaction_receiver,
+                            compaction_interval,
+                        )
+                    })?;
+                Some(handle)
+            }
+            // 不自动合并：接收端在这里被丢掉，没有线程。
+            None => None,
+        };
 
         Ok(Self {
             storage,
             flush_sender,
             flush_thread: Mutex::new(Some(flush_thread)),
+            compaction_sender,
+            compaction_thread: Mutex::new(compaction_thread),
+            compaction_options,
         })
     }
 
@@ -117,14 +156,27 @@ impl Db {
         self.storage.l0_sstable_count()
     }
 
-    /// 当前 L1 有几个 SST。
-    pub fn l1_sstable_count(&self) -> usize {
-        self.storage.l1_sstable_count()
+    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。
+    pub fn level_sstable_counts(&self) -> Vec<usize> {
+        self.storage.level_sstable_counts()
     }
 
-    /// 把 L0 与 L1 的全部文件合并成新的 L1，见 [`LsmStorage::force_full_compaction`]。
+    /// 按后台合并的参数，现在的形状还有没有要做的合并任务。后台正在做的那个任务换进状态
+    /// 之前也算。没有开启自动合并时总是 `false`。
     ///
-    /// 在调用它的线程里做完才返回；后台的 flush 照常进行。
+    /// 用来等后台合并做完，例如基准在两段负载之间。
+    pub fn has_pending_compaction(&self) -> bool {
+        let Some(options) = &self.compaction_options else {
+            return false;
+        };
+        let snapshot = self.storage.snapshot();
+        simple_leveled::generate_task(options, &snapshot).is_some()
+    }
+
+    /// 把 L0 与各层的全部文件合并成新的最底层，见 [`LsmStorage::force_full_compaction`]。
+    ///
+    /// 在调用它的线程里做完才返回；后台的 flush 照常进行。后台的 compaction 正在合并时，
+    /// 等它这个任务做完再开始。
     pub fn force_full_compaction(&self) -> Result<()> {
         self.storage.force_full_compaction()
     }
@@ -144,53 +196,66 @@ impl Db {
     /// 目前没有 WAL，memtable 里的数据只在内存里。正常退出前必须调用这个方法，
     /// 否则最后写入的那部分数据就丢了。
     ///
-    /// 不管成功还是失败，返回时后台线程都已经结束。写文件失败时返回错误，
-    /// 没写成的数据仍然留在内存里、照常读得到；可以再调用一次重试。
-    /// 调用成功之后不应再写入。
+    /// 不管成功还是失败，返回时后台线程都已经结束。compaction 线程正在合并时，
+    /// 等它把手上这个任务做完。写文件失败时返回错误，没写成的数据仍然留在内存里、
+    /// 照常读得到；可以再调用一次重试。调用成功之后不应再写入。
     pub fn close(&self) -> Result<()> {
-        // 先让后台线程停下：从这里往后，做 flush 的只有当前这个线程。
-        self.stop_flush_thread();
+        // 先停 compaction：下面的 flush 会产生新的 L0 文件，不再为它们开始新的合并。
+        stop_thread(
+            &self.compaction_thread,
+            &self.compaction_sender,
+            "compaction",
+        );
+        // 再停 flush：从这里往后，做 flush 的只有当前这个线程。
+        stop_thread(&self.flush_thread, &self.flush_sender, "flush");
         // 可写的那张表里也有数据，冻结之后才能 flush。
         self.storage.freeze_memtable();
         self.storage.flush_all_imm_memtables()
     }
 
-    /// 给后台线程发 `Wake`：它收到后把冻结的 memtable 全部写成 SST。
+    /// 给 flush 线程发 `Wake`：它收到后把冻结的 memtable 全部写成 SST。
     fn wake_flush_thread(&self) {
         // 发送只在接收端已经不存在时失败，也就是后台线程已经结束了。
         // 那时没有人可叫，什么都不用做。
-        let _ = self.flush_sender.send(FlushSignal::Wake);
-    }
-
-    /// 让后台线程停下，并等它结束。线程已经停过了就什么都不做。
-    fn stop_flush_thread(&self) {
-        // 把把手取走。这一句结束时锁就放开了：下面等线程结束可能要等很久，
-        // 不能拿着锁等。
-        let flush_thread = self.flush_thread.lock().unwrap().take();
-        let Some(flush_thread) = flush_thread else {
-            return;
-        };
-
-        // 发送失败说明线程已经自己结束了，照样往下等它。
-        let _ = self.flush_sender.send(FlushSignal::Stop);
-        // 线程正在写文件的话，会先把手上的写完再看信号，所以这里会等到它写完。
-        if flush_thread.join().is_err() {
-            eprintln!("后台 flush 线程是 panic 结束的");
-        }
+        let _ = self.flush_sender.send(Signal::Wake);
     }
 }
 
 impl Drop for Db {
-    /// `Db` 被释放时停下后台线程，不让它留在进程里继续跑。
+    /// `Db` 被释放时停下后台线程，不让它们留在进程里继续跑。
     ///
     /// 这里不做 flush：flush 会失败，而 `drop` 没有办法把错误交给调用方。
     /// 要保住数据，得在释放之前调用 `close`。
     fn drop(&mut self) {
-        self.stop_flush_thread();
+        stop_thread(
+            &self.compaction_thread,
+            &self.compaction_sender,
+            "compaction",
+        );
+        stop_thread(&self.flush_thread, &self.flush_sender, "flush");
     }
 }
 
-/// 后台线程执行的函数：等信号，有冻结的 memtable 就把它们都写成 SST，如此反复。
+/// 让一个后台线程停下，并等它结束。线程已经停过了、或者从来没启动过，就什么都不做。
+///
+/// `thread` 是放线程把手的地方，`sender` 是给它发信号的发送端，`name` 写进出错信息里。
+fn stop_thread(thread: &Mutex<Option<JoinHandle<()>>>, sender: &Sender<Signal>, name: &str) {
+    // 把把手取走。这一句结束时锁就放开了：下面等线程结束可能要等很久，
+    // 不能拿着锁等。
+    let handle = thread.lock().unwrap().take();
+    let Some(handle) = handle else {
+        return;
+    };
+
+    // 发送失败说明线程已经自己结束了，照样往下等它。
+    let _ = sender.send(Signal::Stop);
+    // 线程正在写文件的话，会先把手上的写完再看信号，所以这里会等到它写完。
+    if handle.join().is_err() {
+        eprintln!("后台 {name} 线程是 panic 结束的");
+    }
+}
+
+/// flush 线程执行的函数：等信号，有冻结的 memtable 就把它们都写成 SST，如此反复。
 ///
 /// 每一轮最多等 `interval` 这么久。等到的结果有四种：
 ///
@@ -199,18 +264,60 @@ impl Drop for Db {
 ///
 /// flush 失败时线程不能跟着结束：把错误打印出来，下一轮再试。
 /// 这一轮没写成的表还留在冻结列表里，数据没有丢。
-fn flush_loop(storage: Arc<LsmStorage>, receiver: Receiver<FlushSignal>, interval: Duration) {
+fn flush_loop(storage: Arc<LsmStorage>, receiver: Receiver<Signal>, interval: Duration) {
     loop {
         // 最多等 `interval` 这么久。这里的 `Ok` 只表示收到了一条信号，`Err` 只表示没收到，
         // 所以按"接下来做什么"分成两组，而不是按 `Ok` 和 `Err` 分。
         match receiver.recv_timeout(interval) {
-            Ok(FlushSignal::Wake) | Err(RecvTimeoutError::Timeout) => {}
-            Ok(FlushSignal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Signal::Wake) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
         }
 
         // 失败时线程不结束：没写成的表还在冻结列表里，下一轮再试。
         if let Err(error) = storage.flush_all_imm_memtables() {
             eprintln!("后台 flush 失败，下一轮重试：{error}");
+        }
+    }
+}
+
+/// compaction 线程执行的函数：等信号或超时，然后按策略反复合并，直到没有任务，如此反复。
+///
+/// 每一轮最多等 `interval` 这么久，等到的结果与 `flush_loop` 一样分成两组：
+/// `Wake` 或超时就开始合并；`Stop` 或发送端已经不存在就返回。
+///
+/// 醒来之后反复调用 `compact_once`，直到它返回 `false`（没有任务了）：一次合并常常
+/// 让下面一对层也需要合并，不必等到下一轮。每做完一个任务看一眼有没有 `Stop`，
+/// 有就立刻返回：一连串任务可能要做很久，关闭时不该等它们全部做完。
+///
+/// 合并失败时线程不结束：打印错误，这一轮不再继续，下一轮再试。失败的任务没有改变状态
+/// （或者状态已经换好、只是旧文件没删掉），数据没有丢。
+fn compaction_loop(
+    storage: Arc<LsmStorage>,
+    options: SimpleLeveledOptions,
+    receiver: Receiver<Signal>,
+    interval: Duration,
+) {
+    loop {
+        match receiver.recv_timeout(interval) {
+            Ok(Signal::Wake) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+
+        // 一个接一个地做，直到没有任务。
+        loop {
+            match storage.compact_once(&options) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    eprintln!("后台 compaction 失败，下一轮重试：{error}");
+                    break;
+                }
+            }
+            // 做完一个任务，看一眼有没有 Stop。没有信号时 `try_recv` 立刻返回 `Empty`，不等。
+            match receiver.try_recv() {
+                Ok(Signal::Wake) | Err(TryRecvError::Empty) => {}
+                Ok(Signal::Stop) | Err(TryRecvError::Disconnected) => return,
+            }
         }
     }
 }
@@ -233,6 +340,16 @@ mod tests {
             block_size: 64,
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
+            max_levels: 3,
+            compaction: None,
+        }
+    }
+
+    /// 测试用的合并参数：L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
+    fn compaction_options() -> SimpleLeveledOptions {
+        SimpleLeveledOptions {
+            level0_file_num_compaction_trigger: 2,
+            size_ratio_percent: 200,
         }
     }
 
@@ -265,7 +382,7 @@ mod tests {
     struct RunningLoop {
         storage: Arc<LsmStorage>,
         /// 放在 `Option` 里，测试可以把发送端取走丢掉。
-        sender: Option<Sender<FlushSignal>>,
+        sender: Option<Sender<Signal>>,
         handle: JoinHandle<()>,
         dir: tempfile::TempDir,
     }
@@ -287,7 +404,7 @@ mod tests {
             }
         }
 
-        fn send(&self, signal: FlushSignal) {
+        fn send(&self, signal: Signal) {
             self.sender.as_ref().unwrap().send(signal).unwrap();
         }
 
@@ -303,7 +420,7 @@ mod tests {
         /// 等它会让每个测试都卡住，那个错误由专门的测试去报。
         fn drop(&mut self) {
             if let Some(sender) = &self.sender {
-                let _ = sender.send(FlushSignal::Stop);
+                let _ = sender.send(Signal::Stop);
             }
         }
     }
@@ -314,7 +431,7 @@ mod tests {
         let running = RunningLoop::start(NEVER);
         running.put_and_freeze("a", "1");
 
-        running.send(FlushSignal::Wake);
+        running.send(Signal::Wake);
 
         assert!(
             wait_until(|| running.storage.l0_sstable_count() == 1),
@@ -331,7 +448,7 @@ mod tests {
         running.put_and_freeze("b", "2");
         running.put_and_freeze("c", "3");
 
-        running.send(FlushSignal::Wake);
+        running.send(Signal::Wake);
 
         assert!(
             wait_until(|| running.storage.imm_memtable_count() == 0),
@@ -371,7 +488,7 @@ mod tests {
     fn loop_exits_on_stop() {
         let running = RunningLoop::start(NEVER);
 
-        running.send(FlushSignal::Stop);
+        running.send(Signal::Stop);
 
         assert!(
             wait_until(|| running.handle.is_finished()),
@@ -414,6 +531,191 @@ mod tests {
         assert_eq!(running.storage.imm_memtable_count(), 0);
     }
 
+    // ---------- compaction 线程执行的函数 ----------
+
+    /// 一个正在跑 `compaction_loop` 的线程，连同它用的引擎和通道。
+    struct RunningCompaction {
+        storage: Arc<LsmStorage>,
+        /// 放在 `Option` 里，测试可以把发送端取走丢掉。
+        sender: Option<Sender<Signal>>,
+        handle: JoinHandle<()>,
+        dir: tempfile::TempDir,
+    }
+
+    impl RunningCompaction {
+        /// 引擎不自动冻结、只有 3 层；合并参数是 `compaction_options()`；
+        /// 线程自己醒来的间隔是 `interval`。
+        fn start(interval: Duration) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let options = options_with_limit(usize::MAX);
+            let storage = Arc::new(LsmStorage::open(dir.path(), options).unwrap());
+            let (sender, receiver) = mpsc::channel();
+            let storage_for_thread = Arc::clone(&storage);
+            let handle = thread::spawn(move || {
+                compaction_loop(storage_for_thread, compaction_options(), receiver, interval)
+            });
+            Self {
+                storage,
+                sender: Some(sender),
+                handle,
+                dir,
+            }
+        }
+
+        fn send(&self, signal: Signal) {
+            self.sender.as_ref().unwrap().send(signal).unwrap();
+        }
+
+        /// 写入一条记录，冻结并 flush 成一个 L0 文件。在测试自己的线程里做，不经过后台线程。
+        fn flush_one_file(&self, key: &str, value: &str) {
+            self.storage.put(key.as_bytes(), value.as_bytes());
+            self.storage.freeze_memtable();
+            self.storage.flush_all_imm_memtables().unwrap();
+        }
+
+        /// 现在的形状是否满足合并策略：没有要做的任务。
+        fn settled(&self) -> bool {
+            let snapshot = self.storage.snapshot();
+            simple_leveled::generate_task(&compaction_options(), &snapshot).is_none()
+        }
+    }
+
+    impl Drop for RunningCompaction {
+        /// 测试结束时让线程停下。只发信号、不等它，理由与 `RunningLoop` 相同。
+        fn drop(&mut self) {
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(Signal::Stop);
+            }
+        }
+    }
+
+    // 一次 Wake 就合并到没有任务为止：L0 的 2 个文件要连着做三个任务
+    // （L0→L1、L1→L2、L2→L3）才停。间隔极长，所以只可能是这一次 Wake 做完的。
+    #[test]
+    fn compaction_loop_runs_tasks_until_none_is_left_on_one_wake() {
+        let running = RunningCompaction::start(NEVER);
+        running.flush_one_file("a", "1");
+        running.flush_one_file("b", "2");
+        assert!(!running.settled());
+
+        running.send(Signal::Wake);
+
+        assert!(
+            wait_until(|| running.settled()),
+            "一次 Wake 之后没有合并到停下：{:?}",
+            running.storage.level_sstable_counts()
+        );
+        assert_eq!(running.storage.l0_sstable_count(), 0);
+        assert_eq!(running.storage.level_sstable_counts(), vec![0, 0, 1]);
+    }
+
+    // 没有人发信号：到了间隔线程自己醒来，照样合并。
+    #[test]
+    fn compaction_loop_compacts_on_timeout_without_any_signal() {
+        let running = RunningCompaction::start(SOON);
+
+        running.flush_one_file("a", "1");
+        running.flush_one_file("b", "2");
+
+        assert!(wait_until(|| running.settled()), "等到超时之后没有合并");
+        assert_eq!(running.storage.l0_sstable_count(), 0);
+    }
+
+    // 超时不是结束：线程醒来发现没有任务，接着等下一轮；之后有了任务照样合并。
+    #[test]
+    fn compaction_loop_keeps_running_while_idle() {
+        let running = RunningCompaction::start(SOON);
+
+        // 让它空转若干轮。
+        thread::sleep(SOON * 10);
+        assert!(!running.handle.is_finished(), "线程在没有任务时结束了");
+        running.flush_one_file("a", "1");
+        running.flush_one_file("b", "2");
+
+        assert!(wait_until(|| running.settled()));
+    }
+
+    // 收到 Stop：函数返回，线程结束。
+    #[test]
+    fn compaction_loop_exits_on_stop() {
+        let running = RunningCompaction::start(NEVER);
+
+        running.send(Signal::Stop);
+
+        assert!(
+            wait_until(|| running.handle.is_finished()),
+            "收到 Stop 之后线程没有结束"
+        );
+    }
+
+    // 发送端没了：函数返回，线程结束。
+    #[test]
+    fn compaction_loop_exits_when_sender_is_gone() {
+        let mut running = RunningCompaction::start(NEVER);
+
+        drop(running.sender.take());
+
+        assert!(
+            wait_until(|| running.handle.is_finished()),
+            "发送端没了之后线程没有结束"
+        );
+    }
+
+    // 一连串任务做到一半收到 Stop：做完手上的这个就返回，不把剩下的做完。
+    // Wake 和 Stop 紧挨着发出：线程做完第一个任务（要写文件、同步，至少几百微秒）时，
+    // Stop 早已在通道里等着。
+    #[test]
+    fn compaction_loop_checks_for_stop_between_tasks() {
+        let running = RunningCompaction::start(NEVER);
+        running.flush_one_file("a", "1");
+        running.flush_one_file("b", "2");
+
+        running.send(Signal::Wake);
+        running.send(Signal::Stop);
+
+        assert!(
+            wait_until(|| running.handle.is_finished()),
+            "收到 Stop 之后线程没有结束"
+        );
+        // 要连做三个任务才能停下；在任务之间看到了 Stop，就没有做完。
+        assert!(
+            !running.settled(),
+            "收到 Stop 之后还把剩下的任务做完了：{:?}",
+            running.storage.level_sstable_counts()
+        );
+    }
+
+    // 合并失败（目录被删掉了，写不了新文件）：线程不结束，状态不变；目录恢复之后再叫醒它，
+    // 合并成功。间隔极长，线程只在收到 Wake 时干活：删目录时不会撞上它正在写文件。
+    #[test]
+    fn compaction_loop_survives_errors_and_retries() {
+        let running = RunningCompaction::start(NEVER);
+        running.flush_one_file("a", "1");
+        running.flush_one_file("b", "2");
+        std::fs::remove_dir_all(running.dir.path()).unwrap();
+
+        running.send(Signal::Wake);
+        // 让它失败一次。
+        thread::sleep(SOON * 10);
+        assert!(!running.handle.is_finished(), "合并失败之后线程结束了");
+        assert_eq!(running.storage.l0_sstable_count(), 2);
+
+        std::fs::create_dir(running.dir.path()).unwrap();
+
+        // 写新文件、换状态都会成功；删除旧文件会失败（它们随目录一起没了），这一轮停下。
+        // 所以一直叫醒它，每次接着做后面的任务，直到停下。
+        let settled = wait_until(|| {
+            running.send(Signal::Wake);
+            running.settled()
+        });
+        assert!(
+            settled,
+            "目录恢复之后没有重试成功：{:?}",
+            running.storage.level_sstable_counts()
+        );
+        assert_eq!(running.storage.l0_sstable_count(), 0);
+    }
+
     // ---------- Db ----------
 
     /// 测试用的数据库：开在一个临时目录里，目录随它一起清理。
@@ -438,11 +740,31 @@ mod tests {
         fn open(memtable_size_limit: usize, flush_interval: Duration) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let options = options_with_limit(memtable_size_limit);
-            let db = Db::open_with_flush_interval(dir.path(), options, flush_interval).unwrap();
+            let db = Db::open_with_intervals(dir.path(), options, flush_interval, SOON).unwrap();
             Self {
                 db: Some(Arc::new(db)),
                 dir,
             }
+        }
+
+        /// 打开一个会在后台自动合并的数据库：memtable 写满 `memtable_size_limit` 字节就冻结，
+        /// 合并的参数是 `compaction_options()`，compaction 线程每隔 `compaction_interval`
+        /// 自己醒来一次。
+        fn open_with_compaction(memtable_size_limit: usize, compaction_interval: Duration) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = options_with_limit(memtable_size_limit);
+            options.compaction = Some(compaction_options());
+            let db =
+                Db::open_with_intervals(dir.path(), options, SOON, compaction_interval).unwrap();
+            Self {
+                db: Some(Arc::new(db)),
+                dir,
+            }
+        }
+
+        /// 现在的形状是否满足合并策略：没有要做的任务。
+        fn settled(&self) -> bool {
+            !self.has_pending_compaction()
         }
 
         fn dir(&self) -> &Path {
@@ -600,9 +922,101 @@ mod tests {
             assert!(wait_until(|| db.imm_memtable_count() == 0));
             db.force_full_compaction().unwrap();
             assert_eq!(db.l0_sstable_count(), 0);
-            assert!(db.l1_sstable_count() > 0);
+            let level_counts = db.level_sstable_counts();
+            let bottom_count = *level_counts.last().unwrap();
+            assert!(bottom_count > 0);
             assert_eq!(db.scan_all().len(), writers * puts_per_writer);
-            assert_eq!(sst_file_names(db.dir()).len(), db.l1_sstable_count());
+            assert_eq!(sst_file_names(db.dir()).len(), bottom_count);
+        });
+    }
+
+    // 选项里给了合并参数：不用任何人手动触发，后台把文件一层一层合并下去，形状满足策略；
+    // 数据一条不少。
+    #[test]
+    fn db_compacts_in_the_background() {
+        let db = TestDb::open_with_compaction(64, SOON);
+
+        for i in 0..300 {
+            db.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        assert!(
+            wait_until(|| db.imm_memtable_count() == 0 && db.settled()),
+            "后台没有合并到停下：L0 {}，各层 {:?}",
+            db.l0_sstable_count(),
+            db.level_sstable_counts()
+        );
+        let level_counts = db.level_sstable_counts();
+        assert!(
+            level_counts.iter().sum::<usize>() > 0,
+            "没有任何文件被合并下去"
+        );
+        assert_eq!(db.scan_all().len(), 300);
+    }
+
+    // 没有开启自动合并时，不管 L0 积了多少文件，都不算有待做的合并。
+    #[test]
+    fn has_pending_compaction_is_false_without_compaction_options() {
+        let db = TestDb::open(usize::MAX, SOON);
+        for key in ["a", "b", "c"] {
+            db.put(key.as_bytes(), b"v");
+            db.storage.freeze_memtable();
+            db.storage.flush_all_imm_memtables().unwrap();
+        }
+
+        assert_eq!(db.l0_sstable_count(), 3);
+        assert!(!db.has_pending_compaction());
+    }
+
+    // 选项里没有合并参数：不起 compaction 线程，L0 的文件只增不减。
+    #[test]
+    fn db_without_compaction_options_never_compacts() {
+        let db = TestDb::open(64, SOON);
+
+        for i in 0..300 {
+            db.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        assert!(wait_until(|| db.imm_memtable_count() == 0));
+        // 再多等几轮 compaction 的间隔，确认没有人在合并。
+        thread::sleep(SOON * 10);
+        assert!(db.l0_sstable_count() > 2);
+        assert_eq!(db.level_sstable_counts(), vec![0, 0, 0]);
+    }
+
+    // 几个线程同时写入和读，后台同时在 flush 和合并：每条记录写完立刻读得到；
+    // 关闭之后数据一条不少，目录里的文件正好是状态里的文件。
+    // 整个测试设了时限：几把锁的先后顺序出错时，测试报"卡住"而不是停在那里。
+    #[test]
+    fn db_keeps_data_readable_while_compacting_in_the_background() {
+        run_with_deadline("写入、flush 与后台合并同时进行", || {
+            let db = TestDb::open_with_compaction(256, SOON);
+            let writers = 4;
+            let puts_per_writer = 500;
+
+            thread::scope(|scope| {
+                let db = &db;
+                for writer in 0..writers {
+                    scope.spawn(move || {
+                        for i in 0..puts_per_writer {
+                            let key = format!("w{writer}-{i:04}");
+                            db.put(key.as_bytes(), b"v");
+                            assert_eq!(db.get_str(&key), Some("v".to_string()));
+                        }
+                    });
+                }
+            });
+
+            db.close().unwrap();
+            assert_eq!(db.scan_all().len(), writers * puts_per_writer);
+            let snapshot = db.storage.snapshot();
+            let mut ids: Vec<usize> = snapshot.l0_sstables.iter().map(|sst| sst.id()).collect();
+            for level in &snapshot.levels {
+                ids.extend(level.iter().map(|sst| sst.id()));
+            }
+            ids.sort();
+            let names_in_state: Vec<String> = ids.iter().map(|id| format!("{id:05}.sst")).collect();
+            assert_eq!(sst_file_names(db.dir()), names_in_state);
         });
     }
 
@@ -704,6 +1118,33 @@ mod tests {
         db.close().unwrap();
 
         assert_eq!(records_in_sst_files(db.dir()), expected(&[("a", "1")]));
+    }
+
+    // 有 compaction 线程时，关闭把两个后台线程都停下：只剩 Db 自己的一份指针。
+    #[test]
+    fn close_stops_the_compaction_thread_too() {
+        let db = TestDb::open_with_compaction(usize::MAX, SOON);
+        assert_eq!(Arc::strong_count(&db.storage), 3);
+
+        db.close().unwrap();
+
+        assert_eq!(
+            Arc::strong_count(&db.storage),
+            1,
+            "close 返回之后还有后台线程在"
+        );
+    }
+
+    // 有 compaction 线程时，没有调用 close 就释放：两个后台线程都被停下。
+    #[test]
+    fn dropping_the_db_stops_the_compaction_thread_too() {
+        let mut db = TestDb::open_with_compaction(usize::MAX, NEVER);
+        let storage = Arc::clone(&db.storage);
+        assert_eq!(Arc::strong_count(&storage), 4);
+
+        assert!(db.drop_db(), "释放 Db 没有按时结束");
+
+        assert_eq!(Arc::strong_count(&storage), 1);
     }
 
     // 没有调用 close 就释放：后台线程照样被停下，不会留在进程里。

@@ -108,7 +108,7 @@ db/
 | 编号 | 笔记 | 状态 | 主要范围 | mini-lsm |
 | --- | --- | --- | --- | --- |
 | L02 | [memtable 与跳表](02-memtable-and-skiplist.md) | 部分已整理 | 为什么有序与并发、跳表、墓碑的表示、大小估算、数据的归属；冻结与切换、状态快照与两把锁；mini-lsm 与 GreptimeDB 对照 | 第一周第 1 章 |
-| L03 | [迭代器接口与多路归并](03-iterators-and-merge.md) | 部分已整理 | 游标、多路归并与堆、同 key 取新、墓碑的先后、分层；memtable 游标与自引用；归并、去墓碑与引擎扫描的实现；mini-lsm 与 GreptimeDB 对照 | 第一周第 2 章 |
+| L03 | [迭代器接口与多路归并](03-iterators-and-merge.md) | 部分已整理 | 游标、多路归并与堆、同 key 取新、墓碑的先后、分层；memtable 游标与自引用；归并（当前来源放在堆外）、去墓碑与引擎扫描的实现；mini-lsm 与 GreptimeDB 对照 | 第一周第 2 章 |
 | L04 | [数据块格式](04-block-format.md) | 部分已整理 | 为什么切成块、块与 SST 和 memtable 的关系、两层索引、与页的对照、大小为何可以不固定、块满与过大的记录、块内定位、格式、LevelDB 的 restart point 对照；构建器、编解码与块上游标的实现、二分的写法；mini-lsm 与 GreptimeDB 对照 | 第一周第 3 章 |
 | L05 | [SST 格式](05-sst-format.md) | 部分已整理 | 文件的组成与索引、构建、落盘的步骤、`pread` 与 mmap、错误类型、打开与读块、按末 key 找块、SST 的游标、对文件内容的检查、块缓存（为什么缓存块、LRU 与 TinyLFU、按字节计容量）、块的压缩 | 第一周第 4 章 |
 | L06 | [读路径](06-read-path.md) | 部分已整理 | 状态里的 L0、跨来源的点查、两路归并、范围的两端、读放大、按 key 范围排除文件；状态快照与文件的生命周期未展开 | 第一周第 5 章 |
@@ -120,7 +120,7 @@ db/
 | 编号 | 笔记 | 状态 | 主要范围 | mini-lsm |
 | --- | --- | --- | --- | --- |
 | L09 | [compaction 的执行](09-compaction-execution.md) | 已有正文 | 只增不减的代价、层（L0、sorted run、为什么要 L0）、墓碑何时可以丢、读 L1 与串接游标、扫描为什么要归并、执行步骤与丢失更新、删除旧文件与 Unix 语义、输出切分、tiered 与 leveled；mito2 换状态与删文件的导读；基准 | 第二周第 1 章 |
-| L10 | [简单分层 compaction](10-simple-leveled-compaction.md) | 未教学 | 文件数触发、层间比例触发、compaction 线程 | 第二周第 2 章 |
+| L10 | [简单分层 compaction](10-simple-leveled-compaction.md) | 已有正文 | 为什么要自动、分层与三种放大、简单分层的规则与优先级、策略与执行分开（任务、只给一个任务）、多层状态的表示、执行与换状态、并行合并的约束、后台线程（两种等待、关闭顺序）、穿过空层的复制；mito2 的 picker 与调度器导读；基准 | 第二周第 2 章 |
 | L11 | [tiered compaction](11-tiered-compaction.md) | 未教学 | 有序段、三种触发条件、放大的取舍 | 第二周第 3 章 |
 | L12 | [leveled compaction](12-leveled-compaction.md) | 未教学 | 目标大小、基准层、优先级、选文件 | 第二周第 4 章 |
 | L13 | [manifest](13-manifest.md) | 未教学 | 记录内容与编码、写入时机、恢复 SST 集合 | 第二周第 5 章 |

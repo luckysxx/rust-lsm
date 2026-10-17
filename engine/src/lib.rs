@@ -6,6 +6,7 @@
 //! compaction 等按知识点顺序加入，见 `lsm/notes/README.md`。
 
 pub mod block;
+pub mod compaction;
 pub mod db;
 pub mod error;
 pub mod iterators;

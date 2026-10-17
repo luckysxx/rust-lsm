@@ -8,8 +8,9 @@ mod workload;
 
 use std::process::ExitCode;
 
+use lsm::compaction::simple_leveled::SimpleLeveledOptions;
 use runner::{Config, WorkloadResult, run_workload};
-use target::{KvTarget, TARGET_NAMES, create_target};
+use target::{EngineConfig, KvTarget, TARGET_NAMES, create_target, join_counts};
 use workload::{KEY_SIZE, MAX_KEYS, Workload};
 
 const USAGE: &str = "\
@@ -24,11 +25,17 @@ const USAGE: &str = "\
   --scan-length N    范围扫描每次读的记录数（默认 100）
   --memtable-mb N    被测对象为 engine 时，memtable 的上限，单位 MB（默认 64）
   --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
+  --max-levels N     被测对象为 engine 时，L0 之下有几层（默认 4）
+  --compaction NAME  被测对象为 engine 时，后台自动合并的策略：none（不自动合并）或
+                     simple（简单分层）（默认 none）
+  --l0-trigger N     simple 策略下，L0 攒到几个文件就并进 L1（默认 2）
+  --size-ratio N     simple 策略下，下层的文件数至少是上层的百分之几（默认 200）
   --help             显示本说明
 
 负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）、
 compact（把磁盘上的全部 SST 合并成一层，只做一次；不在默认列表里）。
-每段负载计时结束后，等引擎把冻结的表全部写成文件，再开始下一段；等待的时间单独列出，不计入吞吐。
+每段负载计时结束后，等引擎把冻结的表全部写成文件、后台合并做完，再开始下一段；
+等待的时间单独列出，不计入吞吐。
 被测对象：btreemap（互斥锁加 BTreeMap）、memtable（引擎的单张 memtable）、engine（引擎层）。
 读负载读的是前面的写负载留下的数据，所以要把 fillrandom 排在前面。";
 
@@ -38,6 +45,31 @@ struct Args {
     target: String,
     memtable_megabytes: usize,
     block_cache_megabytes: usize,
+    max_levels: usize,
+    /// `none` 或 `simple`。
+    compaction: String,
+    l0_trigger: usize,
+    size_ratio_percent: usize,
+}
+
+impl Args {
+    /// 被测对象为 engine 时用的配置。
+    fn engine_config(&self) -> EngineConfig {
+        let compaction = if self.compaction == "simple" {
+            Some(SimpleLeveledOptions {
+                level0_file_num_compaction_trigger: self.l0_trigger,
+                size_ratio_percent: self.size_ratio_percent,
+            })
+        } else {
+            None
+        };
+        EngineConfig {
+            memtable_size_limit: self.memtable_megabytes * 1024 * 1024,
+            block_cache_size: self.block_cache_megabytes * 1024 * 1024,
+            max_levels: self.max_levels,
+            compaction,
+        }
+    }
 }
 
 fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
@@ -52,6 +84,10 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     let mut target = "btreemap".to_string();
     let mut memtable_megabytes = 64;
     let mut block_cache_megabytes = 64;
+    let mut max_levels = 4;
+    let mut compaction = "none".to_string();
+    let mut l0_trigger = 2;
+    let mut size_ratio_percent = 200;
 
     let mut index = 0;
     while index < raw.len() {
@@ -73,6 +109,10 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--scan-length" => config.scan_length = parse_number(flag, value)? as usize,
             "--memtable-mb" => memtable_megabytes = parse_number(flag, value)? as usize,
             "--block-cache-mb" => block_cache_megabytes = parse_number(flag, value)? as usize,
+            "--max-levels" => max_levels = parse_number(flag, value)? as usize,
+            "--compaction" => compaction = value.clone(),
+            "--l0-trigger" => l0_trigger = parse_number(flag, value)? as usize,
+            "--size-ratio" => size_ratio_percent = parse_number(flag, value)? as usize,
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -96,12 +136,25 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     if memtable_megabytes == 0 {
         return Err("--memtable-mb 必须至少为 1".to_string());
     }
+    if max_levels == 0 {
+        return Err("--max-levels 必须至少为 1".to_string());
+    }
+    if compaction != "none" && compaction != "simple" {
+        return Err(format!("不认识的合并策略：{compaction}"));
+    }
+    if l0_trigger == 0 {
+        return Err("--l0-trigger 必须至少为 1".to_string());
+    }
     Ok(Some(Args {
         config,
         workloads,
         target,
         memtable_megabytes,
         block_cache_megabytes,
+        max_levels,
+        compaction,
+        l0_trigger,
+        size_ratio_percent,
     }))
 }
 
@@ -134,10 +187,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let memtable_size_limit = args.memtable_megabytes * 1024 * 1024;
-    let block_cache_size = args.block_cache_megabytes * 1024 * 1024;
-    let target = create_target(&args.target, memtable_size_limit, block_cache_size)
-        .expect("名字在解析参数时已经检查过");
+    let target =
+        create_target(&args.target, &args.engine_config()).expect("名字在解析参数时已经检查过");
 
     let mut results = Vec::new();
     for workload in &args.workloads {
@@ -170,7 +221,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("- 被测对象说明：{details}");
     }
     println!(
-        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} --compaction {} --l0-trigger {} --size-ratio {} --workloads {}`",
         args.target,
         config.threads,
         config.num,
@@ -179,6 +230,10 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         config.scan_length,
         args.memtable_megabytes,
         args.block_cache_megabytes,
+        args.max_levels,
+        args.compaction,
+        args.l0_trigger,
+        args.size_ratio_percent,
         workload_names.join(",")
     );
     println!(
@@ -197,7 +252,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     println!("## 吞吐与延迟");
     println!();
     println!(
-        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到或读到的记录 | 之后等落盘 (s) |"
+        "| 负载 | 操作数 | 耗时 (s) | 吞吐 (ops/s) | 写入 (MB/s) | p50 (µs) | p99 (µs) | p99.9 (µs) | 最大 (µs) | 查到或读到的记录 | 之后等后台 (s) |"
     );
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for result in results {
@@ -228,7 +283,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     // 空间放大的分母：全部 key 各一份的大小。基准里没有删除，写满之后 key 的个数不变。
     let live_bytes = args.config.num * (KEY_SIZE + args.config.value_size) as u64;
     println!(
-        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 的 SST | 结束时 SST 的总字节 | 空间放大 |"
+        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 / … 的 SST | 结束时 SST 的总字节 | 空间放大 |"
     );
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     let mut total_user_bytes = 0;
@@ -239,9 +294,9 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         };
         total_user_bytes += stats.user_bytes_written;
         total_disk_bytes += stats.disk_bytes_written();
-        let (layout, total_bytes, space_amplification) = match result.sst_layout {
+        let (layout, total_bytes, space_amplification) = match &result.sst_layout {
             Some(layout) => (
-                format!("{} / {}", layout.l0_files, layout.l1_files),
+                format!("{} / {}", layout.l0_files, join_counts(&layout.level_files)),
                 layout.total_bytes.to_string(),
                 ratio(Some(layout.total_bytes as f64 / live_bytes as f64)),
             ),
@@ -315,6 +370,9 @@ mod tests {
         assert_eq!(args.config.scan_length, 100);
         assert_eq!(args.memtable_megabytes, 64);
         assert_eq!(args.block_cache_megabytes, 64);
+        assert_eq!(args.max_levels, 4);
+        assert_eq!(args.compaction, "none");
+        assert!(args.engine_config().compaction.is_none());
         assert_eq!(args.target, "btreemap");
         assert_eq!(args.workloads, Workload::DEFAULT.to_vec());
     }
@@ -341,6 +399,14 @@ mod tests {
             "8",
             "--block-cache-mb",
             "0",
+            "--max-levels",
+            "3",
+            "--compaction",
+            "simple",
+            "--l0-trigger",
+            "4",
+            "--size-ratio",
+            "400",
         ]);
         let args = parse_args(&raw).unwrap().unwrap();
 
@@ -351,6 +417,10 @@ mod tests {
         assert_eq!(args.config.scan_length, 10);
         assert_eq!(args.memtable_megabytes, 8);
         assert_eq!(args.block_cache_megabytes, 0);
+        assert_eq!(args.max_levels, 3);
+        let compaction = args.engine_config().compaction.unwrap();
+        assert_eq!(compaction.level0_file_num_compaction_trigger, 4);
+        assert_eq!(compaction.size_ratio_percent, 400);
         assert_eq!(args.target, "memtable");
         assert_eq!(
             args.workloads,
@@ -372,6 +442,9 @@ mod tests {
         assert!(parse_args(&strings(&["--value-size", "0"])).is_err());
         assert!(parse_args(&strings(&["--scan-length", "0"])).is_err());
         assert!(parse_args(&strings(&["--memtable-mb", "0"])).is_err());
+        assert!(parse_args(&strings(&["--max-levels", "0"])).is_err());
+        assert!(parse_args(&strings(&["--compaction", "tiered"])).is_err());
+        assert!(parse_args(&strings(&["--l0-trigger", "0"])).is_err());
     }
 
     // --help 不算错误，只是不执行负载。

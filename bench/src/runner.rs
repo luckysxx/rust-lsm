@@ -395,10 +395,10 @@ mod tests {
     // 对引擎执行 compact：L0 清空，数据进了 L1，读到的不变；计数器记下了 compaction 写的字节。
     #[test]
     fn compact_moves_engine_data_into_l1() {
-        use crate::target::EngineTarget;
+        use crate::target::{EngineConfig, EngineTarget};
 
         // memtable 上限 16 KB，1000 条记录写出好几个 L0 文件。
-        let target = EngineTarget::new(16 * 1024, 1 << 20);
+        let target = EngineTarget::new(EngineConfig::without_compaction(16 * 1024, 1 << 20));
         let config = small_config();
         run_workload(&target, Workload::FillRandom, &config);
         let before = target.sst_layout().unwrap();
@@ -409,7 +409,7 @@ mod tests {
         let after = result.sst_layout.unwrap();
         assert_eq!(result.ops, 1);
         assert_eq!(after.l0_files, 0);
-        assert!(after.l1_files > 0);
+        assert!(*after.level_files.last().unwrap() > 0);
         assert!(result.stats.unwrap().compaction_bytes_written > 0);
         let hits = run_workload(&target, Workload::ReadRandom, &config);
         assert_eq!(hits.found, config.num);
