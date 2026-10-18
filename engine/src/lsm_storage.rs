@@ -5,6 +5,9 @@
 //! 读取从新到旧依次查找：可写的表、冻结的表、L0 的 SST、L1、L2……
 //! 冻结的表由 flush 写成 L0 的 SST；compaction 把上层的文件合并进下层。
 //!
+//! 选用 tiered 策略时不用 L0：flush 出的 SST 成为 `levels` 最前面的一个新 tier，
+//! `levels` 是一列按新旧排列、个数会变的 tier。读取的顺序不变，仍是从 `levels` 的前面往后。
+//!
 //! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
 mod compact;
@@ -17,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use bytes::Bytes;
 
-use crate::compaction::simple_leveled::SimpleLeveledOptions;
+use crate::compaction::CompactionOptions;
 use crate::error::Result;
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::{SstConcatIterator, find_sst_index};
@@ -58,6 +61,9 @@ pub struct LsmStorageState {
     /// `max_levels`，空的层也占一项。每层的 SST 按 key 从小到大、范围互不重叠：
     /// 合起来是一个排好序的序列。由 compaction 产生；上层的数据比下层的新，
     /// L1 的数据比 L0 的旧。
+    ///
+    /// 选用 tiered 策略时，这里是全部的 tier，`levels[0]` 最新；每个 tier 同样按 key 排好、
+    /// 互不重叠。个数随 flush 与合并变化，没有空的 tier，L0 一直是空的。
     pub levels: Vec<Vec<Arc<SsTable>>>,
 }
 
@@ -81,12 +87,13 @@ pub struct LsmStorageOptions {
     /// 和块一样是一条软线，文件会稍大一点。flush 不受它限制，一张 memtable 写成一个文件。
     pub target_sst_size: usize,
     /// L0 之下有几层（L1 到 L`max_levels`），至少 1 层。最后一层是最底层：
-    /// 合并到这一层时，墓碑与被它盖住的值可以一起丢掉。
+    /// 合并到这一层时，墓碑与被它盖住的值可以一起丢掉。选用 tiered 策略时不用它：
+    /// tier 的个数是变的。
     pub max_levels: usize,
-    /// 后台自动合并用的简单分层策略的参数。`None` 表示不自动合并，只有手动调用
-    /// `force_full_compaction` 时才合并。`LsmStorage` 自己不起线程，这一项由 `db::Db`
-    /// 读取：有它才启动后台的 compaction 线程。
-    pub compaction: Option<SimpleLeveledOptions>,
+    /// 用哪种合并策略。它决定状态的形状（有没有 L0、层数是否固定）与 flush 把文件放在哪里。
+    /// `LsmStorage` 自己不起线程，由 `db::Db` 读取这一项：不是 `NoCompaction` 才启动
+    /// 后台的 compaction 线程。
+    pub compaction: CompactionOptions,
 }
 
 pub struct LsmStorage {
@@ -119,11 +126,17 @@ impl LsmStorage {
         assert!(options.max_levels >= 1, "L0 之下至少要有 1 层");
         std::fs::create_dir_all(path)?;
 
+        // 分层的策略一开始就有固定数目的空层；tiered 一开始一个 tier 都没有。
+        let initial_levels = if options.compaction.flush_to_l0() {
+            vec![Vec::new(); options.max_levels]
+        } else {
+            Vec::new()
+        };
         let initial_state = LsmStorageState {
             memtable: Arc::new(MemTable::new()),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
-            levels: vec![Vec::new(); options.max_levels],
+            levels: initial_levels,
         };
         let block_cache = if options.block_cache_size == 0 {
             None
@@ -154,7 +167,13 @@ impl LsmStorage {
         self.snapshot().l0_sstables.len()
     }
 
-    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。
+    /// 是否选用了 tiered 策略：不用 L0，`levels` 是一列 tier。
+    pub fn uses_tiers(&self) -> bool {
+        !self.options.compaction.flush_to_l0()
+    }
+
+    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。选用 tiered 策略时是各个 tier 的，
+    /// 第 0 项最新。
     pub fn level_sstable_counts(&self) -> Vec<usize> {
         let snapshot = self.snapshot();
         snapshot.levels.iter().map(|level| level.len()).collect()
@@ -230,7 +249,8 @@ impl LsmStorage {
         }
 
         // 最后从上往下逐层查 L1、L2……上层的更新，先查到的就是最新的。
-        // 每层的文件范围互不重叠，最多一个文件可能有这个 key。
+        // 每层的文件范围互不重叠，最多一个文件可能有这个 key。tiered 的各个 tier 也是这样，
+        // 列表里新的在前。
         for level in &snapshot.levels {
             let sst_index = find_sst_index(level, key);
             if let Some(sst) = level.get(sst_index)
@@ -392,7 +412,8 @@ impl LsmStorage {
         Ok(())
     }
 
-    /// 把最旧的一张冻结的 memtable 写成 SST，放进 L0。没有冻结的表时什么都不做。
+    /// 把最旧的一张冻结的 memtable 写成 SST，放进 L0；选用 tiered 策略时，它自己成为
+    /// 最前面的一个新 tier。没有冻结的表时什么都不做。
     ///
     /// 写文件期间不挡住读写：先在锁外把文件写好、同步，最后只用一瞬间换状态。
     /// 换状态是一步完成的，读者要么看到"表还在、文件不在"，要么看到"表不在了、
@@ -423,7 +444,8 @@ impl LsmStorage {
             self.sync_dir()?;
         }
 
-        // 换状态：复制一份，去掉末尾那张表，把新的 SST 放到 L0 的最前面，换指针。
+        // 换状态：复制一份，去掉末尾那张表，把新的 SST 放到 L0 的最前面（tiered 是放到
+        // `levels` 的最前面），换指针。
         // 与冻结一样先拿 `state_lock` 排队，再用写锁换指针。
         let _state_lock = self.state_lock.lock().unwrap();
         let mut guard = self.state.write().unwrap();
@@ -435,8 +457,12 @@ impl LsmStorage {
             "flush 期间冻结列表的末尾变了"
         );
         if let Some(sst) = sst {
-            // L0 里新的在前：刚写出的这个最新。
-            new_state.l0_sstables.insert(0, sst);
+            // L0 与 tier 的列表都是新的在前：刚写出的这个最新。
+            if self.options.compaction.flush_to_l0() {
+                new_state.l0_sstables.insert(0, sst);
+            } else {
+                new_state.levels.insert(0, vec![sst]);
+            }
         }
         *guard = Arc::new(new_state);
         Ok(())
@@ -610,7 +636,7 @@ mod tests {
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
             max_levels: 3,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         })
     }
 
@@ -1730,7 +1756,7 @@ mod tests {
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
             max_levels: 3,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         };
 
         let _storage = LsmStorage::open(&path, options).unwrap();
@@ -2460,7 +2486,7 @@ mod tests {
             block_cache_size: 0,
             target_sst_size: 1024,
             max_levels: 3,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         };
         let storage = LsmStorage::open(dir.path(), options).unwrap();
         storage.put(b"a", b"1");

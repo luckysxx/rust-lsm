@@ -1,7 +1,9 @@
 //! compaction 的执行：按任务把一组 SST 归并成新的 SST，换进状态，删除旧文件。
 //!
 //! 合并什么由 `crate::compaction` 里的策略决定，这里只负责照做。有两种入口：
-//! 手动的全量合并 `force_full_compaction`，与按简单分层策略做一个任务的 `compact_once`。
+//! 手动的全量合并 `force_full_compaction`，与按选项里的策略做一个任务的 `compact_once`。
+//! 每种任务都是同样的四步：在锁外合并、写新文件 → 同步目录 → 拿 `state_lock` 换状态 →
+//! 删除旧文件。
 //!
 //! 本文件是 `lsm_storage` 的子模块。子模块能看到父模块里的私有内容，所以这里可以
 //! 直接给 `LsmStorage` 加方法，并使用它的私有字段与 `write_ssts` 等私有方法，
@@ -11,7 +13,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::LsmStorage;
-use crate::compaction::simple_leveled::{self, SimpleLeveledOptions, SimpleLeveledTask};
+use crate::compaction::CompactionOptions;
+use crate::compaction::simple_leveled::{self, SimpleLeveledTask};
+use crate::compaction::tiered::{self, TieredTask};
 use crate::error::Result;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
@@ -19,24 +23,85 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::table::{SsTable, SsTableIterator};
 
 impl LsmStorage {
-    /// 把 L0 与各层的全部文件合并成新的最底层（full compaction），然后删除旧文件。
+    /// 按选项里的策略做一个合并任务，然后删除旧文件。返回这次有没有做：
+    /// 没有需要合并的、或者选项是 `NoCompaction` 时什么也不做，返回 `false`。
     ///
-    /// 步骤：记下此刻 L0 与各层的文件 → 在锁外合并、写新文件、同步目录 →
-    /// 拿 `state_lock` 换状态 → 删除旧文件。合并期间 flush 照常进行，新 flush 出的
-    /// L0 文件不参加这次合并，换状态之后仍留在 L0。L0 是空的时候什么也不做。
+    /// 一次合并之后常常还有下一个任务，调用方应当反复调用，直到返回 `false`。
+    ///
+    /// 写新文件失败时返回错误，状态不变，写了一半的新文件留在目录里，没有任何地方引用。
+    /// 删除旧文件失败时也返回错误，这时新状态已经生效，旧文件留在目录里。
+    pub fn compact_once(&self) -> Result<bool> {
+        // 同一时刻只做一次 compaction：L1 往下的层（tier）只由 compaction 拿掉或替换，
+        // 两次交错会互相覆盖。任务要在拿到锁之后生成，看到的才是上一次合并换完之后的状态。
+        let _compaction_lock = self.compaction_lock.lock().unwrap();
+
+        let snapshot = self.snapshot();
+        match &self.options.compaction {
+            CompactionOptions::NoCompaction => Ok(false),
+            CompactionOptions::SimpleLeveled(options) => {
+                let Some(task) = simple_leveled::generate_task(options, &snapshot) else {
+                    return Ok(false);
+                };
+                self.run_simple_leveled_task(&task)?;
+                Ok(true)
+            }
+            CompactionOptions::Tiered(options) => {
+                let Some(task) = tiered::generate_task(options, &snapshot) else {
+                    return Ok(false);
+                };
+                self.run_tiered_task(&task)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// 按选项里的策略，现在的形状还有没有要做的合并任务。后台正在做的那个任务换进状态
+    /// 之前也算。选项是 `NoCompaction` 时总是 `false`。
+    pub fn has_pending_compaction(&self) -> bool {
+        let snapshot = self.snapshot();
+        match &self.options.compaction {
+            CompactionOptions::NoCompaction => false,
+            CompactionOptions::SimpleLeveled(options) => {
+                simple_leveled::generate_task(options, &snapshot).is_some()
+            }
+            CompactionOptions::Tiered(options) => {
+                tiered::generate_task(options, &snapshot).is_some()
+            }
+        }
+    }
+
+    /// 把全部文件合并成一个 sorted run（full compaction），然后删除旧文件。
+    ///
+    /// 分层的形状（`NoCompaction` 与简单分层）：L0 与各层合并成新的最底层，其余各层清空。
+    /// 合并期间 flush 照常进行，新 flush 出的 L0 文件不参加这次合并，换状态之后仍留在 L0。
+    /// L0 是空的时候什么也不做。
+    ///
+    /// tiered：全部 tier 合并成一个。合并期间新 flush 出的 tier 不参加，换状态之后排在它前面。
+    /// 不到 2 个 tier 时什么也不做。
     ///
     /// 旧文件在换状态之后立刻删除。仍拿着旧快照的读者照样能读完：它们的 `SsTable`
     /// 一直开着文件，Unix 上删除只去掉文件名，最后一个打开它的一方关闭之后，文件系统
     /// 才回收空间。
     ///
-    /// 写新文件失败时返回错误，状态不变，写了一半的新文件留在目录里，没有任何地方引用。
-    /// 删除旧文件失败时也返回错误，这时新状态已经生效，旧文件留在目录里。
+    /// 出错时的情况与 `compact_once` 相同。
     pub fn force_full_compaction(&self) -> Result<()> {
         // 同一时刻只做一次 compaction：L1 往下的层只由 compaction 改动，两次交错会互相覆盖。
         let _compaction_lock = self.compaction_lock.lock().unwrap();
+        let snapshot = self.snapshot();
+
+        // tiered：就是一个带上全部 tier 的任务。
+        if !self.options.compaction.flush_to_l0() {
+            if snapshot.levels.len() < 2 {
+                return Ok(());
+            }
+            let task = TieredTask {
+                tiers: snapshot.levels.clone(),
+                bottom_tier_included: true,
+            };
+            return self.run_tiered_task(&task);
+        }
 
         // 记下这次要合并的文件。之后 flush 可能往 L0 加新文件，它们不在这次的输入里。
-        let snapshot = self.snapshot();
         let l0_inputs = snapshot.l0_sstables.clone();
         let level_inputs = snapshot.levels.clone();
         if l0_inputs.is_empty() {
@@ -54,7 +119,12 @@ impl LsmStorage {
 
         // 新状态里已经没有旧文件了，删掉它们的文件名。
         let old_ssts = l0_inputs.iter().chain(level_inputs.iter().flatten());
-        for sst in old_ssts {
+        self.remove_sst_files(old_ssts)
+    }
+
+    /// 删除一组已经不在状态里的 SST 的文件名。
+    fn remove_sst_files<'a>(&self, ssts: impl Iterator<Item = &'a Arc<SsTable>>) -> Result<()> {
+        for sst in ssts {
             std::fs::remove_file(self.path_of_sst(sst.id()))?;
         }
         Ok(())
@@ -142,39 +212,21 @@ impl LsmStorage {
 }
 
 impl LsmStorage {
-    /// 按简单分层策略做一个合并任务，然后删除旧文件。返回这次有没有做：
-    /// 没有需要合并的层时什么也不做，返回 `false`。
-    ///
-    /// 步骤与 `force_full_compaction` 相同：在当前状态上生成任务（记下两层的文件）→
-    /// 在锁外合并、写新文件、同步目录 → 拿 `state_lock` 换状态 → 删除旧文件。
-    /// 一次合并之后下面一对层常常也需要合并，调用方应当反复调用，直到返回 `false`。
-    ///
-    /// 出错时的情况也与 `force_full_compaction` 相同。
-    pub fn compact_once(&self, options: &SimpleLeveledOptions) -> Result<bool> {
-        // 同一时刻只做一次 compaction：L1 往下的层只由 compaction 改动，两次交错会互相覆盖。
-        // 任务要在拿到锁之后生成，看到的才是上一次合并换完之后的状态。
-        let _compaction_lock = self.compaction_lock.lock().unwrap();
-
-        let snapshot = self.snapshot();
-        let Some(task) = simple_leveled::generate_task(options, &snapshot) else {
-            return Ok(false);
-        };
-
+    /// 做一个简单分层的任务：合并两层、同步目录、换状态、删除旧文件。
+    /// 调用方必须持有 `compaction_lock`，任务是拿到锁之后生成的。
+    fn run_simple_leveled_task(&self, task: &SimpleLeveledTask) -> Result<()> {
         // 写新文件：慢，不占 `state_lock`，读、写、冻结、flush 都照常进行。
-        let new_ssts = self.compact_task(&task)?;
+        let new_ssts = self.compact_simple_leveled_task(task)?;
         if !new_ssts.is_empty() {
             self.sync_dir()?;
         }
 
         // 换状态：一瞬间。
-        self.apply_compaction_result(&task, new_ssts);
+        self.apply_simple_leveled_result(task, new_ssts);
 
         // 新状态里已经没有这两层的旧文件了，删掉它们的文件名。
         let old_ssts = task.upper_ssts.iter().chain(task.lower_ssts.iter());
-        for sst in old_ssts {
-            std::fs::remove_file(self.path_of_sst(sst.id()))?;
-        }
-        Ok(true)
+        self.remove_sst_files(old_ssts)
     }
 
     /// 把任务里上层与下层的全部记录归并，写成新的 SST，返回它们（按 key 排好、互不重叠）。
@@ -183,7 +235,7 @@ impl LsmStorage {
     /// 整个不写；不是最底层时墓碑照写，更下面的层里可能还有这个 key 的旧值，要靠它盖住。
     ///
     /// 只写新文件：不改变状态，也不删除输入的文件。
-    fn compact_task(&self, task: &SimpleLeveledTask) -> Result<Vec<Arc<SsTable>>> {
+    fn compact_simple_leveled_task(&self, task: &SimpleLeveledTask) -> Result<Vec<Arc<SsTable>>> {
         let target_sst_size = self.options.target_sst_size;
         let drop_tombstones = task.is_lower_level_bottom;
         // 下层总是按 key 排好、互不重叠的一层，串接起来就有序。
@@ -218,7 +270,7 @@ impl LsmStorage {
     /// 必须原样留在 L0：按编号拿掉输入。上层是 Ln 时，它与下层一样只由 compaction 改动，
     /// 而 compaction 同一时刻只有一个，所以两层此时应当还是任务里记下的文件：
     /// 断言之后，上层清空，下层整层换成 `new_ssts`。其他层不动。
-    fn apply_compaction_result(&self, task: &SimpleLeveledTask, new_ssts: Vec<Arc<SsTable>>) {
+    fn apply_simple_leveled_result(&self, task: &SimpleLeveledTask, new_ssts: Vec<Arc<SsTable>>) {
         // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，再换指针。
         let _state_lock = self.state_lock.lock().unwrap();
         let mut guard = self.state.write().unwrap();
@@ -263,6 +315,94 @@ impl LsmStorage {
     }
 }
 
+impl LsmStorage {
+    /// 做一个 tiered 的任务：合并几个 tier、同步目录、换状态、删除旧文件。
+    /// 调用方必须持有 `compaction_lock`，任务是拿到锁之后生成的。
+    fn run_tiered_task(&self, task: &TieredTask) -> Result<()> {
+        // 写新文件：慢，不占 `state_lock`，读、写、冻结、flush 都照常进行。
+        let new_ssts = self.compact_tiered_task(task)?;
+        if !new_ssts.is_empty() {
+            self.sync_dir()?;
+        }
+
+        // 换状态：一瞬间。
+        self.apply_tiered_result(task, new_ssts);
+
+        // 新状态里已经没有这几个 tier 的旧文件了，删掉它们的文件名。
+        let old_ssts = task.tiers.iter().flatten();
+        self.remove_sst_files(old_ssts)
+    }
+
+    /// 把任务里几个 tier 的全部记录归并，写成新的 SST，返回它们（按 key 排好、互不重叠）。
+    ///
+    /// 每个 tier 按 key 排好、互不重叠，串接起来就有序；各个 tier 再归并，列表里新的在前，
+    /// 归并时排在前面的胜出。包含最底的 tier 时，最新版本是墓碑的 key 整个不写；
+    /// 不包含时墓碑照写，更旧的 tier 里可能还有这个 key 的值，要靠它盖住。
+    ///
+    /// 只写新文件：不改变状态，也不删除输入的文件。
+    fn compact_tiered_task(&self, task: &TieredTask) -> Result<Vec<Arc<SsTable>>> {
+        let mut tier_iters = Vec::new();
+        for tier in &task.tiers {
+            tier_iters.push(SstConcatIterator::create_and_seek_to_first(tier.clone())?);
+        }
+        let mut iter = MergeIterator::new(tier_iters);
+
+        let target_sst_size = self.options.target_sst_size;
+        let drop_tombstones = task.bottom_tier_included;
+        let ssts = self.write_ssts(&mut iter, target_sst_size, drop_tombstones)?;
+        for sst in &ssts {
+            self.stats.add_compaction_bytes_written(sst.file_size());
+        }
+        Ok(ssts)
+    }
+
+    /// 把一个 tiered 任务的结果换进状态：参加合并的几个 tier 换成一个新的 tier，
+    /// 放在它们原来的位置。合并结果是空的（全部被删除）时，那几个 tier 直接拿掉。
+    ///
+    /// 合并期间 flush 可能在最前面加了新的 tier，它们比合并结果新，必须原样排在前面：
+    /// 所以先找到任务里第一个 tier 现在在哪，不能假定它还在最前面。tier 只由 compaction
+    /// 拿掉或替换，而 compaction 同一时刻只有一个，所以任务里的 tier 此时应当原样、
+    /// 连续地排在那里，断言检查这一点。
+    fn apply_tiered_result(&self, task: &TieredTask, new_ssts: Vec<Arc<SsTable>>) {
+        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，再换指针。
+        let _state_lock = self.state_lock.lock().unwrap();
+        let mut guard = self.state.write().unwrap();
+        let mut new_state = guard.as_ref().clone();
+        let tiers = &mut new_state.levels;
+
+        // 任务里的 tier 现在从哪里开始：前面是合并期间新 flush 出的 tier。
+        let first_input = &task.tiers[0];
+        let start = tiers
+            .iter()
+            .position(|tier| same_ssts(tier, first_input))
+            .expect("compaction 期间参加合并的 tier 不见了");
+        let end = start + task.tiers.len();
+        assert!(
+            end <= tiers.len()
+                && tiers[start..end]
+                    .iter()
+                    .zip(&task.tiers)
+                    .all(|(current, input)| same_ssts(current, input)),
+            "compaction 期间参加合并的 tier 被别的操作改动了"
+        );
+        assert_eq!(
+            end == tiers.len(),
+            task.bottom_tier_included,
+            "任务记下的是否包含最底与现在的状态不符"
+        );
+
+        // 几个 tier 换成一个；没有输出时只拿掉。
+        let replacement = if new_ssts.is_empty() {
+            Vec::new()
+        } else {
+            vec![new_ssts]
+        };
+        tiers.splice(start..end, replacement);
+
+        *guard = Arc::new(new_state);
+    }
+}
+
 /// 两组 SST 是否正好是同一批对象，顺序也相同。
 fn same_ssts(current: &[Arc<SsTable>], expected: &[Arc<SsTable>]) -> bool {
     current.len() == expected.len()
@@ -280,6 +420,8 @@ mod tests {
         set_level_ssts,
     };
     use super::*;
+    use crate::compaction::simple_leveled::SimpleLeveledOptions;
+    use crate::compaction::tiered::TieredOptions;
     use crate::iterators::StorageIterator;
     use crate::iterators::vec_iterator::{collect_all, expected};
     use crate::test_util::run_with_deadline;
@@ -663,7 +805,7 @@ mod tests {
             block_cache_size: 0,
             target_sst_size: 1024,
             max_levels: 3,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         });
         let keys = numbered_keys(100);
         let pairs: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "value")).collect();
@@ -686,7 +828,7 @@ mod tests {
         assert_eq!(rest[98].0, "key-099");
     }
 
-    // ---------- 按任务合并：compact_task、apply_compaction_result、compact_once ----------
+    // ---------- 简单分层的任务：compact_simple_leveled_task、apply_simple_leveled_result、compact_once ----------
 
     /// 触发值 2、比例 200%。
     fn simple_options() -> SimpleLeveledOptions {
@@ -694,6 +836,19 @@ mod tests {
             level0_file_num_compaction_trigger: 2,
             size_ratio_percent: 200,
         }
+    }
+
+    /// 不自动冻结、按给定的策略合并的引擎，L0 之下 3 层（tiered 不用层数）。
+    /// 这一层没有后台线程，合并由测试调用 `compact_once`。
+    fn open_with_strategy(compaction: CompactionOptions) -> TestStorage {
+        open_with_options(LsmStorageOptions {
+            memtable_size_limit: usize::MAX,
+            block_size: 64,
+            block_cache_size: 1 << 20,
+            target_sst_size: 1024,
+            max_levels: 3,
+            compaction,
+        })
     }
 
     /// 按当前状态手工搭一个任务：把第 `upper_level` 层（0 是 L0）整层并进下一层。
@@ -715,27 +870,27 @@ mod tests {
         }
     }
 
-    /// 在另一个线程里、设了时限地执行 `compact_task`，返回引擎、任务和写出的文件。
+    /// 在另一个线程里、设了时限地执行 `compact_simple_leveled_task`，返回引擎、任务和写出的文件。
     fn run_task(
         storage: TestStorage,
         upper_level: usize,
     ) -> (TestStorage, SimpleLeveledTask, Vec<Arc<SsTable>>) {
-        run_with_deadline("compact_task", move || {
+        run_with_deadline("compact_simple_leveled_task", move || {
             let task = task_for(&storage, upper_level);
-            let output = storage.compact_task(&task).unwrap();
+            let output = storage.compact_simple_leveled_task(&task).unwrap();
             (storage, task, output)
         })
     }
 
-    /// 在另一个线程里、设了时限地执行 `apply_compaction_result`，返回引擎。
+    /// 在另一个线程里、设了时限地执行 `apply_simple_leveled_result`，返回引擎。
     /// 换状态时锁的用法出错（例如拿着写锁再去取快照）会卡住，这里报"卡住"。
     fn apply_with_deadline(
         storage: TestStorage,
         task: SimpleLeveledTask,
         output: Vec<Arc<SsTable>>,
     ) -> TestStorage {
-        run_with_deadline("apply_compaction_result", move || {
-            storage.apply_compaction_result(&task, output);
+        run_with_deadline("apply_simple_leveled_result", move || {
+            storage.apply_simple_leveled_result(&task, output);
             storage
         })
     }
@@ -938,12 +1093,12 @@ mod tests {
     // 没有需要合并的：返回 false，状态与文件都不变。
     #[test]
     fn compact_once_does_nothing_when_no_task_is_needed() {
-        let storage = open_without_auto_freeze();
+        let storage = open_with_strategy(CompactionOptions::SimpleLeveled(simple_options()));
         flush_records(&storage, &[("a", "1")]);
         let names_before = names_of_whole_state(&storage);
 
         let storage = run_with_deadline("compact_once", move || {
-            assert!(!storage.compact_once(&simple_options()).unwrap());
+            assert!(!storage.compact_once().unwrap());
             storage
         });
 
@@ -954,13 +1109,13 @@ mod tests {
     // L0 攒够 2 个文件：做一个任务（L0 并进 L1），旧文件从目录里删掉，数据照常读得到。
     #[test]
     fn compact_once_runs_one_task_and_deletes_its_inputs() {
-        let storage = open_without_auto_freeze();
+        let storage = open_with_strategy(CompactionOptions::SimpleLeveled(simple_options()));
         flush_records(&storage, &[("a", "1"), ("b", "2")]);
         flush_records(&storage, &[("a", "new"), ("c", "3")]);
         let before = scan_all(&storage);
 
         let storage = run_with_deadline("compact_once", move || {
-            assert!(storage.compact_once(&simple_options()).unwrap());
+            assert!(storage.compact_once().unwrap());
             storage
         });
 
@@ -970,70 +1125,343 @@ mod tests {
         assert_eq!(scan_all(&storage), before);
     }
 
-    // 反复写入、flush、合并到停下：每一轮读到的都与一个 BTreeMap 模型相同，目录里的文件
-    // 正好是状态里的文件，形状满足策略（没有任务可做），最底层里没有墓碑。
+    /// 反复写入、flush、合并到停下，共 `rounds` 轮：每轮随机写入 20 条（约四分之一是删除）
+    /// 并 flush 成一个文件，然后反复调用 `compact_once` 直到没有任务。每一轮之后检查读到的
+    /// 与一个 BTreeMap 模型相同、目录里的文件正好是状态里的文件、没有要做的任务，
+    /// 再调用 `check` 做各策略自己的检查（参数是引擎与轮次）。
+    fn random_rounds(storage: &TestStorage, rounds: usize, check: impl Fn(&TestStorage, usize)) {
+        let mut model = std::collections::BTreeMap::new();
+        // 固定种子的伪随机数，每次运行都一样。
+        let mut seed: u64 = 7;
+        let mut next_random = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed >> 33
+        };
+
+        for round in 0..rounds {
+            let mut pairs = Vec::new();
+            for _ in 0..20 {
+                let key = format!("key-{:03}", next_random() % 80);
+                // 大约四分之一是删除。
+                let value = if next_random() % 4 == 0 {
+                    String::new()
+                } else {
+                    format!("value-{round}")
+                };
+                pairs.push((key, value));
+            }
+            let borrowed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            flush_records(storage, &borrowed);
+            for (key, value) in &pairs {
+                if value.is_empty() {
+                    model.remove(key);
+                } else {
+                    model.insert(key.clone(), value.clone());
+                }
+            }
+
+            let mut tasks = 0;
+            while storage.compact_once().unwrap() {
+                tasks += 1;
+                assert!(tasks <= 100, "第 {round} 轮停不下来");
+            }
+
+            let expected_pairs: Vec<(String, String)> = model
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            assert_eq!(scan_all(storage), expected_pairs, "第 {round} 轮");
+            for (key, value) in &model {
+                assert_eq!(get_str(storage, key).as_ref(), Some(value), "第 {round} 轮");
+            }
+            assert_eq!(
+                storage.sst_file_names(),
+                names_of_whole_state(storage),
+                "第 {round} 轮"
+            );
+            assert!(!storage.has_pending_compaction(), "第 {round} 轮");
+            check(storage, round);
+        }
+    }
+
+    // 简单分层：反复写入、flush、合并，每一轮读到的都与模型相同，目录里的文件正好是状态里的，
+    // 形状满足策略；最底层里没有墓碑。
     #[test]
     fn repeated_compact_once_keeps_data_and_settles() {
         run_with_deadline("反复 compact_once", || {
-            let storage = open_without_auto_freeze();
-            let options = simple_options();
-            let mut model = std::collections::BTreeMap::new();
-            // 固定种子的伪随机数，每次运行都一样。
-            let mut seed: u64 = 7;
-            let mut next_random = move || {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                seed >> 33
-            };
-
-            for round in 0..30 {
-                let mut pairs = Vec::new();
-                for _ in 0..20 {
-                    let key = format!("key-{:03}", next_random() % 80);
-                    // 大约四分之一是删除。
-                    let value = if next_random() % 4 == 0 {
-                        String::new()
-                    } else {
-                        format!("value-{round}")
-                    };
-                    pairs.push((key, value));
-                }
-                let borrowed: Vec<(&str, &str)> = pairs
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str()))
-                    .collect();
-                flush_records(&storage, &borrowed);
-                for (key, value) in &pairs {
-                    if value.is_empty() {
-                        model.remove(key);
-                    } else {
-                        model.insert(key.clone(), value.clone());
-                    }
-                }
-
-                let mut tasks = 0;
-                while storage.compact_once(&options).unwrap() {
-                    tasks += 1;
-                    assert!(tasks <= 100, "第 {round} 轮停不下来");
-                }
-
-                let expected_pairs: Vec<(String, String)> = model
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                assert_eq!(scan_all(&storage), expected_pairs, "第 {round} 轮");
-                assert_eq!(
-                    storage.sst_file_names(),
-                    names_of_whole_state(&storage),
-                    "第 {round} 轮"
-                );
-                assert!(simple_leveled::generate_task(&options, &storage.snapshot()).is_none());
-                let bottom = bottom_level(&storage);
+            let storage = open_with_strategy(CompactionOptions::SimpleLeveled(simple_options()));
+            random_rounds(&storage, 30, |storage, round| {
+                let bottom = bottom_level(storage);
                 let tombstones = records_of(&bottom)
                     .iter()
                     .filter(|(_key, value)| value.is_empty())
                     .count();
                 assert_eq!(tombstones, 0, "第 {round} 轮，最底层里有墓碑");
-            }
+            });
         });
+    }
+
+    // 选项是 NoCompaction：compact_once 什么也不做，也不算有待做的合并。
+    #[test]
+    fn compact_once_without_a_strategy_does_nothing() {
+        let storage = open_without_auto_freeze();
+        flush_records(&storage, &[("a", "1")]);
+        flush_records(&storage, &[("b", "2")]);
+
+        let storage = run_with_deadline("compact_once", move || {
+            assert!(!storage.compact_once().unwrap());
+            storage
+        });
+
+        assert_eq!(storage.l0_sstable_count(), 2);
+        assert!(!storage.has_pending_compaction());
+    }
+
+    // ---------- tiered：flush 成为新的 tier、compact_tiered_task、apply_tiered_result ----------
+
+    /// tiered 的参数：`num_tiers` 个 tier 开始检查，其余是 RocksDB 的默认值。
+    fn tiered_options(num_tiers: usize) -> TieredOptions {
+        TieredOptions {
+            num_tiers,
+            max_size_amplification_percent: 200,
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: None,
+        }
+    }
+
+    /// 选用 tiered 策略的引擎，`num_tiers` 给得很大时测试里不会自动生成任务。
+    fn open_tiered(num_tiers: usize) -> TestStorage {
+        open_with_strategy(CompactionOptions::Tiered(tiered_options(num_tiers)))
+    }
+
+    /// 各个 tier 里文件的编号，新的 tier 在前。
+    fn tier_ids(storage: &LsmStorage) -> Vec<Vec<usize>> {
+        storage
+            .snapshot()
+            .levels
+            .iter()
+            .map(|tier| tier.iter().map(|sst| sst.id()).collect())
+            .collect()
+    }
+
+    /// 按当前状态手工搭一个任务：合并最新的 `count` 个 tier。不经过策略。
+    fn tiered_task_for(storage: &LsmStorage, count: usize) -> TieredTask {
+        let snapshot = storage.snapshot();
+        TieredTask {
+            tiers: snapshot.levels[..count].to_vec(),
+            bottom_tier_included: count == snapshot.levels.len(),
+        }
+    }
+
+    /// 在另一个线程里、设了时限地执行 `compact_tiered_task`，返回引擎、任务和写出的文件。
+    fn run_tiered_task_for(
+        storage: TestStorage,
+        count: usize,
+    ) -> (TestStorage, TieredTask, Vec<Arc<SsTable>>) {
+        run_with_deadline("compact_tiered_task", move || {
+            let task = tiered_task_for(&storage, count);
+            let output = storage.compact_tiered_task(&task).unwrap();
+            (storage, task, output)
+        })
+    }
+
+    /// 在另一个线程里、设了时限地执行 `apply_tiered_result`，返回引擎。
+    fn apply_tiered_with_deadline(
+        storage: TestStorage,
+        task: TieredTask,
+        output: Vec<Arc<SsTable>>,
+    ) -> TestStorage {
+        run_with_deadline("apply_tiered_result", move || {
+            storage.apply_tiered_result(&task, output);
+            storage
+        })
+    }
+
+    /// 三个 tier，从旧到新依次 flush：`[a=1, b=1, c=1]`、`[b=2]`、`[a=3, c=删除]`。
+    fn three_tiers() -> TestStorage {
+        let storage = open_tiered(100);
+        flush_records(&storage, &[("a", "1"), ("b", "1"), ("c", "1")]);
+        flush_records(&storage, &[("b", "2")]);
+        flush_records(&storage, &[("a", "3"), ("c", "")]);
+        storage
+    }
+
+    // tiered 不用 L0：每次 flush 出的文件自己成为一个 tier，放在最前面；读到的是最新的版本。
+    #[test]
+    fn tiered_flush_adds_a_new_tier_in_front() {
+        let storage = three_tiers();
+
+        assert_eq!(storage.l0_sstable_count(), 0);
+        assert_eq!(tier_ids(&storage), vec![vec![3], vec![2], vec![1]]);
+        assert_eq!(get_str(&storage, "a"), Some("3".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+        assert_eq!(get_str(&storage, "c"), None);
+        assert_eq!(scan_all(&storage), expected(&[("a", "3"), ("b", "2")]));
+    }
+
+    // 刚打开时一个 tier 都没有，不像分层那样先有几个空层。
+    #[test]
+    fn tiered_starts_without_any_tier() {
+        let storage = open_tiered(100);
+
+        assert!(storage.snapshot().levels.is_empty());
+        assert_eq!(scan_all(&storage), expected(&[]));
+    }
+
+    // 合并最新的 2 个 tier：新的版本胜出；没有包含最底，墓碑照写。
+    #[test]
+    fn tiered_task_without_the_bottom_keeps_tombstones() {
+        let (_storage, task, output) = run_tiered_task_for(three_tiers(), 2);
+
+        assert!(!task.bottom_tier_included);
+        assert_eq!(
+            records_of(&output),
+            expected(&[("a", "3"), ("b", "2"), ("c", "")])
+        );
+    }
+
+    // 合并全部 tier：包含最底，墓碑与被它盖住的值都不写。
+    #[test]
+    fn tiered_task_with_the_bottom_drops_tombstones() {
+        let (_storage, task, output) = run_tiered_task_for(three_tiers(), 3);
+
+        assert!(task.bottom_tier_included);
+        assert_eq!(records_of(&output), expected(&[("a", "3"), ("b", "2")]));
+    }
+
+    // 换状态：合并期间新 flush 出的 tier 留在最前面，合并结果放在输入原来的位置，
+    // 更旧的 tier 不动；读到的仍是最新的版本。
+    #[test]
+    fn apply_tiered_keeps_tiers_flushed_during_compaction_in_front() {
+        let (storage, task, output) = run_tiered_task_for(three_tiers(), 2);
+        // 合并的期间，又 flush 出一个 tier，放在最前面。
+        flush_records(&storage, &[("b", "newer")]);
+
+        let storage = apply_tiered_with_deadline(storage, task, output.clone());
+
+        let output_ids: Vec<usize> = output.iter().map(|sst| sst.id()).collect();
+        assert_eq!(tier_ids(&storage), vec![vec![5], output_ids, vec![1]]);
+        assert_eq!(get_str(&storage, "a"), Some("3".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("newer".to_string()));
+        assert_eq!(get_str(&storage, "c"), None);
+    }
+
+    // 合并结果是空的（全部被删除）：那几个 tier 直接拿掉，不留下空的 tier。
+    #[test]
+    fn apply_tiered_with_empty_output_removes_the_tiers() {
+        let storage = open_tiered(100);
+        flush_records(&storage, &[("a", "1")]);
+        flush_records(&storage, &[("a", "")]);
+        let (storage, task, output) = run_tiered_task_for(storage, 2);
+        assert!(output.is_empty());
+
+        let storage = apply_tiered_with_deadline(storage, task, output);
+
+        assert!(storage.snapshot().levels.is_empty());
+        assert_eq!(get_str(&storage, "a"), None);
+    }
+
+    // 合并期间参加合并的 tier 被换掉了：换状态时断言失败，而不是把别人的改动覆盖掉。
+    #[test]
+    #[should_panic(expected = "参加合并的 tier 被别的操作改动了")]
+    fn apply_tiered_panics_if_an_input_tier_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, task, output) = run_tiered_task_for(three_tiers(), 2);
+        let replacement = {
+            let other = open_without_auto_freeze();
+            set_level_ssts(&other, &dir, 1, &[(101, &[("x", "1")])]);
+            other.snapshot().levels[0].clone()
+        };
+        {
+            let _state_lock = storage.state_lock.lock().unwrap();
+            let mut guard = storage.state.write().unwrap();
+            let mut new_state = guard.as_ref().clone();
+            new_state.levels[1] = replacement;
+            *guard = Arc::new(new_state);
+        }
+
+        apply_tiered_with_deadline(storage, task, output);
+    }
+
+    // 合并期间第一个参加合并的 tier 不见了：断言失败。
+    #[test]
+    #[should_panic(expected = "参加合并的 tier 不见了")]
+    fn apply_tiered_panics_if_the_first_input_tier_is_gone() {
+        let (storage, task, output) = run_tiered_task_for(three_tiers(), 2);
+        {
+            let _state_lock = storage.state_lock.lock().unwrap();
+            let mut guard = storage.state.write().unwrap();
+            let mut new_state = guard.as_ref().clone();
+            new_state.levels.remove(0);
+            *guard = Arc::new(new_state);
+        }
+
+        apply_tiered_with_deadline(storage, task, output);
+    }
+
+    // compact_once 按 tiered 策略做一个任务：3 个 tier、num_tiers 为 3，空间放大成立，
+    // 全部合并成一个 tier；旧文件从目录里删掉。
+    #[test]
+    fn tiered_compact_once_runs_one_task() {
+        let storage = open_tiered(3);
+        flush_records(&storage, &[("a", "1"), ("b", "1"), ("c", "1")]);
+        flush_records(&storage, &[("b", "2")]);
+        flush_records(&storage, &[("a", "3"), ("c", "")]);
+        assert!(storage.has_pending_compaction());
+
+        let storage = run_with_deadline("compact_once", move || {
+            assert!(storage.compact_once().unwrap());
+            storage
+        });
+
+        assert_eq!(storage.level_sstable_counts().len(), 1);
+        assert_eq!(storage.sst_file_names(), names_of_whole_state(&storage));
+        assert_eq!(scan_all(&storage), expected(&[("a", "3"), ("b", "2")]));
+        assert!(!storage.compact_once().unwrap());
+    }
+
+    // tiered：反复写入、flush、合并，每一轮读到的都与模型相同，目录里的文件正好是状态里的；
+    // L0 一直是空的，停下时 tier 数不到 num_tiers，没有空的 tier。
+    #[test]
+    fn repeated_tiered_compact_once_keeps_data_and_settles() {
+        run_with_deadline("反复 tiered compact_once", || {
+            let num_tiers = 4;
+            let storage = open_tiered(num_tiers);
+            random_rounds(&storage, 60, |storage, round| {
+                let snapshot = storage.snapshot();
+                assert!(snapshot.l0_sstables.is_empty(), "第 {round} 轮");
+                assert!(snapshot.levels.len() < num_tiers, "第 {round} 轮");
+                assert!(
+                    snapshot.levels.iter().all(|tier| !tier.is_empty()),
+                    "第 {round} 轮出现了空的 tier"
+                );
+            });
+        });
+    }
+
+    // tiered 的全量合并：全部 tier 合成一个，没有墓碑与旧版本，旧文件删掉。
+    #[test]
+    fn tiered_full_compaction_merges_every_tier_into_one() {
+        let storage = full_compaction(three_tiers());
+
+        assert_eq!(storage.level_sstable_counts().len(), 1);
+        let only_tier = storage.snapshot().levels[0].clone();
+        assert_eq!(records_of(&only_tier), expected(&[("a", "3"), ("b", "2")]));
+        assert_eq!(storage.sst_file_names(), names_of_whole_state(&storage));
+    }
+
+    // tiered 只有一个 tier 时，全量合并什么也不做。
+    #[test]
+    fn tiered_full_compaction_with_one_tier_does_nothing() {
+        let storage = open_tiered(100);
+        flush_records(&storage, &[("a", "1"), ("b", "")]);
+
+        let storage = full_compaction(storage);
+
+        assert_eq!(tier_ids(&storage), vec![vec![1]]);
     }
 }

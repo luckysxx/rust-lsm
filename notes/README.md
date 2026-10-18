@@ -121,7 +121,7 @@ db/
 | --- | --- | --- | --- | --- |
 | L09 | [compaction 的执行](09-compaction-execution.md) | 已有正文 | 只增不减的代价、层（L0、sorted run、为什么要 L0）、墓碑何时可以丢、读 L1 与串接游标、扫描为什么要归并、执行步骤与丢失更新、删除旧文件与 Unix 语义、输出切分、tiered 与 leveled；mito2 换状态与删文件的导读；基准 | 第二周第 1 章 |
 | L10 | [简单分层 compaction](10-simple-leveled-compaction.md) | 已有正文 | 为什么要自动、分层与三种放大、简单分层的规则与优先级、策略与执行分开（任务、只给一个任务）、多层状态的表示、执行与换状态、并行合并的约束、后台线程（两种等待、关闭顺序）、穿过空层的复制；mito2 的 picker 与调度器导读；基准 | 第二周第 2 章 |
-| L11 | [tiered compaction](11-tiered-compaction.md) | 未教学 | 有序段、三种触发条件、放大的取舍 | 第二周第 3 章 |
+| L11 | [tiered compaction](11-tiered-compaction.md) | 已有正文 | leveled 为什么写得多、只合并大小相近的 run、三种触发与参数、一定会停下、正确性（相邻、前缀、墓碑、合并期间的 flush）、按文件数模拟与真实引擎的差距、不用 L0 的理由、tier 与 SST、两种策略的分支放在哪里；mito2 TWCS 找 sorted run 的导读；基准 | 第二周第 3 章 |
 | L12 | [leveled compaction](12-leveled-compaction.md) | 未教学 | 目标大小、基准层、优先级、选文件 | 第二周第 4 章 |
 | L13 | [manifest](13-manifest.md) | 未教学 | 记录内容与编码、写入时机、恢复 SST 集合 | 第二周第 5 章 |
 | L14 | [WAL](14-wal.md) | 未教学 | 记录编码、与 memtable 的对应、重放、同步策略 | 第二周第 6 章 |

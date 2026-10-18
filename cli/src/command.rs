@@ -24,9 +24,10 @@ pub enum Command {
     /// `fill COUNT`：写入 `COUNT` 条 `key-000000 = value-000000` 这样的记录，
     /// 用来很快写满 memtable、看到 SST 文件出现。
     Fill { count: u64 },
-    /// `compact`：把 L0 与 L1 的全部 SST 合并成新的 L1。
+    /// `compact`：把全部 SST 合并成一个 sorted run：分层时放进最底层，tiered 时成为唯一的 tier。
     Compact,
-    /// `status`：冻结的 memtable 个数、L0 与 L1 的 SST 个数、块缓存的用量，以及目录里的 SST 文件。
+    /// `status`：冻结的 memtable 个数、L0 与各层（tiered 时是各 tier）的 SST 个数、块缓存的用量，
+    /// 以及目录里的 SST 文件。
     Status,
     /// `help`：列出所有命令。
     Help,
@@ -46,8 +47,8 @@ get KEY              查找一个 key
 delete KEY           删除一个 key
 scan [LOWER [UPPER]] 按 key 从小到大列出记录，包含 LOWER、不包含 UPPER
 fill COUNT           写入 COUNT 条 key-000000 = value-000000 这样的记录
-compact              把 L0 与 L1 的全部 SST 合并成新的 L1
-status               冻结的 memtable 个数、L0 与 L1 的 SST 个数、块缓存的用量、目录里的 SST 文件
+compact              把全部 SST 合并成一个 sorted run（分层时在最底层，tiered 时是唯一的 tier）
+status               冻结的 memtable 个数、各层或各 tier 的 SST 个数、块缓存的用量、目录里的 SST 文件
 help                 显示本说明
 quit                 关闭数据库并退出（Ctrl-D 也一样）";
 

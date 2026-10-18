@@ -19,7 +19,7 @@ cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md
 
 ## 比较两次结果的条件
 
-- 同一台机器、同样的电源状态，参数行（`--target`、`--threads`、`--num`、`--value-size`、`--seed`、`--scan-length`、`--memtable-mb`、`--block-cache-mb`、`--max-levels`、`--compaction`、`--l0-trigger`、`--size-ratio`、`--workloads`）除了要比较的那一项之外完全相同。
+- 同一台机器、同样的电源状态，参数行（`--target`、`--threads`、`--num`、`--value-size`、`--seed`、`--scan-length`、`--memtable-mb`、`--block-cache-mb`、`--max-levels`、`--compaction` 与所选策略的参数、`--workloads`）除了要比较的那一项之外完全相同。
 - 都是 release 编译，工具链相同。
 - 差距小于同一版本重复运行的浮动（目前约一成）时，不能当作结论。
 
@@ -35,3 +35,4 @@ cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md
 | [2026-10-15-prefix-compression.md](2026-10-15-prefix-compression.md) | 块内 key 前缀压缩的前后对比：SST 小了 8%，与估算一致；吞吐的变化在浮动之内 |
 | [2026-10-15-full-compaction.md](2026-10-15-full-compaction.md) | 全量 compaction 的前后对比：扫描快 7～19 倍、查不存在的 key 快 4～9 倍；整次运行的写放大 1.46～1.95；覆盖写之后的空间放大从 1.95 降到 0.98 |
 | [2026-10-17-simple-leveled-compaction.md](2026-10-17-simple-leveled-compaction.md) | 简单分层的自动合并：读回到全量合并一次的水平，写放大 4～6，其中约 2 是穿过空层的复制；合并跟不上写入；扫描因多一层归并慢约三成，归并游标改成当前来源放在堆外之后恢复 |
+| [2026-10-18-tiered-compaction.md](2026-10-18-tiered-compaction.md) | tiered 与简单分层的对比：整次运行的写放大从 5.4 降到 2～2.6，合并跟得上写入；读与空间取决于停下时剩几个 tier，7 个 tier 时查不存在的 key 慢一半、扫描慢到三分之一 |

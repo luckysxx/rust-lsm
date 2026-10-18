@@ -64,20 +64,36 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
         }
         Command::Compact => {
             db.force_full_compaction()?;
-            writeln!(
-                out,
-                "合并完成：L0 有 {} 个 SST，L1 往下各层依次有 {} 个",
-                db.l0_sstable_count(),
-                join_counts(&db.level_sstable_counts())
-            )?;
+            if db.uses_tiers() {
+                writeln!(
+                    out,
+                    "合并完成：各 tier（新的在前）依次有 {} 个 SST",
+                    join_counts(&db.level_sstable_counts())
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "合并完成：L0 有 {} 个 SST，L1 往下各层依次有 {} 个",
+                    db.l0_sstable_count(),
+                    join_counts(&db.level_sstable_counts())
+                )?;
+            }
         }
         Command::Status => {
             writeln!(out, "冻结的 memtable：{}", db.imm_memtable_count())?;
-            writeln!(out, "L0 的 SST：{}", db.l0_sstable_count())?;
-            for (index, count) in db.level_sstable_counts().iter().enumerate() {
-                // 第 0 项是 L1。
-                let level = index + 1;
-                writeln!(out, "L{level} 的 SST：{count}")?;
+            if db.uses_tiers() {
+                // tiered 不用 L0；第 0 项是最新的 tier。
+                for (index, count) in db.level_sstable_counts().iter().enumerate() {
+                    let tier = index + 1;
+                    writeln!(out, "tier {tier} 的 SST：{count}")?;
+                }
+            } else {
+                writeln!(out, "L0 的 SST：{}", db.l0_sstable_count())?;
+                for (index, count) in db.level_sstable_counts().iter().enumerate() {
+                    // 第 0 项是 L1。
+                    let level = index + 1;
+                    writeln!(out, "L{level} 的 SST：{count}")?;
+                }
             }
             let (cached_blocks, cached_bytes) = db.block_cache_usage();
             writeln!(out, "块缓存：{cached_blocks} 个块，{cached_bytes} 字节")?;
@@ -119,6 +135,8 @@ pub fn sst_files(dir: &Path) -> std::io::Result<Vec<(String, u64)>> {
 mod tests {
     use super::*;
     use crate::command::parse;
+    use lsm::compaction::CompactionOptions;
+    use lsm::compaction::tiered::TieredOptions;
     use lsm::lsm_storage::LsmStorageOptions;
 
     /// 收集输出的缓冲区，最多收下 `limit` 字节，再写就返回错误。
@@ -152,8 +170,13 @@ mod tests {
     }
 
     impl TestDb {
-        /// memtable 写满 `memtable_size_limit` 字节就冻结。
+        /// memtable 写满 `memtable_size_limit` 字节就冻结；不自动合并。
         fn open(memtable_size_limit: usize) -> Self {
+            Self::open_with_strategy(memtable_size_limit, CompactionOptions::NoCompaction)
+        }
+
+        /// 与 `open` 相同，只是合并策略由调用方给出。
+        fn open_with_strategy(memtable_size_limit: usize, compaction: CompactionOptions) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let options = LsmStorageOptions {
                 memtable_size_limit,
@@ -161,7 +184,7 @@ mod tests {
                 block_cache_size: 1 << 20,
                 target_sst_size: 4096,
                 max_levels: 3,
-                compaction: None,
+                compaction,
             };
             let db = Db::open(dir.path(), options).unwrap();
             Self { db, dir }
@@ -269,6 +292,40 @@ mod tests {
         );
         assert!(bottom_count > 0);
         assert_eq!(sst_files(db.dir.path()).unwrap().len(), bottom_count);
+        assert_eq!(db.run("get key-000123"), "value-000123\n");
+    }
+
+    // tiered：status 列出各个 tier 而不是 L0 与各层；compact 把全部 tier 合成一个。
+    // num_tiers 给得很大，后台不会自己合并，fill 出的每个文件都是一个 tier。
+    #[test]
+    fn status_and_compact_with_tiered() {
+        let tiered = CompactionOptions::Tiered(TieredOptions {
+            num_tiers: 1000,
+            max_size_amplification_percent: 200,
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: None,
+        });
+        let db = TestDb::open_with_strategy(4096, tiered);
+        db.run("fill 500");
+        db.db.close().unwrap();
+        let tier_count = db.db.level_sstable_counts().len();
+        assert!(tier_count > 1);
+
+        let status = db.run("status");
+        assert!(!status.contains("L0"), "{status}");
+        assert!(status.contains("tier 1 的 SST：1\n"), "{status}");
+        assert!(
+            status.contains(&format!("tier {tier_count} 的 SST：1\n")),
+            "{status}"
+        );
+
+        let output = db.run("compact");
+        let only_tier_count = db.db.level_sstable_counts()[0];
+        assert_eq!(
+            output,
+            format!("合并完成：各 tier（新的在前）依次有 {only_tier_count} 个 SST\n")
+        );
         assert_eq!(db.run("get key-000123"), "value-000123\n");
     }
 

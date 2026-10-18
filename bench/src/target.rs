@@ -5,7 +5,7 @@ use std::hint::black_box;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
-use lsm::compaction::simple_leveled::SimpleLeveledOptions;
+use lsm::compaction::CompactionOptions;
 use lsm::db::Db;
 use lsm::iterators::StorageIterator;
 use lsm::lsm_storage::LsmStorageOptions;
@@ -159,10 +159,10 @@ pub struct EngineConfig {
     pub memtable_size_limit: usize,
     /// 块缓存的容量，字节；0 表示不用块缓存。
     pub block_cache_size: usize,
-    /// L0 之下有几层。
+    /// L0 之下有几层。tiered 不用它。
     pub max_levels: usize,
-    /// 后台自动合并的参数；`None` 表示不自动合并。
-    pub compaction: Option<SimpleLeveledOptions>,
+    /// 后台自动合并的策略与参数。
+    pub compaction: CompactionOptions,
 }
 
 #[cfg(test)]
@@ -173,7 +173,7 @@ impl EngineConfig {
             memtable_size_limit,
             block_cache_size,
             max_levels: 4,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         }
     }
 }
@@ -236,23 +236,47 @@ impl KvTarget for EngineTarget {
         let memtable_megabytes = self.config.memtable_size_limit / (1024 * 1024);
         let cache_megabytes = self.config.block_cache_size / (1024 * 1024);
         let max_levels = self.config.max_levels;
-        let compaction = match &self.config.compaction {
-            Some(options) => format!(
-                "后台按简单分层合并（L0 触发值 {}，层间比例 {}%）",
-                options.level0_file_num_compaction_trigger, options.size_ratio_percent
+        // 策略与形状：tiered 没有 L0、tier 的个数是变的，分开描述。
+        let (strategy, shape) = match &self.config.compaction {
+            CompactionOptions::NoCompaction => (
+                format!("L0 之下 {max_levels} 层，不自动合并"),
+                format!("L0 有 {} 个 SST", self.db.l0_sstable_count()),
             ),
-            None => "不自动合并".to_string(),
+            CompactionOptions::SimpleLeveled(options) => (
+                format!(
+                    "L0 之下 {max_levels} 层，后台按简单分层合并（L0 触发值 {}，层间比例 {}%）",
+                    options.level0_file_num_compaction_trigger, options.size_ratio_percent
+                ),
+                format!("L0 有 {} 个 SST", self.db.l0_sstable_count()),
+            ),
+            CompactionOptions::Tiered(options) => (
+                format!(
+                    "后台按 tiered 合并（num_tiers {}，空间放大 {}%，比例 {}%，最少合并 {} 个，最多 {}）",
+                    options.num_tiers,
+                    options.max_size_amplification_percent,
+                    options.size_ratio,
+                    options.min_merge_width,
+                    match options.max_merge_width {
+                        Some(width) => format!("{width} 个"),
+                        None => "不限".to_string(),
+                    }
+                ),
+                "不用 L0".to_string(),
+            ),
+        };
+        let level_files = join_counts(&self.db.level_sstable_counts());
+        let levels_name = if self.config.compaction.flush_to_l0() {
+            "L1 往下各层"
+        } else {
+            "各 tier（新的在前）"
         };
         let frozen = self.db.imm_memtable_count();
-        let l0_files = self.db.l0_sstable_count();
-        let level_files = join_counts(&self.db.level_sstable_counts());
         let (cached_blocks, cached_bytes) = self.db.block_cache_usage();
         let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
         Some(format!(
-            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，\
-             L0 之下 {max_levels} 层，{compaction}；\
-             结束时有 {frozen} 张冻结的 memtable 等待落盘，L0 有 {l0_files} 个 SST，\
-             L1 往下各层依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
+            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，{strategy}；\
+             结束时有 {frozen} 张冻结的 memtable 等待落盘，{shape}，\
+             {levels_name}依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
         ))
     }
 
@@ -333,6 +357,8 @@ pub fn create_target(name: &str, engine_config: &EngineConfig) -> Option<Box<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsm::compaction::simple_leveled::SimpleLeveledOptions;
+    use lsm::compaction::tiered::TieredOptions;
 
     // 内存基线读到的是最后一次写入的值；它没有引擎计数器。
     #[test]
@@ -432,7 +458,7 @@ mod tests {
             memtable_size_limit: 256,
             block_cache_size: 0,
             max_levels: 3,
-            compaction: Some(SimpleLeveledOptions {
+            compaction: CompactionOptions::SimpleLeveled(SimpleLeveledOptions {
                 level0_file_num_compaction_trigger: 2,
                 size_ratio_percent: 200,
             }),
@@ -449,5 +475,36 @@ mod tests {
         assert!(target.db.level_sstable_counts().iter().sum::<usize>() > 0);
         assert!(target.stats().unwrap().compaction_bytes_written > 0);
         assert!(target.details().unwrap().contains("简单分层"));
+    }
+
+    // tiered：等后台工作做完之后同样没有待做的合并；L0 一直是空的，报告里写的是 tier。
+    #[test]
+    fn engine_target_waits_for_background_tiered_compaction() {
+        let config = EngineConfig {
+            memtable_size_limit: 256,
+            block_cache_size: 0,
+            max_levels: 3,
+            compaction: CompactionOptions::Tiered(TieredOptions {
+                num_tiers: 4,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+        };
+        let target = EngineTarget::new(config);
+        for i in 0..200 {
+            target.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        target.wait_for_background();
+
+        assert_eq!(target.db.imm_memtable_count(), 0);
+        assert!(!target.db.has_pending_compaction());
+        assert_eq!(target.db.l0_sstable_count(), 0);
+        assert!(target.db.level_sstable_counts().len() < 4);
+        assert!(target.stats().unwrap().compaction_bytes_written > 0);
+        let details = target.details().unwrap();
+        assert!(details.contains("tiered") && details.contains("各 tier"));
     }
 }

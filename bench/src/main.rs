@@ -8,7 +8,9 @@ mod workload;
 
 use std::process::ExitCode;
 
+use lsm::compaction::CompactionOptions;
 use lsm::compaction::simple_leveled::SimpleLeveledOptions;
+use lsm::compaction::tiered::TieredOptions;
 use runner::{Config, WorkloadResult, run_workload};
 use target::{EngineConfig, KvTarget, TARGET_NAMES, create_target, join_counts};
 use workload::{KEY_SIZE, MAX_KEYS, Workload};
@@ -25,11 +27,16 @@ const USAGE: &str = "\
   --scan-length N    范围扫描每次读的记录数（默认 100）
   --memtable-mb N    被测对象为 engine 时，memtable 的上限，单位 MB（默认 64）
   --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
-  --max-levels N     被测对象为 engine 时，L0 之下有几层（默认 4）
-  --compaction NAME  被测对象为 engine 时，后台自动合并的策略：none（不自动合并）或
-                     simple（简单分层）（默认 none）
+  --max-levels N     被测对象为 engine 时，L0 之下有几层（默认 4；tiered 不用）
+  --compaction NAME  被测对象为 engine 时，后台自动合并的策略：none（不自动合并）、
+                     simple（简单分层）或 tiered（默认 none）
   --l0-trigger N     simple 策略下，L0 攒到几个文件就并进 L1（默认 2）
   --size-ratio N     simple 策略下，下层的文件数至少是上层的百分之几（默认 200）
+  --num-tiers N      tiered 策略下，tier 数到几个才开始检查（默认 8）
+  --max-size-amp N   tiered 策略下，空间放大的阈值，百分数（默认 200）
+  --tier-size-ratio N  tiered 策略下，下一个 tier 比前面之和大出百分之几才算大得多（默认 1）
+  --min-merge-width N  tiered 策略下，按大小比例至少合并几个 tier（默认 2）
+  --max-merge-width N  tiered 策略下，减少段数时最多合并几个 tier；0 表示不限（默认 0）
   --help             显示本说明
 
 负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）、
@@ -46,22 +53,57 @@ struct Args {
     memtable_megabytes: usize,
     block_cache_megabytes: usize,
     max_levels: usize,
-    /// `none` 或 `simple`。
+    /// `none`、`simple` 或 `tiered`。
     compaction: String,
     l0_trigger: usize,
     size_ratio_percent: usize,
+    num_tiers: usize,
+    max_size_amplification_percent: usize,
+    tier_size_ratio: usize,
+    min_merge_width: usize,
+    /// 0 表示不限。
+    max_merge_width: usize,
 }
 
 impl Args {
+    /// 复现这次运行的合并参数：只列出所选策略用到的选项。
+    fn compaction_flags(&self) -> String {
+        match self.compaction.as_str() {
+            "simple" => format!(
+                "--compaction simple --l0-trigger {} --size-ratio {}",
+                self.l0_trigger, self.size_ratio_percent
+            ),
+            "tiered" => format!(
+                "--compaction tiered --num-tiers {} --max-size-amp {} --tier-size-ratio {} --min-merge-width {} --max-merge-width {}",
+                self.num_tiers,
+                self.max_size_amplification_percent,
+                self.tier_size_ratio,
+                self.min_merge_width,
+                self.max_merge_width
+            ),
+            _ => "--compaction none".to_string(),
+        }
+    }
+
     /// 被测对象为 engine 时用的配置。
     fn engine_config(&self) -> EngineConfig {
-        let compaction = if self.compaction == "simple" {
-            Some(SimpleLeveledOptions {
+        let compaction = match self.compaction.as_str() {
+            "simple" => CompactionOptions::SimpleLeveled(SimpleLeveledOptions {
                 level0_file_num_compaction_trigger: self.l0_trigger,
                 size_ratio_percent: self.size_ratio_percent,
-            })
-        } else {
-            None
+            }),
+            "tiered" => CompactionOptions::Tiered(TieredOptions {
+                num_tiers: self.num_tiers,
+                max_size_amplification_percent: self.max_size_amplification_percent,
+                size_ratio: self.tier_size_ratio,
+                min_merge_width: self.min_merge_width,
+                max_merge_width: if self.max_merge_width == 0 {
+                    None
+                } else {
+                    Some(self.max_merge_width)
+                },
+            }),
+            _ => CompactionOptions::NoCompaction,
         };
         EngineConfig {
             memtable_size_limit: self.memtable_megabytes * 1024 * 1024,
@@ -88,6 +130,11 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     let mut compaction = "none".to_string();
     let mut l0_trigger = 2;
     let mut size_ratio_percent = 200;
+    let mut num_tiers = 8;
+    let mut max_size_amplification_percent = 200;
+    let mut tier_size_ratio = 1;
+    let mut min_merge_width = 2;
+    let mut max_merge_width = 0;
 
     let mut index = 0;
     while index < raw.len() {
@@ -113,6 +160,13 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--compaction" => compaction = value.clone(),
             "--l0-trigger" => l0_trigger = parse_number(flag, value)? as usize,
             "--size-ratio" => size_ratio_percent = parse_number(flag, value)? as usize,
+            "--num-tiers" => num_tiers = parse_number(flag, value)? as usize,
+            "--max-size-amp" => {
+                max_size_amplification_percent = parse_number(flag, value)? as usize
+            }
+            "--tier-size-ratio" => tier_size_ratio = parse_number(flag, value)? as usize,
+            "--min-merge-width" => min_merge_width = parse_number(flag, value)? as usize,
+            "--max-merge-width" => max_merge_width = parse_number(flag, value)? as usize,
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -139,11 +193,20 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     if max_levels == 0 {
         return Err("--max-levels 必须至少为 1".to_string());
     }
-    if compaction != "none" && compaction != "simple" {
+    if !["none", "simple", "tiered"].contains(&compaction.as_str()) {
         return Err(format!("不认识的合并策略：{compaction}"));
     }
     if l0_trigger == 0 {
         return Err("--l0-trigger 必须至少为 1".to_string());
+    }
+    if num_tiers < 2 {
+        return Err("--num-tiers 必须至少为 2".to_string());
+    }
+    if min_merge_width < 2 {
+        return Err("--min-merge-width 必须至少为 2".to_string());
+    }
+    if max_merge_width == 1 {
+        return Err("--max-merge-width 必须是 0（不限）或至少为 2".to_string());
     }
     Ok(Some(Args {
         config,
@@ -155,6 +218,11 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         compaction,
         l0_trigger,
         size_ratio_percent,
+        num_tiers,
+        max_size_amplification_percent,
+        tier_size_ratio,
+        min_merge_width,
+        max_merge_width,
     }))
 }
 
@@ -221,7 +289,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("- 被测对象说明：{details}");
     }
     println!(
-        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} --compaction {} --l0-trigger {} --size-ratio {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} {} --workloads {}`",
         args.target,
         config.threads,
         config.num,
@@ -231,9 +299,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         args.memtable_megabytes,
         args.block_cache_megabytes,
         args.max_levels,
-        args.compaction,
-        args.l0_trigger,
-        args.size_ratio_percent,
+        args.compaction_flags(),
         workload_names.join(",")
     );
     println!(
@@ -372,7 +438,10 @@ mod tests {
         assert_eq!(args.block_cache_megabytes, 64);
         assert_eq!(args.max_levels, 4);
         assert_eq!(args.compaction, "none");
-        assert!(args.engine_config().compaction.is_none());
+        assert!(matches!(
+            args.engine_config().compaction,
+            CompactionOptions::NoCompaction
+        ));
         assert_eq!(args.target, "btreemap");
         assert_eq!(args.workloads, Workload::DEFAULT.to_vec());
     }
@@ -418,7 +487,9 @@ mod tests {
         assert_eq!(args.memtable_megabytes, 8);
         assert_eq!(args.block_cache_megabytes, 0);
         assert_eq!(args.max_levels, 3);
-        let compaction = args.engine_config().compaction.unwrap();
+        let CompactionOptions::SimpleLeveled(compaction) = args.engine_config().compaction else {
+            panic!("应当是简单分层");
+        };
         assert_eq!(compaction.level0_file_num_compaction_trigger, 4);
         assert_eq!(compaction.size_ratio_percent, 400);
         assert_eq!(args.target, "memtable");
@@ -443,8 +514,55 @@ mod tests {
         assert!(parse_args(&strings(&["--scan-length", "0"])).is_err());
         assert!(parse_args(&strings(&["--memtable-mb", "0"])).is_err());
         assert!(parse_args(&strings(&["--max-levels", "0"])).is_err());
-        assert!(parse_args(&strings(&["--compaction", "tiered"])).is_err());
+        assert!(parse_args(&strings(&["--compaction", "leveled"])).is_err());
+        assert!(parse_args(&strings(&["--num-tiers", "1"])).is_err());
+        assert!(parse_args(&strings(&["--min-merge-width", "1"])).is_err());
+        assert!(parse_args(&strings(&["--max-merge-width", "1"])).is_err());
         assert!(parse_args(&strings(&["--l0-trigger", "0"])).is_err());
+    }
+
+    // tiered 的选项：默认值是 RocksDB 的，num_tiers 默认 8；max-merge-width 为 0 表示不限。
+    #[test]
+    fn tiered_flags() {
+        let args = parse_args(&strings(&["--compaction", "tiered"]))
+            .unwrap()
+            .unwrap();
+        let CompactionOptions::Tiered(defaults) = args.engine_config().compaction else {
+            panic!("应当是 tiered");
+        };
+        assert_eq!(defaults.num_tiers, 8);
+        assert_eq!(defaults.max_size_amplification_percent, 200);
+        assert_eq!(defaults.size_ratio, 1);
+        assert_eq!(defaults.min_merge_width, 2);
+        assert_eq!(defaults.max_merge_width, None);
+
+        let raw = strings(&[
+            "--compaction",
+            "tiered",
+            "--num-tiers",
+            "16",
+            "--max-size-amp",
+            "300",
+            "--tier-size-ratio",
+            "10",
+            "--min-merge-width",
+            "3",
+            "--max-merge-width",
+            "6",
+        ]);
+        let args = parse_args(&raw).unwrap().unwrap();
+        let CompactionOptions::Tiered(options) = args.engine_config().compaction else {
+            panic!("应当是 tiered");
+        };
+        assert_eq!(options.num_tiers, 16);
+        assert_eq!(options.max_size_amplification_percent, 300);
+        assert_eq!(options.size_ratio, 10);
+        assert_eq!(options.min_merge_width, 3);
+        assert_eq!(options.max_merge_width, Some(6));
+        assert_eq!(
+            args.compaction_flags(),
+            "--compaction tiered --num-tiers 16 --max-size-amp 300 --tier-size-ratio 10 --min-merge-width 3 --max-merge-width 6"
+        );
     }
 
     // --help 不算错误，只是不执行负载。

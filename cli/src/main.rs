@@ -9,7 +9,9 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use lsm::compaction::CompactionOptions;
 use lsm::compaction::simple_leveled::SimpleLeveledOptions;
+use lsm::compaction::tiered::TieredOptions;
 use lsm::db::Db;
 use lsm::lsm_storage::LsmStorageOptions;
 
@@ -17,11 +19,12 @@ use command::Command;
 use execute::{execute, sst_files};
 
 const USAGE: &str = "\
-用法：lsm-cli 目录 [memtable 上限，字节]
+用法：lsm-cli 目录 [memtable 上限，字节] [合并策略]
 
   目录             数据库所在的目录，不存在就创建；里面不能已有 SST 文件
   memtable 上限    可写的 memtable 写满多少字节就冻结（默认 4096）。
-                   取得小，几十条记录就能看到 SST 文件出现";
+                   取得小，几十条记录就能看到 SST 文件出现
+  合并策略         simple（简单分层，默认）或 tiered";
 
 /// memtable 上限的默认值，字节。取得小，用 `fill` 写几十条就会冻结。
 const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4096;
@@ -34,18 +37,31 @@ const MAX_LEVELS: usize = 4;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (dir, memtable_size_limit) = match args.as_slice() {
-        [dir] => (PathBuf::from(dir), DEFAULT_MEMTABLE_SIZE_LIMIT),
-        [dir, limit] => {
-            let limit = limit
-                .parse()
-                .with_context(|| format!("memtable 上限应当是正整数，实际是 {limit}"))?;
-            (PathBuf::from(dir), limit)
-        }
+    let (dir, memtable_size_limit, strategy) = match args.as_slice() {
+        [dir] => (PathBuf::from(dir), DEFAULT_MEMTABLE_SIZE_LIMIT, "simple"),
+        [dir, limit] => (PathBuf::from(dir), parse_limit(limit)?, "simple"),
+        [dir, limit, strategy] => (PathBuf::from(dir), parse_limit(limit)?, strategy.as_str()),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
+    };
+    let compaction = match strategy {
+        // 后台自动合并：L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
+        // 取得小，用 status 很快就能看到文件一层一层往下沉。
+        "simple" => CompactionOptions::SimpleLeveled(SimpleLeveledOptions {
+            level0_file_num_compaction_trigger: 2,
+            size_ratio_percent: 200,
+        }),
+        // tier 到 4 个就开始检查，其余是 RocksDB 的默认值。
+        "tiered" => CompactionOptions::Tiered(TieredOptions {
+            num_tiers: 4,
+            max_size_amplification_percent: 200,
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: None,
+        }),
+        _ => bail!("合并策略应当是 simple 或 tiered，实际是 {strategy}"),
     };
 
     refuse_existing_sst_files(&dir)?;
@@ -56,12 +72,7 @@ fn main() -> anyhow::Result<()> {
         // compaction 写出的文件与 flush 写出的一样大。
         target_sst_size: memtable_size_limit,
         max_levels: MAX_LEVELS,
-        // 后台自动合并：L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
-        // 取得小，用 status 很快就能看到文件一层一层往下沉。
-        compaction: Some(SimpleLeveledOptions {
-            level0_file_num_compaction_trigger: 2,
-            size_ratio_percent: 200,
-        }),
+        compaction,
     };
     let db = Db::open(&dir, options).with_context(|| format!("打开数据库：{}", dir.display()))?;
     println!("已打开 {}。输入 help 查看命令。", dir.display());
@@ -71,6 +82,13 @@ fn main() -> anyhow::Result<()> {
     db.close().context("关闭数据库：把内存里的数据写成 SST")?;
     println!("已关闭，内存里的数据都已写成 SST。");
     Ok(())
+}
+
+/// 解析命令行里的 memtable 上限。
+fn parse_limit(limit: &str) -> anyhow::Result<usize> {
+    limit
+        .parse()
+        .with_context(|| format!("memtable 上限应当是正整数，实际是 {limit}"))
 }
 
 /// 目录里已经有 SST 文件时返回错误。目录不存在不算错误，打开时会创建。

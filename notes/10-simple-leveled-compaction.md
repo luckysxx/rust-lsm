@@ -1,6 +1,6 @@
 # 简单分层 compaction
 
-状态：已有正文 · 代码：[compaction/simple_leveled.rs](../engine/src/compaction/simple_leveled.rs) 的 `generate_task`、`pick_upper_level`；[lsm_storage/compact.rs](../engine/src/lsm_storage/compact.rs) 的 `compact_once`、`compact_task`、`apply_compaction_result`；[lsm_storage.rs](../engine/src/lsm_storage.rs) 的 `levels`、`get`、`scan`；[db.rs](../engine/src/db.rs) 的 `compaction_loop`、`stop_thread`
+状态：已有正文 · 代码：[compaction/simple_leveled.rs](../engine/src/compaction/simple_leveled.rs) 的 `generate_task`、`pick_upper_level`；[lsm_storage/compact.rs](../engine/src/lsm_storage/compact.rs) 的 `compact_once`、`compact_simple_leveled_task`、`apply_simple_leveled_result`；[lsm_storage.rs](../engine/src/lsm_storage.rs) 的 `levels`、`get`、`scan`；[db.rs](../engine/src/db.rs) 的 `compaction_loop`、`stop_thread`
 
 ## 位置
 
@@ -171,10 +171,10 @@ leveled 用写换读和空间，tiered 反过来。
 
 ## 本项目的做法
 
-- **状态**：`LsmStorageState` 的 `l1_sstables` 换成 `levels: Vec<Vec<Arc<SsTable>>>`；选项多了 `max_levels`（至少 1）与 `compaction: Option<SimpleLeveledOptions>`（`None` 表示不自动合并）。`LsmStorageState::level_mut(n)` 取 Ln 的可变引用，把 `- 1` 收在一处。
+- **状态**：`LsmStorageState` 的 `l1_sstables` 换成 `levels: Vec<Vec<Arc<SsTable>>>`；选项多了 `max_levels`（至少 1）与合并策略的参数（[L11](11-tiered-compaction.md) 起是枚举 `CompactionOptions`，`NoCompaction` 表示不自动合并）。`LsmStorageState::level_mut(n)` 取 Ln 的可变引用，把 `- 1` 收在一处。
 - **策略**：crate 顶层的 [compaction/](../engine/src/compaction.rs) 模块，每种策略一个子模块，只依赖公开的 `LsmStorageState`；执行留在 `lsm_storage` 的子模块里，因为它要用 `LsmStorage` 的私有字段。依赖只有一个方向：执行依赖策略给出的任务类型。层号用 `usize`，0 是 L0。任务里放 `Arc<SsTable>`（状态里直接放 `Arc`，没有"编号 → 文件"的映射）。策略用自由函数，调用处写成 `simple_leveled::generate_task(&options, &state)`。
-- **执行**：`compact_task` 写新文件，`apply_compaction_result` 换状态，`compact_once` 串起"拿 `compaction_lock` → 生成任务 → 写文件、同步目录 → 换状态 → 删旧文件"，返回这次有没有做。任务必须在拿到锁之后生成，才能看到上一次合并换完之后的状态。全量合并改名为 `compact_full`、`apply_full_compaction_result`，结果放进最底层。
-- **线程**：`Db` 有两个后台线程，共用信号 `Signal`（`Wake`、`Stop`）与停线程的函数 `stop_thread`；compaction 线程每 50 毫秒醒来一次。`Db::has_pending_compaction` 返回当前形状还有没有待做的任务，基准用它等后台做完。
+- **执行**：`compact_simple_leveled_task` 写新文件，`apply_simple_leveled_result` 换状态，`compact_once` 串起"拿 `compaction_lock` → 生成任务 → 写文件、同步目录 → 换状态 → 删旧文件"，返回这次有没有做。任务必须在拿到锁之后生成，才能看到上一次合并换完之后的状态。全量合并改名为 `compact_full`、`apply_full_compaction_result`，结果放进最底层。
+- **线程**：`Db` 有两个后台线程，共用信号 `Signal`（`Wake`、`Stop`）与停线程的函数 `stop_thread`；compaction 线程每 50 毫秒醒来一次。`has_pending_compaction` 返回当前形状还有没有待做的任务，基准用它等后台做完。
 - **对外**：`level_sstable_counts` 代替 `l1_sstable_count`；命令行程序默认开启自动合并（触发值 2、比例 200%、4 层），`status` 逐层列出；基准驱动新增 `--max-levels`、`--compaction`、`--l0-trigger`、`--size-ratio`，每段负载之后连同后台合并、旧文件的删除一起等完。
 - **测试**：策略用文件数直接测，另有 100 次 flush 的模拟；执行与换状态各有测试，其中三个检查断言的失败信息；一个综合测试做 30 轮随机写入与删除，每轮合并到停下，再与 `BTreeMap` 模型比对、核对目录里的文件、确认最底层没有墓碑；线程的测试覆盖"一次叫醒做完全部任务""任务之间看到 Stop 就停""失败后重试"。
 

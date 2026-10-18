@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::compaction::simple_leveled::{self, SimpleLeveledOptions};
+use crate::compaction::CompactionOptions;
 use crate::error::Result;
 use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator};
 use crate::stats::StatsSnapshot;
@@ -59,8 +59,6 @@ pub struct Db {
     /// compaction 线程的把手，用法与 `flush_thread` 相同。选项里没有 compaction 的参数时
     /// 不启动这个线程，一开始就是 `None`。
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
-    /// 后台合并用的参数，与选项里的 `compaction` 相同；`None` 表示不自动合并。
-    compaction_options: Option<SimpleLeveledOptions>,
 }
 
 impl Db {
@@ -76,8 +74,9 @@ impl Db {
         flush_interval: Duration,
         compaction_interval: Duration,
     ) -> Result<Self> {
-        // 选项要整个交给引擎，先把 compaction 线程要用的那部分复制出来。
-        let compaction_options = options.compaction.clone();
+        // 选项要整个交给引擎，先看清要不要起 compaction 线程。
+        let start_compaction_thread =
+            !matches!(options.compaction, CompactionOptions::NoCompaction);
         let storage = Arc::new(LsmStorage::open(path, options)?);
 
         // 线程什么时候结束不由这个函数决定，所以它不能借用这里的任何东西，
@@ -91,23 +90,21 @@ impl Db {
             .spawn(move || flush_loop(storage_for_flush, flush_receiver, flush_interval))?;
 
         let (compaction_sender, compaction_receiver) = mpsc::channel();
-        let compaction_thread = match compaction_options.clone() {
-            Some(compaction_options) => {
-                let storage_for_compaction = Arc::clone(&storage);
-                let handle = thread::Builder::new()
-                    .name("lsm-compaction".to_string())
-                    .spawn(move || {
-                        compaction_loop(
-                            storage_for_compaction,
-                            compaction_options,
-                            compaction_receiver,
-                            compaction_interval,
-                        )
-                    })?;
-                Some(handle)
-            }
+        let compaction_thread = if start_compaction_thread {
+            let storage_for_compaction = Arc::clone(&storage);
+            let handle = thread::Builder::new()
+                .name("lsm-compaction".to_string())
+                .spawn(move || {
+                    compaction_loop(
+                        storage_for_compaction,
+                        compaction_receiver,
+                        compaction_interval,
+                    )
+                })?;
+            Some(handle)
+        } else {
             // 不自动合并：接收端在这里被丢掉，没有线程。
-            None => None,
+            None
         };
 
         Ok(Self {
@@ -116,7 +113,6 @@ impl Db {
             flush_thread: Mutex::new(Some(flush_thread)),
             compaction_sender,
             compaction_thread: Mutex::new(compaction_thread),
-            compaction_options,
         })
     }
 
@@ -156,7 +152,13 @@ impl Db {
         self.storage.l0_sstable_count()
     }
 
-    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。
+    /// 是否选用了 tiered 策略：不用 L0，`level_sstable_counts` 给出的是各个 tier 的文件数。
+    pub fn uses_tiers(&self) -> bool {
+        self.storage.uses_tiers()
+    }
+
+    /// 当前 L1 往下各层分别有几个 SST，第 0 项是 L1。选用 tiered 策略时是各个 tier 的，
+    /// 第 0 项最新。
     pub fn level_sstable_counts(&self) -> Vec<usize> {
         self.storage.level_sstable_counts()
     }
@@ -166,14 +168,10 @@ impl Db {
     ///
     /// 用来等后台合并做完，例如基准在两段负载之间。
     pub fn has_pending_compaction(&self) -> bool {
-        let Some(options) = &self.compaction_options else {
-            return false;
-        };
-        let snapshot = self.storage.snapshot();
-        simple_leveled::generate_task(options, &snapshot).is_some()
+        self.storage.has_pending_compaction()
     }
 
-    /// 把 L0 与各层的全部文件合并成新的最底层，见 [`LsmStorage::force_full_compaction`]。
+    /// 把全部文件合并成一个 sorted run，见 [`LsmStorage::force_full_compaction`]。
     ///
     /// 在调用它的线程里做完才返回；后台的 flush 照常进行。后台的 compaction 正在合并时，
     /// 等它这个任务做完再开始。
@@ -285,18 +283,13 @@ fn flush_loop(storage: Arc<LsmStorage>, receiver: Receiver<Signal>, interval: Du
 /// 每一轮最多等 `interval` 这么久，等到的结果与 `flush_loop` 一样分成两组：
 /// `Wake` 或超时就开始合并；`Stop` 或发送端已经不存在就返回。
 ///
-/// 醒来之后反复调用 `compact_once`，直到它返回 `false`（没有任务了）：一次合并常常
-/// 让下面一对层也需要合并，不必等到下一轮。每做完一个任务看一眼有没有 `Stop`，
+/// 醒来之后反复调用 `compact_once`，直到它返回 `false`（没有任务了）：一次合并之后
+/// 常常还有下一个任务，不必等到下一轮。用哪种策略由引擎的选项决定。每做完一个任务看一眼有没有 `Stop`，
 /// 有就立刻返回：一连串任务可能要做很久，关闭时不该等它们全部做完。
 ///
 /// 合并失败时线程不结束：打印错误，这一轮不再继续，下一轮再试。失败的任务没有改变状态
 /// （或者状态已经换好、只是旧文件没删掉），数据没有丢。
-fn compaction_loop(
-    storage: Arc<LsmStorage>,
-    options: SimpleLeveledOptions,
-    receiver: Receiver<Signal>,
-    interval: Duration,
-) {
+fn compaction_loop(storage: Arc<LsmStorage>, receiver: Receiver<Signal>, interval: Duration) {
     loop {
         match receiver.recv_timeout(interval) {
             Ok(Signal::Wake) | Err(RecvTimeoutError::Timeout) => {}
@@ -305,7 +298,7 @@ fn compaction_loop(
 
         // 一个接一个地做，直到没有任务。
         loop {
-            match storage.compact_once(&options) {
+            match storage.compact_once() {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -325,6 +318,8 @@ fn compaction_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::simple_leveled::SimpleLeveledOptions;
+    use crate::compaction::tiered::TieredOptions;
     use crate::iterators::vec_iterator::{collect_all, expected};
     use crate::table::{FileObject, SsTable, SsTableIterator};
     use crate::test_util::{run_with_deadline, wait_until};
@@ -341,16 +336,27 @@ mod tests {
             block_cache_size: 1 << 20,
             target_sst_size: 1024,
             max_levels: 3,
-            compaction: None,
+            compaction: CompactionOptions::NoCompaction,
         }
     }
 
-    /// 测试用的合并参数：L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
-    fn compaction_options() -> SimpleLeveledOptions {
-        SimpleLeveledOptions {
+    /// 测试用的合并参数：简单分层，L0 攒到 2 个文件就并进 L1，下层至少是上层的 2 倍。
+    fn compaction_options() -> CompactionOptions {
+        CompactionOptions::SimpleLeveled(SimpleLeveledOptions {
             level0_file_num_compaction_trigger: 2,
             size_ratio_percent: 200,
-        }
+        })
+    }
+
+    /// 测试用的 tiered 参数：4 个 tier 开始检查，其余是 RocksDB 的默认值。
+    fn tiered_options() -> CompactionOptions {
+        CompactionOptions::Tiered(TieredOptions {
+            num_tiers: 4,
+            max_size_amplification_percent: 200,
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: None,
+        })
     }
 
     /// 目录里现有的 SST 文件名，按名字排序。
@@ -547,13 +553,13 @@ mod tests {
         /// 线程自己醒来的间隔是 `interval`。
         fn start(interval: Duration) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let options = options_with_limit(usize::MAX);
+            let mut options = options_with_limit(usize::MAX);
+            options.compaction = compaction_options();
             let storage = Arc::new(LsmStorage::open(dir.path(), options).unwrap());
             let (sender, receiver) = mpsc::channel();
             let storage_for_thread = Arc::clone(&storage);
-            let handle = thread::spawn(move || {
-                compaction_loop(storage_for_thread, compaction_options(), receiver, interval)
-            });
+            let handle =
+                thread::spawn(move || compaction_loop(storage_for_thread, receiver, interval));
             Self {
                 storage,
                 sender: Some(sender),
@@ -575,8 +581,7 @@ mod tests {
 
         /// 现在的形状是否满足合并策略：没有要做的任务。
         fn settled(&self) -> bool {
-            let snapshot = self.storage.snapshot();
-            simple_leveled::generate_task(&compaction_options(), &snapshot).is_none()
+            !self.storage.has_pending_compaction()
         }
     }
 
@@ -751,9 +756,22 @@ mod tests {
         /// 合并的参数是 `compaction_options()`，compaction 线程每隔 `compaction_interval`
         /// 自己醒来一次。
         fn open_with_compaction(memtable_size_limit: usize, compaction_interval: Duration) -> Self {
+            Self::open_with_strategy(
+                memtable_size_limit,
+                compaction_interval,
+                compaction_options(),
+            )
+        }
+
+        /// 与 `open_with_compaction` 相同，只是合并策略由调用方给出。
+        fn open_with_strategy(
+            memtable_size_limit: usize,
+            compaction_interval: Duration,
+            compaction: CompactionOptions,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut options = options_with_limit(memtable_size_limit);
-            options.compaction = Some(compaction_options());
+            options.compaction = compaction;
             let db =
                 Db::open_with_intervals(dir.path(), options, SOON, compaction_interval).unwrap();
             Self {
@@ -954,6 +972,27 @@ mod tests {
         assert_eq!(db.scan_all().len(), 300);
     }
 
+    // tiered：后台自动合并，L0 一直是空的，停下时 tier 数不到 num_tiers；数据一条不少。
+    #[test]
+    fn db_compacts_in_the_background_with_tiered() {
+        let db = TestDb::open_with_strategy(64, SOON, tiered_options());
+
+        for i in 0..300 {
+            db.put(format!("key-{i:03}").as_bytes(), b"value");
+        }
+
+        assert!(
+            wait_until(|| db.imm_memtable_count() == 0 && db.settled()),
+            "后台没有合并到停下：各 tier {:?}",
+            db.level_sstable_counts()
+        );
+        assert_eq!(db.l0_sstable_count(), 0);
+        let tier_count = db.level_sstable_counts().len();
+        assert!((1..4).contains(&tier_count), "tier 数是 {tier_count}");
+        assert!(db.stats().compaction_bytes_written > 0);
+        assert_eq!(db.scan_all().len(), 300);
+    }
+
     // 没有开启自动合并时，不管 L0 积了多少文件，都不算有待做的合并。
     #[test]
     fn has_pending_compaction_is_false_without_compaction_options() {
@@ -986,11 +1025,22 @@ mod tests {
 
     // 几个线程同时写入和读，后台同时在 flush 和合并：每条记录写完立刻读得到；
     // 关闭之后数据一条不少，目录里的文件正好是状态里的文件。
-    // 整个测试设了时限：几把锁的先后顺序出错时，测试报"卡住"而不是停在那里。
     #[test]
     fn db_keeps_data_readable_while_compacting_in_the_background() {
-        run_with_deadline("写入、flush 与后台合并同时进行", || {
-            let db = TestDb::open_with_compaction(256, SOON);
+        keeps_data_readable_while_compacting(compaction_options());
+    }
+
+    // 同上，策略换成 tiered：合并期间 flush 不断在最前面加 tier，换状态时要原样留下它们。
+    #[test]
+    fn db_keeps_data_readable_while_tiered_compacting_in_the_background() {
+        keeps_data_readable_while_compacting(tiered_options());
+    }
+
+    /// 几个线程同时写入和读，后台按 `compaction` 同时在 flush 和合并，最后关闭并检查。
+    /// 整个过程设了时限：几把锁的先后顺序出错时，测试报"卡住"而不是停在那里。
+    fn keeps_data_readable_while_compacting(compaction: CompactionOptions) {
+        run_with_deadline("写入、flush 与后台合并同时进行", move || {
+            let db = TestDb::open_with_strategy(256, SOON, compaction);
             let writers = 4;
             let puts_per_writer = 500;
 
