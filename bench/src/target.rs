@@ -263,6 +263,15 @@ impl KvTarget for EngineTarget {
                 ),
                 "不用 L0".to_string(),
             ),
+            CompactionOptions::Leveled(options) => (
+                format!(
+                    "L0 之下 {max_levels} 层，后台按 leveled 合并（L0 触发值 {}，层间比例 {}，基准大小 {} MB）",
+                    options.level0_file_num_compaction_trigger,
+                    options.level_size_multiplier,
+                    options.base_level_size_bytes as f64 / (1024.0 * 1024.0)
+                ),
+                format!("L0 有 {} 个 SST", self.db.l0_sstable_count()),
+            ),
         };
         let level_files = join_counts(&self.db.level_sstable_counts());
         let levels_name = if self.config.compaction.flush_to_l0() {

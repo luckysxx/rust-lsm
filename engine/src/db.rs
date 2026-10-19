@@ -318,6 +318,7 @@ fn compaction_loop(storage: Arc<LsmStorage>, receiver: Receiver<Signal>, interva
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::leveled::LeveledOptions;
     use crate::compaction::simple_leveled::SimpleLeveledOptions;
     use crate::compaction::tiered::TieredOptions;
     use crate::iterators::vec_iterator::{collect_all, expected};
@@ -356,6 +357,16 @@ mod tests {
             size_ratio: 1,
             min_merge_width: 2,
             max_merge_width: None,
+        })
+    }
+
+    /// 测试用的 leveled 参数：触发值 2、比例 2、基准大小 1 KB，数据不多也会用到好几层，
+    /// 部分合并与 trivial move 都会发生。
+    fn leveled_options() -> CompactionOptions {
+        CompactionOptions::Leveled(LeveledOptions {
+            level0_file_num_compaction_trigger: 2,
+            level_size_multiplier: 2,
+            base_level_size_bytes: 1024,
         })
     }
 
@@ -1034,6 +1045,12 @@ mod tests {
     #[test]
     fn db_keeps_data_readable_while_tiered_compacting_in_the_background() {
         keeps_data_readable_while_compacting(tiered_options());
+    }
+
+    // 同上，策略换成 leveled：合并期间 flush 不断往 L0 加文件，部分合并只换掉下层的一部分。
+    #[test]
+    fn db_keeps_data_readable_while_leveled_compacting_in_the_background() {
+        keeps_data_readable_while_compacting(leveled_options());
     }
 
     /// 几个线程同时写入和读，后台按 `compaction` 同时在 flush 和合并，最后关闭并检查。

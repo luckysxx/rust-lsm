@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use lsm::compaction::CompactionOptions;
+use lsm::compaction::leveled::LeveledOptions;
 use lsm::compaction::simple_leveled::SimpleLeveledOptions;
 use lsm::compaction::tiered::TieredOptions;
 use lsm::db::Db;
@@ -24,7 +25,7 @@ const USAGE: &str = "\
   目录             数据库所在的目录，不存在就创建；里面不能已有 SST 文件
   memtable 上限    可写的 memtable 写满多少字节就冻结（默认 4096）。
                    取得小，几十条记录就能看到 SST 文件出现
-  合并策略         simple（简单分层，默认）或 tiered";
+  合并策略         simple（简单分层，默认）、tiered 或 leveled";
 
 /// memtable 上限的默认值，字节。取得小，用 `fill` 写几十条就会冻结。
 const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4096;
@@ -61,7 +62,14 @@ fn main() -> anyhow::Result<()> {
             min_merge_width: 2,
             max_merge_width: None,
         }),
-        _ => bail!("合并策略应当是 simple 或 tiered，实际是 {strategy}"),
+        // L0 攒到 2 个文件就往下并，相邻层的目标之比 4，基准层约 2 张 memtable：
+        // 取得小，写几百条就能看到中间层从下往上启用。
+        "leveled" => CompactionOptions::Leveled(LeveledOptions {
+            level0_file_num_compaction_trigger: 2,
+            level_size_multiplier: 4,
+            base_level_size_bytes: (memtable_size_limit * 2) as u64,
+        }),
+        _ => bail!("合并策略应当是 simple、tiered 或 leveled，实际是 {strategy}"),
     };
 
     refuse_existing_sst_files(&dir)?;

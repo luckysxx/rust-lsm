@@ -73,6 +73,12 @@ impl LsmStorageState {
         assert!(n >= 1, "level_mut 只管 L1 往下的层，L0 用 l0_sstables");
         &mut self.levels[n - 1]
     }
+
+    /// 第 `n` 层（Ln，n 从 1 开始）的 SST，只读。L0 不在这里，用 `l0_sstables`。
+    pub fn level_at(&self, n: usize) -> &[Arc<SsTable>] {
+        assert!(n >= 1, "level_at 只管 L1 往下的层，L0 用 l0_sstables");
+        &self.levels[n - 1]
+    }
 }
 
 #[derive(Debug, Clone)]

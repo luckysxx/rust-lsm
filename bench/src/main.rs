@@ -9,6 +9,7 @@ mod workload;
 use std::process::ExitCode;
 
 use lsm::compaction::CompactionOptions;
+use lsm::compaction::leveled::LeveledOptions;
 use lsm::compaction::simple_leveled::SimpleLeveledOptions;
 use lsm::compaction::tiered::TieredOptions;
 use runner::{Config, WorkloadResult, run_workload};
@@ -29,9 +30,12 @@ const USAGE: &str = "\
   --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
   --max-levels N     被测对象为 engine 时，L0 之下有几层（默认 4；tiered 不用）
   --compaction NAME  被测对象为 engine 时，后台自动合并的策略：none（不自动合并）、
-                     simple（简单分层）或 tiered（默认 none）
-  --l0-trigger N     simple 策略下，L0 攒到几个文件就并进 L1（默认 2）
+                     simple（简单分层）、tiered 或 leveled（默认 none）
+  --l0-trigger N     simple 与 leveled 策略下，L0 攒到几个文件就往下并（默认 2）
   --size-ratio N     simple 策略下，下层的文件数至少是上层的百分之几（默认 200）
+  --level-multiplier N  leveled 策略下，相邻两层目标大小之比（默认 10）
+  --base-level-mb N  leveled 策略下，基准层大约多大，单位 MB；0 表示取
+                     memtable 上限 × L0 触发值（RocksDB 建议的取法，默认 0）
   --num-tiers N      tiered 策略下，tier 数到几个才开始检查（默认 8）
   --max-size-amp N   tiered 策略下，空间放大的阈值，百分数（默认 200）
   --tier-size-ratio N  tiered 策略下，下一个 tier 比前面之和大出百分之几才算大得多（默认 1）
@@ -53,7 +57,7 @@ struct Args {
     memtable_megabytes: usize,
     block_cache_megabytes: usize,
     max_levels: usize,
-    /// `none`、`simple` 或 `tiered`。
+    /// `none`、`simple`、`tiered` 或 `leveled`。
     compaction: String,
     l0_trigger: usize,
     size_ratio_percent: usize,
@@ -63,9 +67,21 @@ struct Args {
     min_merge_width: usize,
     /// 0 表示不限。
     max_merge_width: usize,
+    level_multiplier: u64,
+    /// 0 表示取 memtable 上限 × L0 触发值，见 `base_level_megabytes`。
+    base_level_mb: usize,
 }
 
 impl Args {
+    /// leveled 实际用的基准大小，MB：给了就用给的，没给（0）就取 memtable 上限 × L0 触发值。
+    fn base_level_megabytes(&self) -> usize {
+        if self.base_level_mb == 0 {
+            self.memtable_megabytes * self.l0_trigger
+        } else {
+            self.base_level_mb
+        }
+    }
+
     /// 复现这次运行的合并参数：只列出所选策略用到的选项。
     fn compaction_flags(&self) -> String {
         match self.compaction.as_str() {
@@ -80,6 +96,12 @@ impl Args {
                 self.tier_size_ratio,
                 self.min_merge_width,
                 self.max_merge_width
+            ),
+            "leveled" => format!(
+                "--compaction leveled --l0-trigger {} --level-multiplier {} --base-level-mb {}",
+                self.l0_trigger,
+                self.level_multiplier,
+                self.base_level_megabytes()
             ),
             _ => "--compaction none".to_string(),
         }
@@ -102,6 +124,11 @@ impl Args {
                 } else {
                     Some(self.max_merge_width)
                 },
+            }),
+            "leveled" => CompactionOptions::Leveled(LeveledOptions {
+                level0_file_num_compaction_trigger: self.l0_trigger,
+                level_size_multiplier: self.level_multiplier,
+                base_level_size_bytes: (self.base_level_megabytes() * 1024 * 1024) as u64,
             }),
             _ => CompactionOptions::NoCompaction,
         };
@@ -135,6 +162,8 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     let mut tier_size_ratio = 1;
     let mut min_merge_width = 2;
     let mut max_merge_width = 0;
+    let mut level_multiplier = 10;
+    let mut base_level_mb = 0;
 
     let mut index = 0;
     while index < raw.len() {
@@ -167,6 +196,8 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--tier-size-ratio" => tier_size_ratio = parse_number(flag, value)? as usize,
             "--min-merge-width" => min_merge_width = parse_number(flag, value)? as usize,
             "--max-merge-width" => max_merge_width = parse_number(flag, value)? as usize,
+            "--level-multiplier" => level_multiplier = parse_number(flag, value)?,
+            "--base-level-mb" => base_level_mb = parse_number(flag, value)? as usize,
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -193,7 +224,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     if max_levels == 0 {
         return Err("--max-levels 必须至少为 1".to_string());
     }
-    if !["none", "simple", "tiered"].contains(&compaction.as_str()) {
+    if !["none", "simple", "tiered", "leveled"].contains(&compaction.as_str()) {
         return Err(format!("不认识的合并策略：{compaction}"));
     }
     if l0_trigger == 0 {
@@ -207,6 +238,9 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     }
     if max_merge_width == 1 {
         return Err("--max-merge-width 必须是 0（不限）或至少为 2".to_string());
+    }
+    if level_multiplier < 2 {
+        return Err("--level-multiplier 必须至少为 2".to_string());
     }
     Ok(Some(Args {
         config,
@@ -223,6 +257,8 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         tier_size_ratio,
         min_merge_width,
         max_merge_width,
+        level_multiplier,
+        base_level_mb,
     }))
 }
 
@@ -514,7 +550,8 @@ mod tests {
         assert!(parse_args(&strings(&["--scan-length", "0"])).is_err());
         assert!(parse_args(&strings(&["--memtable-mb", "0"])).is_err());
         assert!(parse_args(&strings(&["--max-levels", "0"])).is_err());
-        assert!(parse_args(&strings(&["--compaction", "leveled"])).is_err());
+        assert!(parse_args(&strings(&["--compaction", "nosuch"])).is_err());
+        assert!(parse_args(&strings(&["--level-multiplier", "1"])).is_err());
         assert!(parse_args(&strings(&["--num-tiers", "1"])).is_err());
         assert!(parse_args(&strings(&["--min-merge-width", "1"])).is_err());
         assert!(parse_args(&strings(&["--max-merge-width", "1"])).is_err());
@@ -562,6 +599,41 @@ mod tests {
         assert_eq!(
             args.compaction_flags(),
             "--compaction tiered --num-tiers 16 --max-size-amp 300 --tier-size-ratio 10 --min-merge-width 3 --max-merge-width 6"
+        );
+    }
+
+    // leveled 的选项：比例默认 10；基准大小默认取 memtable 上限 × L0 触发值，也可以直接给出。
+    #[test]
+    fn leveled_flags() {
+        let raw = strings(&["--compaction", "leveled", "--memtable-mb", "4"]);
+        let args = parse_args(&raw).unwrap().unwrap();
+        let CompactionOptions::Leveled(defaults) = args.engine_config().compaction else {
+            panic!("应当是 leveled");
+        };
+        assert_eq!(defaults.level0_file_num_compaction_trigger, 2);
+        assert_eq!(defaults.level_size_multiplier, 10);
+        assert_eq!(defaults.base_level_size_bytes, 8 * 1024 * 1024);
+
+        let raw = strings(&[
+            "--compaction",
+            "leveled",
+            "--l0-trigger",
+            "4",
+            "--level-multiplier",
+            "5",
+            "--base-level-mb",
+            "32",
+        ]);
+        let args = parse_args(&raw).unwrap().unwrap();
+        let CompactionOptions::Leveled(options) = args.engine_config().compaction else {
+            panic!("应当是 leveled");
+        };
+        assert_eq!(options.level0_file_num_compaction_trigger, 4);
+        assert_eq!(options.level_size_multiplier, 5);
+        assert_eq!(options.base_level_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            args.compaction_flags(),
+            "--compaction leveled --l0-trigger 4 --level-multiplier 5 --base-level-mb 32"
         );
     }
 
