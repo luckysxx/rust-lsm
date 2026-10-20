@@ -9,6 +9,7 @@ use lsm::compaction::CompactionOptions;
 use lsm::db::Db;
 use lsm::iterators::StorageIterator;
 use lsm::lsm_storage::LsmStorageOptions;
+use lsm::manifest::{MANIFEST_FILE_NAME, Manifest};
 use lsm::mem_table::{MemTable, MemTableIterator};
 use lsm::stats::StatsSnapshot;
 
@@ -194,6 +195,17 @@ impl EngineTarget {
         Self { db, config, dir }
     }
 
+    /// MANIFEST 里有几条记录、文件多少字节。每次 flush 或合并换状态追加一条，
+    /// 第一条记着形状。
+    fn manifest_usage(&self) -> (usize, u64) {
+        let path = self.dir.path().join(MANIFEST_FILE_NAME);
+        let bytes = std::fs::metadata(&path)
+            .expect("读 MANIFEST 的信息失败")
+            .len();
+        let (_, records) = Manifest::recover(&path).expect("读 MANIFEST 失败");
+        (records.len(), bytes)
+    }
+
     /// 目录里现有几个 SST 文件。
     fn sst_file_count(&self) -> usize {
         let entries = std::fs::read_dir(self.dir.path()).expect("读目录失败");
@@ -282,10 +294,13 @@ impl KvTarget for EngineTarget {
         let frozen = self.db.imm_memtable_count();
         let (cached_blocks, cached_bytes) = self.db.block_cache_usage();
         let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
+        let (manifest_records, manifest_bytes) = self.manifest_usage();
+        let manifest_kilobytes = manifest_bytes as f64 / 1024.0;
         Some(format!(
             "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，{strategy}；\
              结束时有 {frozen} 张冻结的 memtable 等待落盘，{shape}，\
-             {levels_name}依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB）"
+             {levels_name}依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB），\
+             MANIFEST 有 {manifest_records} 条记录（{manifest_kilobytes:.1} KB）"
         ))
     }
 

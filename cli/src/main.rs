@@ -17,12 +17,13 @@ use lsm::db::Db;
 use lsm::lsm_storage::LsmStorageOptions;
 
 use command::Command;
-use execute::{execute, sst_files};
+use execute::execute;
 
 const USAGE: &str = "\
 用法：lsm-cli 目录 [memtable 上限，字节] [合并策略]
 
-  目录             数据库所在的目录，不存在就创建；里面不能已有 SST 文件
+  目录             数据库所在的目录，不存在就创建；已有数据库时接着打开，
+                   合并策略要与写入时的形状相同（simple 与 leveled 可以互换）
   memtable 上限    可写的 memtable 写满多少字节就冻结（默认 4096）。
                    取得小，几十条记录就能看到 SST 文件出现
   合并策略         simple（简单分层，默认）、tiered 或 leveled";
@@ -72,7 +73,6 @@ fn main() -> anyhow::Result<()> {
         _ => bail!("合并策略应当是 simple、tiered 或 leveled，实际是 {strategy}"),
     };
 
-    refuse_existing_sst_files(&dir)?;
     let options = LsmStorageOptions {
         memtable_size_limit,
         block_size: BLOCK_SIZE,
@@ -97,26 +97,6 @@ fn parse_limit(limit: &str) -> anyhow::Result<usize> {
     limit
         .parse()
         .with_context(|| format!("memtable 上限应当是正整数，实际是 {limit}"))
-}
-
-/// 目录里已经有 SST 文件时返回错误。目录不存在不算错误，打开时会创建。
-///
-/// 引擎重新打开时不读取已有的文件，SST 的编号又从 1 开始：
-/// 新文件会撞上旧文件的名字，flush 一直失败。
-fn refuse_existing_sst_files(dir: &Path) -> anyhow::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let files = sst_files(dir).with_context(|| format!("读取目录：{}", dir.display()))?;
-    if !files.is_empty() {
-        bail!(
-            "{} 里已经有 {} 个 SST 文件。引擎还不会读回已有的文件（要等 manifest 与 WAL），\
-             请换一个目录，或者先删掉这些文件",
-            dir.display(),
-            files.len()
-        );
-    }
-    Ok(())
 }
 
 /// 读输入的循环：读一行、解析、执行、打印，直到 `quit` 或输入结束（Ctrl-D）。

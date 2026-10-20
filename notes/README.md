@@ -123,7 +123,7 @@ db/
 | L10 | [简单分层 compaction](10-simple-leveled-compaction.md) | 已有正文 | 为什么要自动、分层与三种放大、简单分层的规则与优先级、策略与执行分开（任务、只给一个任务）、多层状态的表示、执行与换状态、并行合并的约束、后台线程（两种等待、关闭顺序）、穿过空层的复制；mito2 的 picker 与调度器导读；基准 | 第二周第 2 章 |
 | L11 | [tiered compaction](11-tiered-compaction.md) | 已有正文 | leveled 为什么写得多、只合并大小相近的 run、三种触发与参数、一定会停下、正确性（相邻、前缀、墓碑、合并期间的 flush）、按文件数模拟与真实引擎的差距、不用 L0 的理由、tier 与 SST、两种策略的分支放在哪里；mito2 TWCS 找 sorted run 的导读；基准 | 第二周第 3 章 |
 | L12 | [leveled compaction](12-leveled-compaction.md) | 已有正文 | 简单分层的三处粗糙、目标大小从最底层往上算（`base_level_size` 的含义与取值、为什么不从上往下、目标是软的）、优先级与分数、部分合并（L0 拿全部、按整体跨度找重叠、省的是峰值空间与任务时长）、挑哪个文件、换状态时整块插入、trivial move（多个 L0 文件一起挪、为什么挪动时才排序）、写放大从哪里来、分支还是 trait、L0 单独放的代价；mini-lsm、RocksDB、mito2 对照；基准 | 第二周第 4 章 |
-| L13 | [manifest](13-manifest.md) | 未教学 | 记录内容与编码、写入时机、恢复 SST 集合 | 第二周第 5 章 |
+| L13 | [manifest](13-manifest.md) | 已有正文 | 记录内容与编码、写入时机、恢复 SST 集合 | 第二周第 5 章 |
 | L14 | [WAL](14-wal.md) | 未教学 | 记录编码、与 memtable 的对应、重放、同步策略 | 第二周第 6 章 |
 | L15 | [写批次与校验和](15-write-batch-and-checksums.md) | 未教学 | 写批次、四处校验和、损坏与残尾 | 第二周第 7 章 |
 

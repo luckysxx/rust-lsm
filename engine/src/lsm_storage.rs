@@ -8,10 +8,15 @@
 //! 选用 tiered 策略时不用 L0：flush 出的 SST 成为 `levels` 最前面的一个新 tier，
 //! `levels` 是一列按新旧排列、个数会变的 tier。读取的顺序不变，仍是从 `levels` 的前面往后。
 //!
+//! 每次 flush 与合并换状态，都先往 manifest 追加一条记录，记下文件列表的变化；
+//! 打开时重放 manifest，恢复各层有哪些 SST，删掉目录里不在其中的残留文件。
+//! memtable 里还没写成 SST 的数据重启后会丢（还没有 WAL）。
+//!
 //! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
 mod compact;
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -20,17 +25,21 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use bytes::Bytes;
 
-use crate::compaction::CompactionOptions;
-use crate::error::Result;
+use crate::compaction::{CompactionOptions, sorted_by_first_key};
+use crate::error::{Error, Result};
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::{SstConcatIterator, find_sst_index};
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::LsmIterator;
+use crate::manifest::{
+    MANIFEST_FILE_NAME, Manifest, ManifestRecord, Placement, RecoveredLayout, Shape, VersionEdit,
+    replay,
+};
 use crate::mem_table::{MemTable, MemTableIterator, bound_to_owned};
 use crate::stats::{Stats, StatsSnapshot};
 use crate::table::{
-    BlockCache, SsTable, SsTableBuilder, SsTableIterator, key_hash, new_block_cache,
+    BlockCache, FileObject, SsTable, SsTableBuilder, SsTableIterator, key_hash, new_block_cache,
 };
 
 /// `scan` 返回的游标类型，从里往外读：
@@ -106,7 +115,10 @@ pub struct LsmStorage {
     /// 指向当前状态的指针。读写锁保护的是"当前状态是哪一份"，不是表里的内容。
     state: RwLock<Arc<LsmStorageState>>,
     /// 让改变结构的操作（冻结、flush 与 compaction 最后换状态的那一步）排队。
-    state_lock: Mutex<()>,
+    ///
+    /// 锁里放着 manifest：只有拿着这把锁才能追加记录，所以记录在文件里的先后
+    /// 与状态生效的先后一致，重放得到的就是最后一份状态的文件列表。
+    state_lock: Mutex<Manifest>,
     /// 同一时刻只做一次 flush。写文件比较慢，这期间不占着 `state_lock`，
     /// 冻结和写入照常进行。
     flush_lock: Mutex<()>,
@@ -115,7 +127,8 @@ pub struct LsmStorage {
     compaction_lock: Mutex<()>,
     /// 数据库所在的目录，SST 文件都放在这里。
     path: PathBuf,
-    /// 下一个 SST 文件的编号。从 1 开始，只增不减，编号不重复使用。
+    /// 下一个 SST 文件的编号。新建的数据库从 1 开始，打开已有的数据库时接着 manifest
+    /// 记下的往后；只增不减，编号不重复使用。
     next_sst_id: AtomicUsize,
     /// 所有 SST 共用的块缓存。容量设为 0 时没有缓存。
     block_cache: Option<Arc<BlockCache>>,
@@ -127,38 +140,74 @@ pub struct LsmStorage {
 impl LsmStorage {
     /// 在 `path` 这个目录里打开引擎；目录不存在就创建。
     ///
-    /// 目前不会读取目录里已有的文件：每次打开都是空的，重启后数据不保留。
+    /// 目录里没有 manifest 时新建一个空的数据库。已有 manifest 时重放它，打开其中记下的
+    /// SST，删除目录里不在其中的 SST 文件（崩溃时写了一半的新文件，或者换了状态还没来得及
+    /// 删的旧文件）。memtable 里没有写成 SST 的数据不在任何文件里，重启后没有了。
+    ///
+    /// - 选项与数据库的形状对不上（分层与 tiered 互换，或者 `max_levels` 变了）：
+    ///   [`Error::IncompatibleOptions`]。不合并、简单分层与 leveled 的形状相同，可以互换。
+    /// - manifest 损坏、manifest 记下的 SST 不在了、目录里有 SST 却没有 manifest：
+    ///   [`Error::Corruption`]。
     pub fn open(path: &Path, options: LsmStorageOptions) -> Result<Self> {
         assert!(options.max_levels >= 1, "L0 之下至少要有 1 层");
         std::fs::create_dir_all(path)?;
 
-        // 分层的策略一开始就有固定数目的空层；tiered 一开始一个 tier 都没有。
-        let initial_levels = if options.compaction.flush_to_l0() {
-            vec![Vec::new(); options.max_levels]
-        } else {
-            Vec::new()
-        };
-        let initial_state = LsmStorageState {
-            memtable: Arc::new(MemTable::new()),
-            imm_memtables: Vec::new(),
-            l0_sstables: Vec::new(),
-            levels: initial_levels,
-        };
         let block_cache = if options.block_cache_size == 0 {
             None
         } else {
             let capacity_bytes = options.block_cache_size as u64;
             Some(Arc::new(new_block_cache(capacity_bytes)))
         };
+        let stats = Arc::new(Stats::new());
+
+        // 文件列表：重放 manifest 得到编号，再逐个打开。
+        let shape = shape_of(&options);
+        let (manifest, layout) = open_manifest(path, shape)?;
+        let open_sst = |id: usize| -> Result<Arc<SsTable>> {
+            let file = FileObject::open(&sst_path(path, id)).map_err(|error| match error {
+                Error::Io(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
+                    Error::Corruption(format!("manifest 记下的 SST {id:05}.sst 不在目录里"))
+                }
+                other => other,
+            })?;
+            let sst = SsTable::open(id, block_cache.clone(), file)?.with_stats(Arc::clone(&stats));
+            Ok(Arc::new(sst))
+        };
+        let mut l0_sstables = Vec::new();
+        for &id in &layout.l0 {
+            l0_sstables.push(open_sst(id)?);
+        }
+        let mut levels = Vec::new();
+        for ids in &layout.levels {
+            let mut level = Vec::new();
+            for &id in ids {
+                level.push(open_sst(id)?);
+            }
+            // 分层时 manifest 不记层内的顺序：每层是按 key 排好、互不重叠的一列，按首 key
+            // 排一次就是原来的顺序。tier 内的顺序 manifest 记着，不用排。
+            if options.compaction.flush_to_l0() {
+                level = sorted_by_first_key(&level);
+            }
+            levels.push(level);
+        }
+
+        remove_unlisted_ssts(path, &layout)?;
+
+        let initial_state = LsmStorageState {
+            memtable: Arc::new(MemTable::new()),
+            imm_memtables: Vec::new(),
+            l0_sstables,
+            levels,
+        };
         Ok(Self {
             state: RwLock::new(Arc::new(initial_state)),
-            state_lock: Mutex::new(()),
+            state_lock: Mutex::new(manifest),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            next_sst_id: AtomicUsize::new(1),
+            next_sst_id: AtomicUsize::new(layout.next_sst_id),
             block_cache,
-            stats: Arc::new(Stats::new()),
+            stats,
             options,
         })
     }
@@ -202,7 +251,7 @@ impl LsmStorage {
 
     /// 编号为 `id` 的 SST 文件的路径，例如 `目录/00007.sst`。
     fn path_of_sst(&self, id: usize) -> PathBuf {
-        self.path.join(format!("{id:05}.sst"))
+        sst_path(&self.path, id)
     }
 
     /// 取一个新的 SST 编号。
@@ -213,6 +262,39 @@ impl LsmStorage {
     /// 同步数据库的目录：让"目录里多了一个文件"这件事落到磁盘上。
     fn sync_dir(&self) -> Result<()> {
         File::open(&self.path)?.sync_all()?;
+        Ok(())
+    }
+
+    /// 一次换状态在 manifest 里的记录：去掉 `removed`，加上 `added`，放在 `placement`。
+    /// 下一个编号取现在的值：分配编号不拿锁，但已经分配出去的编号都比它小。
+    fn version_edit<'a>(
+        &self,
+        removed: impl Iterator<Item = &'a Arc<SsTable>>,
+        added: &[Arc<SsTable>],
+        placement: Placement,
+    ) -> VersionEdit {
+        VersionEdit {
+            removed: removed.map(|sst| sst.id()).collect(),
+            added: added.iter().map(|sst| sst.id()).collect(),
+            placement,
+            next_sst_id: self.next_sst_id.load(Ordering::SeqCst),
+        }
+    }
+
+    /// 换状态的最后一步：先把 `edit` 追加进 manifest 并同步，成功之后才换上 `new_state`。
+    ///
+    /// `manifest` 来自调用方持有的 `state_lock`，`new_state` 是拿到锁之后在当前状态的副本上
+    /// 改好的。fsync 在 `state_lock` 里、在 `state` 的写锁外：等它的只有冻结与别的换状态，
+    /// 读者取快照不受影响。追加失败时返回错误，状态不变；这次写出的新文件没有任何记录
+    /// 提到，下次打开时被当作残留删掉。
+    fn commit_state(
+        &self,
+        manifest: &mut Manifest,
+        new_state: LsmStorageState,
+        edit: VersionEdit,
+    ) -> Result<()> {
+        manifest.append(&ManifestRecord::Edit(edit))?;
+        *self.state.write().unwrap() = Arc::new(new_state);
         Ok(())
     }
 
@@ -425,7 +507,7 @@ impl LsmStorage {
     /// 换状态是一步完成的，读者要么看到"表还在、文件不在"，要么看到"表不在了、
     /// 文件在"，不会出现两边都没有的时刻。
     ///
-    /// 写文件失败时返回错误，状态不变，那张表仍然留在冻结列表里。
+    /// 写文件或追加 manifest 失败时返回错误，状态不变，那张表仍然留在冻结列表里。
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
         // 同一时刻只做一次 flush：下面要先看"最旧的表是哪张"，最后再把它拿掉，
         // 这中间不能有另一次 flush 插进来。冻结不受影响，它只往列表的开头加。
@@ -451,27 +533,34 @@ impl LsmStorage {
         }
 
         // 换状态：复制一份，去掉末尾那张表，把新的 SST 放到 L0 的最前面（tiered 是放到
-        // `levels` 的最前面），换指针。
-        // 与冻结一样先拿 `state_lock` 排队，再用写锁换指针。
-        let _state_lock = self.state_lock.lock().unwrap();
-        let mut guard = self.state.write().unwrap();
-        let mut new_state = guard.as_ref().clone();
+        // `levels` 的最前面），先记进 manifest，再换指针。
+        // 与冻结一样先拿 `state_lock` 排队；状态只在这把锁里改变，拿到锁之后取的快照就是最新的。
+        let mut manifest = self.state_lock.lock().unwrap();
+        let mut new_state = self.snapshot().as_ref().clone();
         let removed = new_state.imm_memtables.pop();
         // 拿掉的必须就是刚才写成文件的那一张。
         assert!(
             removed.is_some_and(|removed| Arc::ptr_eq(&removed, &memtable)),
             "flush 期间冻结列表的末尾变了"
         );
-        if let Some(sst) = sst {
-            // L0 与 tier 的列表都是新的在前：刚写出的这个最新。
-            if self.options.compaction.flush_to_l0() {
-                new_state.l0_sstables.insert(0, sst);
-            } else {
-                new_state.levels.insert(0, vec![sst]);
-            }
+        let Some(sst) = sst else {
+            // 空表没有写出文件，文件列表没变，不用记进 manifest。
+            *self.state.write().unwrap() = Arc::new(new_state);
+            return Ok(());
+        };
+        // L0 与 tier 的列表都是新的在前：刚写出的这个最新。
+        let placement = if self.options.compaction.flush_to_l0() {
+            Placement::L0
+        } else {
+            Placement::Tier
+        };
+        let edit = self.version_edit(std::iter::empty(), std::slice::from_ref(&sst), placement);
+        if self.options.compaction.flush_to_l0() {
+            new_state.l0_sstables.insert(0, sst);
+        } else {
+            new_state.levels.insert(0, vec![sst]);
         }
-        *guard = Arc::new(new_state);
-        Ok(())
+        self.commit_state(&mut manifest, new_state, edit)
     }
 
     /// 把游标从当前位置走到头，按顺序写成一个或多个 SST 文件，返回它们（按 key 排列）。
@@ -532,7 +621,7 @@ impl LsmStorage {
     ///
     /// 当前状态可能正被读者的快照引用，不能原地修改：复制一份，在副本上换表，
     /// 再用写锁把指针换成副本。新表在拿写锁之前就准备好，写锁只持有一瞬间。
-    pub fn force_freeze_memtable(&self, _state_lock: &MutexGuard<'_, ()>) {
+    pub fn force_freeze_memtable(&self, _state_lock: &MutexGuard<'_, Manifest>) {
         let new_memtable = Arc::new(MemTable::new());
 
         let mut guard = self.state.write().unwrap();
@@ -543,6 +632,102 @@ impl LsmStorage {
         new_state.memtable = new_memtable;
         *guard = Arc::new(new_state);
     }
+}
+
+/// 编号为 `id` 的 SST 文件在目录 `dir` 里的路径，例如 `目录/00007.sst`。
+fn sst_path(dir: &Path, id: usize) -> PathBuf {
+    dir.join(format!("{id:05}.sst"))
+}
+
+/// 按选项算出数据库的形状：分层的策略是 L0 加 `max_levels` 层，tiered 是一列 tier。
+fn shape_of(options: &LsmStorageOptions) -> Shape {
+    if options.compaction.flush_to_l0() {
+        Shape::Levels {
+            max_levels: options.max_levels,
+        }
+    } else {
+        Shape::Tiers
+    }
+}
+
+/// 打开目录 `dir` 里的 manifest，返回它和重放得到的文件列表。
+///
+/// - 没有 manifest：新建一个，写下第一条 [`ManifestRecord::Init`]。目录里却已经有 SST 时
+///   返回 [`Error::Corruption`]：这些文件不是本引擎按 manifest 管理的，不能当作残留删掉。
+/// - 有 manifest 但一条记录也没有（新建之后、第一条写完之前崩溃）：补上第一条，当作新的。
+///   这时还不可能有任何 SST 被记下，目录里的 SST 都是残留。
+/// - 否则重放；形状与 `shape` 不同时返回 [`Error::IncompatibleOptions`]。
+fn open_manifest(dir: &Path, shape: Shape) -> Result<(Manifest, RecoveredLayout)> {
+    let manifest_path = dir.join(MANIFEST_FILE_NAME);
+    if !manifest_path.exists() {
+        let existing = list_sst_ids(dir)?;
+        if !existing.is_empty() {
+            return Err(Error::Corruption(format!(
+                "{} 里有 {} 个 SST 文件，却没有 {MANIFEST_FILE_NAME}",
+                dir.display(),
+                existing.len()
+            )));
+        }
+        let mut manifest = Manifest::create(&manifest_path)?;
+        manifest.append(&ManifestRecord::Init(shape))?;
+        return Ok((manifest, RecoveredLayout::new(shape)));
+    }
+
+    let (mut manifest, records) = Manifest::recover(&manifest_path)?;
+    if records.is_empty() {
+        manifest.append(&ManifestRecord::Init(shape))?;
+        return Ok((manifest, RecoveredLayout::new(shape)));
+    }
+    let layout = replay(&records)?;
+    if layout.shape != shape {
+        return Err(Error::IncompatibleOptions(format!(
+            "数据库的形状是 {:?}，选项要求的是 {shape:?}",
+            layout.shape
+        )));
+    }
+    Ok((manifest, layout))
+}
+
+/// 目录 `dir` 里全部 SST 文件的编号（文件名是"数字.sst"的），顺序不定。
+fn list_sst_ids(dir: &Path) -> Result<Vec<usize>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        let Some(stem) = name.strip_suffix(".sst") else {
+            continue;
+        };
+        if let Ok(id) = stem.parse::<usize>() {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// 删除目录 `dir` 里不在 `layout` 中的 SST 文件：崩溃时写了一半、还没记进 manifest 的
+/// 新文件，或者 manifest 已经去掉、还没来得及删的旧文件。
+///
+/// manifest 里的编号不小于记下的下一个编号时返回 [`Error::Corruption`]：那样的编号以后
+/// 还会分配出去，与已有的文件重名。
+fn remove_unlisted_ssts(dir: &Path, layout: &RecoveredLayout) -> Result<()> {
+    let listed: HashSet<usize> = layout
+        .l0
+        .iter()
+        .chain(layout.levels.iter().flatten())
+        .copied()
+        .collect();
+    if let Some(&too_large) = listed.iter().find(|&&id| id >= layout.next_sst_id) {
+        return Err(Error::Corruption(format!(
+            "manifest 里的 SST 编号 {too_large} 不小于下一个编号 {}",
+            layout.next_sst_id
+        )));
+    }
+    for id in list_sst_ids(dir)? {
+        if !listed.contains(&id) {
+            std::fs::remove_file(sst_path(dir, id))?;
+        }
+    }
+    Ok(())
 }
 
 /// 在一个 SST 上建游标，指着范围下界之后的第一条记录。
@@ -622,6 +807,16 @@ mod tests {
             self.dir.path()
         }
 
+        /// 释放引擎，用同样的选项在同一个目录里重新打开，模拟一次重启：
+        /// memtable 里没有写成 SST 的数据不在了。
+        pub(super) fn reopen(self) -> TestStorage {
+            let options = self.storage.options.clone();
+            let TestStorage { storage, dir } = self;
+            drop(storage);
+            let storage = LsmStorage::open(dir.path(), options).unwrap();
+            TestStorage { storage, dir }
+        }
+
         /// 目录里现有的 SST 文件名，按名字排序。
         pub(super) fn sst_file_names(&self) -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(self.dir())
@@ -632,6 +827,36 @@ mod tests {
             names.sort();
             names
         }
+    }
+
+    /// 状态里各处的文件编号：L0（新的在前），以及 L1 往下各层（或各个 tier）。
+    pub(super) fn state_ids(storage: &LsmStorage) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let snapshot = storage.snapshot();
+        let ids_of =
+            |ssts: &[Arc<SsTable>]| -> Vec<usize> { ssts.iter().map(|sst| sst.id()).collect() };
+        let l0 = ids_of(&snapshot.l0_sstables);
+        let levels = snapshot.levels.iter().map(|level| ids_of(level)).collect();
+        (l0, levels)
+    }
+
+    /// 读出目录里的 manifest 并重放，检查得到的文件列表与引擎现在的状态相同。
+    ///
+    /// L0 与 tier 的顺序要一样；分层时 manifest 不记层内的顺序，各层按编号排好再比。
+    /// 下一个编号也要一样（manifest 记的是最后一次换状态时的值，之后没有再分配）。
+    pub(super) fn assert_manifest_matches_state(storage: &TestStorage) {
+        let path = storage.dir().join(MANIFEST_FILE_NAME);
+        let (_, records) = Manifest::recover(&path).unwrap();
+        let layout = replay(&records).unwrap();
+        let (l0, mut levels) = state_ids(storage);
+        let mut manifest_levels = layout.levels.clone();
+        if storage.options.compaction.flush_to_l0() {
+            for level in levels.iter_mut().chain(manifest_levels.iter_mut()) {
+                level.sort();
+            }
+        }
+        assert_eq!(layout.shape, shape_of(&storage.options));
+        assert_eq!(layout.l0, l0, "manifest 里的 L0 与状态不同");
+        assert_eq!(manifest_levels, levels, "manifest 里的各层与状态不同");
     }
 
     fn open_with_limit(memtable_size_limit: usize) -> TestStorage {
@@ -2505,5 +2730,259 @@ mod tests {
 
         assert_eq!(storage.block_cache_usage(), (0, 0));
         assert_eq!(storage.stats().blocks_read, 3);
+    }
+
+    // ---------- 重启：manifest ----------
+
+    /// 在 L0 上写入并 flush 一组记录，成为一个新的 SST。空字符串的 value 是墓碑。
+    fn flush_pairs(storage: &LsmStorage, pairs: &[(&str, &str)]) {
+        for (key, value) in pairs {
+            if value.is_empty() {
+                storage.delete(key.as_bytes());
+            } else {
+                storage.put(key.as_bytes(), value.as_bytes());
+            }
+        }
+        storage.freeze_memtable();
+        storage.flush_all_imm_memtables().unwrap();
+    }
+
+    /// 不合并、L0 之下 3 层的选项。
+    fn no_compaction_options() -> LsmStorageOptions {
+        LsmStorageOptions {
+            memtable_size_limit: usize::MAX,
+            block_size: 64,
+            block_cache_size: 1 << 20,
+            target_sst_size: 1024,
+            max_levels: 3,
+            compaction: CompactionOptions::NoCompaction,
+        }
+    }
+
+    /// 期望 `open` 返回 `IncompatibleOptions`。
+    fn assert_incompatible(result: Result<LsmStorage>) {
+        match result {
+            Err(Error::IncompatibleOptions(_)) => {}
+            Err(other) => panic!("应当是 IncompatibleOptions，实际是 {other:?}"),
+            Ok(_) => panic!("应当打不开"),
+        }
+    }
+
+    /// 期望 `open` 返回 `Corruption`。
+    fn assert_open_corruption(result: Result<LsmStorage>) {
+        match result {
+            Err(Error::Corruption(_)) => {}
+            Err(other) => panic!("应当是 Corruption，实际是 {other:?}"),
+            Ok(_) => panic!("应当打不开"),
+        }
+    }
+
+    // 新的目录：打开时建好 manifest，里面只有第一条，记着形状。
+    #[test]
+    fn open_creates_a_manifest_with_only_the_shape() {
+        let storage = open_without_auto_freeze();
+
+        let path = storage.dir().join(MANIFEST_FILE_NAME);
+        let (_, records) = Manifest::recover(&path).unwrap();
+        assert_eq!(
+            records,
+            vec![ManifestRecord::Init(Shape::Levels { max_levels: 3 })]
+        );
+    }
+
+    // flush 出的 SST 在重启之后还在：L0 的顺序、读到的值都与重启前相同；之后的 flush
+    // 接着用新编号，不与已有的文件重名。
+    #[test]
+    fn reopen_keeps_flushed_ssts() {
+        let storage = open_without_auto_freeze();
+        flush_pairs(&storage, &[("a", "1"), ("b", "1")]);
+        flush_pairs(&storage, &[("a", "2"), ("c", "2")]);
+        flush_pairs(&storage, &[("b", ""), ("d", "3")]);
+        let before = scan_all(&storage);
+        assert_eq!(state_ids(&storage).0, vec![3, 2, 1]);
+
+        let storage = storage.reopen();
+
+        assert_eq!(state_ids(&storage).0, vec![3, 2, 1]);
+        assert_eq!(scan_all(&storage), before);
+        assert_eq!(get_str(&storage, "a"), Some("2".to_string()));
+        assert_eq!(get_str(&storage, "b"), None);
+        flush_pairs(&storage, &[("e", "4")]);
+        assert_eq!(state_ids(&storage).0, vec![4, 3, 2, 1]);
+        assert_manifest_matches_state(&storage);
+    }
+
+    // 还没有 WAL：没写成 SST 的数据重启之后没有了。
+    #[test]
+    fn reopen_loses_the_unflushed_memtable() {
+        let storage = open_without_auto_freeze();
+        flush_pairs(&storage, &[("a", "1")]);
+        storage.put(b"b", b"2");
+
+        let storage = storage.reopen();
+
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        assert_eq!(get_str(&storage, "b"), None);
+    }
+
+    // 目录里不在 manifest 中的 SST 是崩溃留下的残留，打开时删掉；其他文件不动。
+    // 残留的编号可能不小于下一个编号（写了一半的新文件），删掉之后新 flush 才不会重名。
+    #[test]
+    fn reopen_removes_unlisted_ssts() {
+        let storage = open_without_auto_freeze();
+        flush_pairs(&storage, &[("a", "1")]);
+        std::fs::write(storage.dir().join("00002.sst"), b"half written").unwrap();
+        std::fs::write(storage.dir().join("00009.sst"), b"left over").unwrap();
+        std::fs::write(storage.dir().join("notes.txt"), b"not ours").unwrap();
+
+        let storage = storage.reopen();
+
+        assert_eq!(storage.sst_file_names(), vec!["00001.sst"]);
+        assert!(storage.dir().join("notes.txt").exists());
+        flush_pairs(&storage, &[("b", "2")]);
+        assert_eq!(storage.sst_file_names(), vec!["00001.sst", "00002.sst"]);
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+    }
+
+    // 合并换完状态、还没来得及删旧文件时崩溃：旧文件留在目录里。重启时它不在 manifest 里，
+    // 被删掉；合并时丢掉的墓碑盖住的值不会复活。
+    #[test]
+    fn reopen_does_not_resurrect_a_deleted_key() {
+        let storage = open_without_auto_freeze();
+        flush_pairs(&storage, &[("k", "old")]);
+        flush_pairs(&storage, &[("k", "")]);
+        let old_file = storage.dir().join("00001.sst");
+        let old_bytes = std::fs::read(&old_file).unwrap();
+        storage.force_full_compaction().unwrap();
+        assert_eq!(storage.sst_file_names(), Vec::<String>::new());
+        // 模拟崩溃：旧文件没有删成。
+        std::fs::write(&old_file, &old_bytes).unwrap();
+
+        let storage = storage.reopen();
+
+        assert_eq!(get_str(&storage, "k"), None);
+        assert_eq!(storage.sst_file_names(), Vec::<String>::new());
+    }
+
+    // 形状不同的选项打不开：分层换成 tiered、tiered 换成分层、层数变了。目录里的文件不动。
+    #[test]
+    fn reopen_rejects_another_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
+        flush_pairs(&storage, &[("a", "1")]);
+        drop(storage);
+        let tiered = CompactionOptions::Tiered(crate::compaction::tiered::TieredOptions {
+            num_tiers: 4,
+            max_size_amplification_percent: 200,
+            size_ratio: 1,
+            min_merge_width: 2,
+            max_merge_width: None,
+        });
+
+        assert_incompatible(LsmStorage::open(
+            dir.path(),
+            LsmStorageOptions {
+                compaction: tiered.clone(),
+                ..no_compaction_options()
+            },
+        ));
+        assert_incompatible(LsmStorage::open(
+            dir.path(),
+            LsmStorageOptions {
+                max_levels: 4,
+                ..no_compaction_options()
+            },
+        ));
+        assert!(dir.path().join("00001.sst").exists());
+
+        let tiered_dir = tempfile::tempdir().unwrap();
+        let tiered_options = LsmStorageOptions {
+            compaction: tiered,
+            ..no_compaction_options()
+        };
+        drop(LsmStorage::open(tiered_dir.path(), tiered_options).unwrap());
+        assert_incompatible(LsmStorage::open(tiered_dir.path(), no_compaction_options()));
+    }
+
+    // 不合并、简单分层、leveled 的形状相同，可以换着打开，数据照常读得到。
+    #[test]
+    fn reopen_allows_switching_between_layered_strategies() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
+        flush_pairs(&storage, &[("a", "1")]);
+        flush_pairs(&storage, &[("b", "2")]);
+        drop(storage);
+
+        let simple = LsmStorageOptions {
+            compaction: CompactionOptions::SimpleLeveled(
+                crate::compaction::simple_leveled::SimpleLeveledOptions {
+                    level0_file_num_compaction_trigger: 2,
+                    size_ratio_percent: 200,
+                },
+            ),
+            ..no_compaction_options()
+        };
+        let storage = LsmStorage::open(dir.path(), simple).unwrap();
+        while storage.compact_once().unwrap() {}
+        flush_pairs(&storage, &[("c", "3")]);
+        drop(storage);
+
+        let leveled = LsmStorageOptions {
+            compaction: CompactionOptions::Leveled(crate::compaction::leveled::LeveledOptions {
+                level0_file_num_compaction_trigger: 1,
+                level_size_multiplier: 10,
+                base_level_size_bytes: 1 << 20,
+            }),
+            ..no_compaction_options()
+        };
+        let storage = LsmStorage::open(dir.path(), leveled).unwrap();
+        while storage.compact_once().unwrap() {}
+        assert_eq!(
+            scan_all(&storage),
+            expected(&[("a", "1"), ("b", "2"), ("c", "3")])
+        );
+    }
+
+    // manifest 是空的（新建之后、第一条写完之前崩溃）：当作新的数据库，补上第一条；
+    // 这时不可能有 SST 被记下，目录里的 SST 都是残留。
+    #[test]
+    fn empty_manifest_is_a_new_database() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILE_NAME), b"").unwrap();
+        std::fs::write(dir.path().join("00001.sst"), b"left over").unwrap();
+
+        let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
+
+        assert!(!dir.path().join("00001.sst").exists());
+        assert_eq!(storage.l0_sstable_count(), 0);
+        let (_, records) = Manifest::recover(&dir.path().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(
+            records,
+            vec![ManifestRecord::Init(Shape::Levels { max_levels: 3 })]
+        );
+    }
+
+    // 目录里有 SST、却没有 manifest：不是这个引擎按 manifest 管理的文件，不能当作残留删掉，
+    // 打不开，文件不动。
+    #[test]
+    fn ssts_without_a_manifest_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("00001.sst"), b"someone else's").unwrap();
+
+        assert_open_corruption(LsmStorage::open(dir.path(), no_compaction_options()));
+        assert!(dir.path().join("00001.sst").exists());
+        assert!(!dir.path().join(MANIFEST_FILE_NAME).exists());
+    }
+
+    // manifest 记下的 SST 不在目录里：打不开，是 Corruption。
+    #[test]
+    fn a_missing_listed_sst_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
+        flush_pairs(&storage, &[("a", "1")]);
+        drop(storage);
+        std::fs::remove_file(dir.path().join("00001.sst")).unwrap();
+
+        assert_open_corruption(LsmStorage::open(dir.path(), no_compaction_options()));
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! 合并什么由 `crate::compaction` 里的策略决定，这里只负责照做。有两种入口：
 //! 手动的全量合并 `force_full_compaction`，与按选项里的策略做一个任务的 `compact_once`。
-//! 每种任务都是同样的四步：在锁外合并、写新文件 → 同步目录 → 拿 `state_lock` 换状态 →
-//! 删除旧文件。
+//! 每种任务都是同样的四步：在锁外合并、写新文件 → 同步目录 → 拿 `state_lock`，把这次的
+//! 变化追加进 manifest，再换状态 → 删除旧文件。旧文件要等新状态记进 manifest 之后才能删：
+//! 在这之前崩溃，重启时 manifest 里还是旧文件。
 //!
 //! 本文件是 `lsm_storage` 的子模块。子模块能看到父模块里的私有内容，所以这里可以
 //! 直接给 `LsmStorage` 加方法，并使用它的私有字段与 `write_ssts` 等私有方法，
@@ -21,6 +22,7 @@ use crate::error::Result;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::manifest::Placement;
 use crate::table::{SsTable, SsTableIterator};
 
 impl LsmStorage {
@@ -29,8 +31,9 @@ impl LsmStorage {
     ///
     /// 一次合并之后常常还有下一个任务，调用方应当反复调用，直到返回 `false`。
     ///
-    /// 写新文件失败时返回错误，状态不变，写了一半的新文件留在目录里，没有任何地方引用。
-    /// 删除旧文件失败时也返回错误，这时新状态已经生效，旧文件留在目录里。
+    /// 写新文件或追加 manifest 失败时返回错误，状态不变，写好或写了一半的新文件留在目录里，
+    /// 没有任何地方引用，下次打开时删掉。删除旧文件失败时也返回错误，这时新状态已经生效、
+    /// 记进了 manifest，旧文件留在目录里，同样在下次打开时删掉。
     pub fn compact_once(&self) -> Result<bool> {
         // 同一时刻只做一次 compaction：L1 往下的层（tier）只由 compaction 拿掉或替换，
         // 两次交错会互相覆盖。任务要在拿到锁之后生成，看到的才是上一次合并换完之后的状态。
@@ -126,7 +129,7 @@ impl LsmStorage {
         }
 
         // 换状态：一瞬间。
-        self.apply_full_compaction_result(&l0_inputs, &level_inputs, new_ssts);
+        self.apply_full_compaction_result(&l0_inputs, &level_inputs, new_ssts)?;
 
         // 新状态里已经没有旧文件了，删掉它们的文件名。
         let old_ssts = l0_inputs.iter().chain(level_inputs.iter().flatten());
@@ -153,11 +156,14 @@ impl LsmStorage {
         l0_inputs: &[Arc<SsTable>],
         level_inputs: &[Vec<Arc<SsTable>>],
         new_ssts: Vec<Arc<SsTable>>,
-    ) {
-        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，再换指针。
-        let _state_lock = self.state_lock.lock().unwrap();
-        let mut guard = self.state.write().unwrap();
-        let mut new_state = guard.as_ref().clone();
+    ) -> Result<()> {
+        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，记进 manifest，
+        // 再换指针。
+        let mut manifest = self.state_lock.lock().unwrap();
+        let mut new_state = self.snapshot().as_ref().clone();
+        let removed = l0_inputs.iter().chain(level_inputs.iter().flatten());
+        let placement = Placement::Level(level_inputs.len());
+        let edit = self.version_edit(removed, &new_ssts, placement);
 
         // L0：只拿掉参加了合并的文件，合并期间新 flush 出的留下。
         remove_compacted_ssts(&mut new_state.l0_sstables, l0_inputs, 0);
@@ -173,7 +179,7 @@ impl LsmStorage {
         }
         let bottom = new_state.levels.last_mut().unwrap();
         *bottom = new_ssts;
-        *guard = Arc::new(new_state);
+        self.commit_state(&mut manifest, new_state, edit)
     }
 
     /// 把 `l0` 与 `levels` 里的全部记录归并，写成新的 SST，返回它们（按 key 排好、互不重叠）。
@@ -223,7 +229,7 @@ impl LsmStorage {
         }
 
         // 换状态：一瞬间。
-        self.apply_simple_leveled_result(task, new_ssts);
+        self.apply_simple_leveled_result(task, new_ssts)?;
 
         // 新状态里已经没有这两层的旧文件了，删掉它们的文件名。
         let old_ssts = task.upper_ssts.iter().chain(task.lower_ssts.iter());
@@ -291,11 +297,18 @@ impl LsmStorage {
     /// 必须原样留在 L0：按编号拿掉输入。上层是 Ln 时，它与下层一样只由 compaction 改动，
     /// 而 compaction 同一时刻只有一个，所以两层此时应当还是任务里记下的文件：
     /// 断言之后，上层清空，下层整层换成 `new_ssts`。其他层不动。
-    fn apply_simple_leveled_result(&self, task: &SimpleLeveledTask, new_ssts: Vec<Arc<SsTable>>) {
-        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，再换指针。
-        let _state_lock = self.state_lock.lock().unwrap();
-        let mut guard = self.state.write().unwrap();
-        let mut new_state = guard.as_ref().clone();
+    fn apply_simple_leveled_result(
+        &self,
+        task: &SimpleLeveledTask,
+        new_ssts: Vec<Arc<SsTable>>,
+    ) -> Result<()> {
+        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，记进 manifest，
+        // 再换指针。
+        let mut manifest = self.state_lock.lock().unwrap();
+        let mut new_state = self.snapshot().as_ref().clone();
+        let removed = task.upper_ssts.iter().chain(task.lower_ssts.iter());
+        let placement = Placement::Level(task.lower_level);
+        let edit = self.version_edit(removed, &new_ssts, placement);
 
         // 上层。
         if task.upper_level == 0 {
@@ -321,7 +334,7 @@ impl LsmStorage {
         );
         *lower = new_ssts;
 
-        *guard = Arc::new(new_state);
+        self.commit_state(&mut manifest, new_state, edit)
     }
 }
 
@@ -336,7 +349,7 @@ impl LsmStorage {
         }
 
         // 换状态：一瞬间。
-        self.apply_tiered_result(task, new_ssts);
+        self.apply_tiered_result(task, new_ssts)?;
 
         // 新状态里已经没有这几个 tier 的旧文件了，删掉它们的文件名。
         let old_ssts = task.tiers.iter().flatten();
@@ -373,11 +386,12 @@ impl LsmStorage {
     /// 所以先找到任务里第一个 tier 现在在哪，不能假定它还在最前面。tier 只由 compaction
     /// 拿掉或替换，而 compaction 同一时刻只有一个，所以任务里的 tier 此时应当原样、
     /// 连续地排在那里，断言检查这一点。
-    fn apply_tiered_result(&self, task: &TieredTask, new_ssts: Vec<Arc<SsTable>>) {
-        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，再换指针。
-        let _state_lock = self.state_lock.lock().unwrap();
-        let mut guard = self.state.write().unwrap();
-        let mut new_state = guard.as_ref().clone();
+    fn apply_tiered_result(&self, task: &TieredTask, new_ssts: Vec<Arc<SsTable>>) -> Result<()> {
+        // 与冻结、flush 一样：先拿 `state_lock` 排队，在当前状态的副本上改，记进 manifest，
+        // 再换指针。重放时新 tier 放在第一个被去掉的文件所在的位置，也就是这里的 `start`。
+        let mut manifest = self.state_lock.lock().unwrap();
+        let mut new_state = self.snapshot().as_ref().clone();
+        let edit = self.version_edit(task.tiers.iter().flatten(), &new_ssts, Placement::Tier);
         let tiers = &mut new_state.levels;
 
         // 任务里的 tier 现在从哪里开始：前面是合并期间新 flush 出的 tier。
@@ -409,7 +423,7 @@ impl LsmStorage {
         };
         tiers.splice(start..end, replacement);
 
-        *guard = Arc::new(new_state);
+        self.commit_state(&mut manifest, new_state, edit)
     }
 }
 
@@ -426,15 +440,14 @@ impl LsmStorage {
     ///   参加合并的旧文件。
     fn run_leveled_task(&self, task: &LeveledTask) -> Result<()> {
         if task.is_trivial_move {
-            self.apply_leveled_result(task, sorted_by_first_key(&task.upper_ssts));
-            return Ok(());
+            return self.apply_leveled_result(task, sorted_by_first_key(&task.upper_ssts));
         }
         let new_ssts = self.compact_leveled_task(task)?;
         if !new_ssts.is_empty() {
             self.sync_dir()?;
         }
 
-        self.apply_leveled_result(task, new_ssts);
+        self.apply_leveled_result(task, new_ssts)?;
         let old_ssts = task.upper_ssts.iter().chain(task.lower_ssts.iter());
         self.remove_sst_files(old_ssts)
     }
@@ -456,7 +469,8 @@ impl LsmStorage {
     /// `new_ssts` 是要放进下层的文件，按 key 排好、互不重叠，可以是空的（全部被删除）：
     /// 合并时是新写出的文件；trivial move 时就是 `task.upper_ssts` 按首 key 排好。
     ///
-    /// 步骤（与冻结、flush 一样，先拿 `state_lock` 排队，在当前状态的副本上改，再换指针）：
+    /// 步骤（与冻结、flush 一样，先拿 `state_lock` 排队，在当前状态的副本上改，记进 manifest，
+    /// 再换指针；trivial move 记成"去掉这几个文件、把它们放进下层"）：
     ///
     /// 1. 上层按编号拿掉 `task.upper_ssts`，其余文件顺序不变。上层是 L0 时，合并期间 flush
     ///    可能在前面加了新文件，它们留下。拿掉的个数不对时 panic：
@@ -470,10 +484,12 @@ impl LsmStorage {
     ///
     /// L1 往下的层只由 compaction 改动，而 compaction 同一时刻只有一个，所以第 1、2 步里
     /// 任务记下的文件此时应当都还在。
-    fn apply_leveled_result(&self, task: &LeveledTask, new_ssts: Vec<Arc<SsTable>>) {
-        let _state_lock = self.state_lock.lock().unwrap();
-        let mut guard = self.state.write().unwrap();
-        let mut new_state = guard.as_ref().clone();
+    fn apply_leveled_result(&self, task: &LeveledTask, new_ssts: Vec<Arc<SsTable>>) -> Result<()> {
+        let mut manifest = self.state_lock.lock().unwrap();
+        let mut new_state = self.snapshot().as_ref().clone();
+        let removed = task.upper_ssts.iter().chain(task.lower_ssts.iter());
+        let placement = Placement::Level(task.lower_level);
+        let edit = self.version_edit(removed, &new_ssts, placement);
 
         // 上层：只拿掉参加了合并的文件。L0 里合并期间新 flush 出的、Ln 里没被挑中的留下。
         let upper = if task.upper_level == 0 {
@@ -497,7 +513,7 @@ impl LsmStorage {
                 task.lower_level
             );
         }
-        *guard = Arc::new(new_state);
+        self.commit_state(&mut manifest, new_state, edit)
     }
 }
 
@@ -530,8 +546,8 @@ fn remove_compacted_ssts(files: &mut Vec<Arc<SsTable>>, inputs: &[Arc<SsTable>],
 mod tests {
     use super::super::LsmStorageOptions;
     use super::super::tests::{
-        TestStorage, add_l0_sst, get_str, open_with_options, open_without_auto_freeze, scan_all,
-        set_level_ssts,
+        TestStorage, add_l0_sst, assert_manifest_matches_state, get_str, open_with_options,
+        open_without_auto_freeze, scan_all, set_level_ssts, state_ids,
     };
     use super::*;
     use crate::compaction::leveled::LeveledOptions;
@@ -539,7 +555,7 @@ mod tests {
     use crate::compaction::tiered::TieredOptions;
     use crate::iterators::StorageIterator;
     use crate::iterators::vec_iterator::{collect_all, expected};
-    use crate::test_util::run_with_deadline;
+    use crate::test_util::{run_with_deadline, run_with_slow_deadline};
     use std::ops::Bound;
 
     // 测试里手工写的 SST 编号从 101 起，避开引擎自己分配的编号（从 1 开始）：
@@ -880,7 +896,9 @@ mod tests {
             flush_records(&storage, &[("a", "newer")]);
             let flushed_during = Arc::clone(&storage.snapshot().l0_sstables[0]);
 
-            storage.apply_full_compaction_result(&l0_inputs, &level_inputs, new_ssts.clone());
+            storage
+                .apply_full_compaction_result(&l0_inputs, &level_inputs, new_ssts.clone())
+                .unwrap();
 
             let state = storage.snapshot();
             assert_eq!(state.l0_sstables.len(), 1);
@@ -1005,7 +1023,7 @@ mod tests {
         output: Vec<Arc<SsTable>>,
     ) -> TestStorage {
         run_with_deadline("apply_simple_leveled_result", move || {
-            storage.apply_simple_leveled_result(&task, output);
+            storage.apply_simple_leveled_result(&task, output).unwrap();
             storage
         })
     }
@@ -1242,8 +1260,8 @@ mod tests {
 
     /// 反复写入、flush、合并到停下，共 `rounds` 轮：每轮随机写入 20 条（约四分之一是删除）
     /// 并 flush 成一个文件，然后反复调用 `compact_once` 直到没有任务。每一轮之后检查读到的
-    /// 与一个 BTreeMap 模型相同、目录里的文件正好是状态里的文件、没有要做的任务，
-    /// 再调用 `check` 做各策略自己的检查（参数是引擎与轮次）。
+    /// 与一个 BTreeMap 模型相同、目录里的文件正好是状态里的文件、manifest 重放出的文件列表
+    /// 与状态相同、没有要做的任务，再调用 `check` 做各策略自己的检查（参数是引擎与轮次）。
     fn random_rounds(storage: &TestStorage, rounds: usize, check: impl Fn(&TestStorage, usize)) {
         let mut model = std::collections::BTreeMap::new();
         // 固定种子的伪随机数，每次运行都一样。
@@ -1297,6 +1315,7 @@ mod tests {
                 names_of_whole_state(storage),
                 "第 {round} 轮"
             );
+            assert_manifest_matches_state(storage);
             assert!(!storage.has_pending_compaction(), "第 {round} 轮");
             check(storage, round);
         }
@@ -1306,7 +1325,7 @@ mod tests {
     // 形状满足策略；最底层里没有墓碑。
     #[test]
     fn repeated_compact_once_keeps_data_and_settles() {
-        run_with_deadline("反复 compact_once", || {
+        run_with_slow_deadline("反复 compact_once", || {
             let storage = open_with_strategy(CompactionOptions::SimpleLeveled(simple_options()));
             random_rounds(&storage, 30, |storage, round| {
                 let bottom = bottom_level(storage);
@@ -1391,7 +1410,7 @@ mod tests {
         output: Vec<Arc<SsTable>>,
     ) -> TestStorage {
         run_with_deadline("apply_tiered_result", move || {
-            storage.apply_tiered_result(&task, output);
+            storage.apply_tiered_result(&task, output).unwrap();
             storage
         })
     }
@@ -1543,7 +1562,7 @@ mod tests {
     // L0 一直是空的，停下时 tier 数不到 num_tiers，没有空的 tier。
     #[test]
     fn repeated_tiered_compact_once_keeps_data_and_settles() {
-        run_with_deadline("反复 tiered compact_once", || {
+        run_with_slow_deadline("反复 tiered compact_once", || {
             let num_tiers = 4;
             let storage = open_tiered(num_tiers);
             random_rounds(&storage, 60, |storage, round| {
@@ -1671,7 +1690,7 @@ mod tests {
         output: Vec<Arc<SsTable>>,
     ) -> TestStorage {
         run_with_deadline("apply_leveled_result", move || {
-            storage.apply_leveled_result(&task, output);
+            storage.apply_leveled_result(&task, output).unwrap();
             storage
         })
     }
@@ -2081,7 +2100,7 @@ mod tests {
     // 目录里的文件正好是状态里的；L0 一直直接并进最底层，上面两层始终是空的。
     #[test]
     fn repeated_leveled_compact_once_goes_straight_to_the_bottom() {
-        run_with_deadline("反复 leveled compact_once", || {
+        run_with_slow_deadline("反复 leveled compact_once", || {
             let options = leveled_options();
             let trigger = options.level0_file_num_compaction_trigger;
             let storage = open_leveled(options);
@@ -2099,7 +2118,7 @@ mod tests {
     // 目录里的文件正好是状态里的，每层都是一个 sorted run；有的轮次停下时不止一层有文件。
     #[test]
     fn repeated_leveled_compact_once_uses_several_levels() {
-        run_with_deadline("反复 leveled compact_once（多层）", || {
+        run_with_slow_deadline("反复 leveled compact_once（多层）", || {
             let options = LeveledOptions {
                 level0_file_num_compaction_trigger: 2,
                 level_size_multiplier: 2,
@@ -2128,5 +2147,81 @@ mod tests {
 
         assert_eq!(storage.l0_sstable_count(), 0);
         assert_eq!(records_of(&bottom_level(&storage)), expected(&[("a", "1")]));
+    }
+
+    // ---------- 重启：各策略换过状态之后 ----------
+
+    /// 重启前后的状态与读到的数据相同：L0 与 tier 的顺序、各层里文件的顺序（重启时按首 key
+    /// 重新排好）都一样。返回重启之后的引擎。
+    fn reopen_and_compare(storage: TestStorage) -> TestStorage {
+        let ids_before = state_ids(&storage);
+        let data_before = scan_all(&storage);
+        let storage = storage.reopen();
+        assert_eq!(state_ids(&storage), ids_before);
+        assert_eq!(scan_all(&storage), data_before);
+        assert_eq!(storage.sst_file_names(), names_of_whole_state(&storage));
+        storage
+    }
+
+    // 每种策略反复写入、合并之后重启，状态与数据都与重启前相同；再做一次全量合并、重启，
+    // 同样相同。leveled 有两组参数：只用最底层（L0 的文件常被直接挪下去），与用好几层。
+    #[test]
+    fn reopen_restores_the_state_of_every_strategy() {
+        let strategies = vec![
+            CompactionOptions::SimpleLeveled(simple_options()),
+            CompactionOptions::Tiered(TieredOptions {
+                num_tiers: 4,
+                max_size_amplification_percent: 200,
+                size_ratio: 1,
+                min_merge_width: 2,
+                max_merge_width: None,
+            }),
+            CompactionOptions::Leveled(leveled_options()),
+            CompactionOptions::Leveled(LeveledOptions {
+                level0_file_num_compaction_trigger: 2,
+                level_size_multiplier: 2,
+                base_level_size_bytes: 1,
+            }),
+        ];
+        for compaction in strategies {
+            run_with_slow_deadline("各策略重启", move || {
+                let storage = open_with_strategy(compaction);
+                random_rounds(&storage, 30, |_storage, _round| {});
+                let storage = reopen_and_compare(storage);
+                // 分层时 L0 是空的全量合并什么也不做：先 flush 一个文件，让它真的合并。
+                flush_records(&storage, &[("key-000", "last"), ("key-999", "last")]);
+                let storage = full_compaction(storage);
+                assert_eq!(storage.l0_sstable_count(), 0);
+                assert_manifest_matches_state(&storage);
+                reopen_and_compare(storage);
+            });
+        }
+    }
+
+    // manifest 只记"放进哪一层"，不记层内的位置：leveled 把文件插到层的中间时，记录的先后
+    // 与 key 的先后不同。重启时按首 key 重新排，各层的顺序与重启前相同。
+    #[test]
+    fn reopen_sorts_each_level_by_first_key() {
+        let storage = open_leveled(LeveledOptions {
+            level0_file_num_compaction_trigger: 1,
+            ..leveled_options()
+        });
+        // 三批互不重叠的 key，先 m、再 a、最后 x：每批都被原样挪进最底层，插在按 key 的位置。
+        for batch in ["m", "a", "x"] {
+            let first = format!("{batch}1");
+            let second = format!("{batch}2");
+            flush_records(&storage, &[(first.as_str(), "v"), (second.as_str(), "v")]);
+            while storage.compact_once().unwrap() {}
+        }
+        let bottom_first_keys: Vec<Vec<u8>> = storage.snapshot().levels[2]
+            .iter()
+            .map(|sst| sst.first_key().to_vec())
+            .collect();
+        assert_eq!(
+            bottom_first_keys,
+            vec![b"a1".to_vec(), b"m1".to_vec(), b"x1".to_vec()]
+        );
+
+        reopen_and_compare(storage);
     }
 }

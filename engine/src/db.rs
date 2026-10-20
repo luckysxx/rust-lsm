@@ -323,7 +323,7 @@ mod tests {
     use crate::compaction::tiered::TieredOptions;
     use crate::iterators::vec_iterator::{collect_all, expected};
     use crate::table::{FileObject, SsTable, SsTableIterator};
-    use crate::test_util::{run_with_deadline, wait_until};
+    use crate::test_util::{run_with_deadline, run_with_slow_deadline, wait_until};
 
     /// 长到测试期间不会到点：用它时，后台线程只可能是被信号叫醒的。
     const NEVER: Duration = Duration::from_secs(3600);
@@ -1053,11 +1053,13 @@ mod tests {
         keeps_data_readable_while_compacting(leveled_options());
     }
 
-    /// 几个线程同时写入和读，后台按 `compaction` 同时在 flush 和合并，最后关闭并检查。
+    /// 几个线程同时写入和读，后台按 `compaction` 同时在 flush 和合并，最后关闭并检查；
+    /// 再在同一个目录里重新打开，状态与数据都与关闭时相同（flush 与合并交错着往 manifest
+    /// 追加记录，重放的结果仍是最后的状态）。
     /// 整个过程设了时限：几把锁的先后顺序出错时，测试报"卡住"而不是停在那里。
     fn keeps_data_readable_while_compacting(compaction: CompactionOptions) {
-        run_with_deadline("写入、flush 与后台合并同时进行", move || {
-            let db = TestDb::open_with_strategy(256, SOON, compaction);
+        run_with_slow_deadline("写入、flush 与后台合并同时进行", move || {
+            let mut db = TestDb::open_with_strategy(256, SOON, compaction.clone());
             let writers = 4;
             let puts_per_writer = 500;
 
@@ -1084,7 +1086,27 @@ mod tests {
             ids.sort();
             let names_in_state: Vec<String> = ids.iter().map(|id| format!("{id:05}.sst")).collect();
             assert_eq!(sst_file_names(db.dir()), names_in_state);
+
+            // 重新打开。两个后台线程只在收到信号时醒来，比较之前不会改动状态。
+            let ids_before = state_ids(&db.storage);
+            let data_before = db.scan_all();
+            assert!(db.drop_db());
+            let mut options = options_with_limit(256);
+            options.compaction = compaction;
+            let reopened = Db::open_with_intervals(db.dir(), options, NEVER, NEVER).unwrap();
+            db.db = Some(Arc::new(reopened));
+            assert_eq!(state_ids(&db.storage), ids_before);
+            assert_eq!(db.scan_all(), data_before);
         });
+    }
+
+    /// 状态里各处的文件编号：L0（新的在前），以及 L1 往下各层（或各个 tier）。
+    fn state_ids(storage: &LsmStorage) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let snapshot = storage.snapshot();
+        let ids_of =
+            |ssts: &[Arc<SsTable>]| -> Vec<usize> { ssts.iter().map(|sst| sst.id()).collect() };
+        let levels = snapshot.levels.iter().map(|level| ids_of(level)).collect();
+        (ids_of(&snapshot.l0_sstables), levels)
     }
 
     // 关闭：可写的表里的数据也被写成 SST。直接读文件核对，墓碑也在里面。

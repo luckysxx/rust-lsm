@@ -13,10 +13,19 @@ use std::time::{Duration, Instant};
 /// 最长等待时间。正常情况下几毫秒就够，只有出错时才会等满。
 pub const DEADLINE: Duration = Duration::from_secs(5);
 
+/// 要同步几百次文件的测试用的最长等待时间。每次换状态都要同步 SST、目录与 manifest，
+/// 所有测试一起跑、磁盘很忙的时候，一次同步可能要几十毫秒，5 秒不够；卡住时照样会超时。
+pub const SLOW_DEADLINE: Duration = Duration::from_secs(30);
+
 /// 反复检查 `condition`，直到它成立或者超过最长等待时间。返回它最后有没有成立。
 pub fn wait_until(condition: impl Fn() -> bool) -> bool {
+    wait_until_within(DEADLINE, condition)
+}
+
+/// 与 `wait_until` 相同，最长等待时间由调用方给出。
+fn wait_until_within(limit: Duration, condition: impl Fn() -> bool) -> bool {
     let start = Instant::now();
-    while start.elapsed() < DEADLINE {
+    while start.elapsed() < limit {
         if condition() {
             return true;
         }
@@ -33,12 +42,29 @@ pub fn run_with_deadline<T: Send + 'static>(
     what: &str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> T {
+    run_within(what, DEADLINE, work)
+}
+
+/// 与 `run_with_deadline` 相同，最长等待时间是 `SLOW_DEADLINE`：给要同步几百次文件的测试用。
+pub fn run_with_slow_deadline<T: Send + 'static>(
+    what: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    run_within(what, SLOW_DEADLINE, work)
+}
+
+/// 在另一个线程里执行 `work`，超过 `limit` 还没结束，测试失败。
+fn run_within<T: Send + 'static>(
+    what: &str,
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
     let handle = thread::spawn(work);
-    let finished = wait_until(|| handle.is_finished());
+    let finished = wait_until_within(limit, || handle.is_finished());
     assert!(
         finished,
         "{what}没有在 {} 秒内结束，很可能卡住了",
-        DEADLINE.as_secs()
+        limit.as_secs()
     );
     match handle.join() {
         Ok(result) => result,
