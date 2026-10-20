@@ -2036,6 +2036,34 @@ mod tests {
         assert_eq!(get_str(&storage, "a"), Some("2".to_string()));
     }
 
+    // L1 有一个 key 的旧值，基准层是最底层 L3；L0 达到触发值时要并进 L1，
+    // 不能跳过 L1 落进 L3，否则点查先查到 L1 里的旧值。
+    #[test]
+    fn leveled_l0_does_not_skip_a_level_with_data() {
+        let storage = open_leveled(leveled_options());
+        // 手工把一个文件挪进 L1：基准层是最底层，策略自己不会往 L1 放数据。
+        flush_records(&storage, &[("k", "old")]);
+        let old_id = storage.snapshot().l0_sstables[0].id();
+        let task = leveled_task(&storage, (0, &[old_id]), (1, &[]));
+        let (storage, task, output) = merge_leveled(storage, task);
+        let storage = apply_leveled_with_deadline(storage, task, output);
+        assert_eq!(level_ids(&storage.snapshot().levels[0]), vec![old_id]);
+
+        flush_records(&storage, &[("k", "new")]);
+        flush_records(&storage, &[("z", "1")]);
+        let storage = run_with_deadline("compact_once", move || {
+            assert!(storage.compact_once().unwrap());
+            storage
+        });
+
+        assert_eq!(get_str(&storage, "k"), Some("new".to_string()));
+        let state = storage.snapshot();
+        assert!(state.l0_sstables.is_empty());
+        assert!(!state.levels[0].is_empty());
+        assert!(state.levels[2].is_empty());
+        assert_eq!(scan_all(&storage), expected(&[("k", "new"), ("z", "1")]));
+    }
+
     /// 每一轮之后 leveled 的形状检查：L0 不到触发值，L1 往下每层都是一个 sorted run。
     fn check_leveled_shape(storage: &TestStorage, round: usize, trigger: usize) {
         let snapshot = storage.snapshot();

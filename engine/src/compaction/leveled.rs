@@ -120,7 +120,9 @@ fn base_level(targets: &[u64]) -> usize {
 ///
 /// `level_sizes` 与 `target_sizes` 的参数相同：L1 往下各层的实际大小，最后一项是最底层。
 ///
-/// 1. L0 的文件数达到触发值：返回 `(0, 基准层)`。
+/// 1. L0 的文件数达到触发值：返回 `(0, n)`，n 是基准层与第一个有数据的层中更靠上的那个。
+///    基准层上面有数据时（数据变少、基准层下移之后留下的，或从简单分层换过来的）
+///    不能跳过它：L0 的新值落到它下面，点查会先查到它里面的旧值。
 /// 2. 否则看 L1 到倒数第二层（最底层没有下一层，不参加），分数 = 实际 ÷ 目标，
 ///    只有大于 1 的层可以选；取分数最大的那层 n，返回 `(n, n + 1)`。分数相同时取上面的层。
 ///    目标是 0 却有数据的层（数据变少、基准层下移之后留下的）分数算作无穷大；
@@ -135,6 +137,11 @@ fn pick_levels(
     let targets = target_sizes(options, level_sizes);
     let base_level = base_level(&targets);
     if l0_file_count >= options.level0_file_num_compaction_trigger {
+        // 第一个有数据的层在 `level_sizes` 里的下标，第 0 项是 L1。
+        let first_non_empty_index = level_sizes.iter().position(|&size| size > 0);
+        if let Some(index) = first_non_empty_index {
+            return Some((0, base_level.min(index + 1)));
+        }
         return Some((0, base_level));
     }
     let level_count = level_sizes.len();
@@ -366,6 +373,19 @@ mod tests {
             pick_levels(&options(), 3, &[0, 16, 160, 1600]),
             Some((0, 2))
         );
+    }
+
+    // L0 达到触发值，基准层上面却有数据的层（数据变少、基准层下移后留下的，或从简单分层
+    // 换过来的）：并进第一个有数据的层，不能跳过它。跳过的话，L0 的新值落在它下面，
+    // 点查先查到它里面的旧值。
+    #[test]
+    fn l0_does_not_skip_a_level_with_data() {
+        // 基准层是 L3，L1 有数据：并进 L1。
+        assert_eq!(pick_levels(&options(), 2, &[5, 0, 11, 116]), Some((0, 1)));
+        // 基准层是 L3，L2 有数据：并进 L2。
+        assert_eq!(pick_levels(&options(), 2, &[0, 30, 100, 116]), Some((0, 2)));
+        // 第一个有数据的层在基准层下面（L3 空着、L4 有数据）：照样并进基准层 L3。
+        assert_eq!(pick_levels(&options(), 2, &[0, 0, 0, 116]), Some((0, 3)));
     }
 
     // L0 达到触发值，同时 L3 远超目标：先做 L0。
