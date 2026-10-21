@@ -315,13 +315,13 @@ mod tests {
     // 来源换成 memtable 的游标也一样：较新的表里的值与墓碑胜出。
     #[test]
     fn merge_works_over_memtable_iterators() {
-        let newer = MemTable::new();
-        newer.put(b"b", b"");
-        newer.put(b"c", b"4");
-        let older = MemTable::new();
-        older.put(b"a", b"1");
-        older.put(b"b", b"2");
-        older.put(b"c", b"3");
+        let newer = MemTable::new(0);
+        newer.put(b"b", b"").unwrap();
+        newer.put(b"c", b"4").unwrap();
+        let older = MemTable::new(0);
+        older.put(b"a", b"1").unwrap();
+        older.put(b"b", b"2").unwrap();
+        older.put(b"c", b"3").unwrap();
 
         let iters = vec![
             MemTableIterator::new(Arc::new(newer), Bound::Unbounded, Bound::Unbounded),

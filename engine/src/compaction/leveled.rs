@@ -494,7 +494,7 @@ mod tests {
     /// 一份只有 SST 的状态：`l0` 是 L0 的文件（新的在前），`levels[i]` 是 L(i+1) 的。
     fn state_with(dir: &tempfile::TempDir, l0: &[Spec], levels: &[&[Spec]]) -> LsmStorageState {
         LsmStorageState {
-            memtable: Arc::new(MemTable::new()),
+            memtable: Arc::new(MemTable::new(0)),
             imm_memtables: Vec::new(),
             l0_sstables: ssts(dir, l0),
             levels: levels.iter().map(|specs| ssts(dir, specs)).collect(),

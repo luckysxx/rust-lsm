@@ -27,8 +27,12 @@ pub enum Command {
     /// `compact`：把全部 SST 合并成一个 sorted run：分层时放进最底层，tiered 时成为唯一的 tier。
     Compact,
     /// `status`：冻结的 memtable 个数、L0 与各层（tiered 时是各 tier）的 SST 个数、块缓存的用量，
-    /// 以及目录里的 SST 文件。
+    /// 以及目录里的 SST 与 WAL 文件。
     Status,
+    /// `sync`：把 WAL 同步到磁盘，之前的写入断电也不丢。
+    Sync,
+    /// `crash`：立刻结束进程，不关闭数据库，模拟一次崩溃。下次打开时从 WAL 恢复。
+    Crash,
     /// `help`：列出所有命令。
     Help,
     /// `quit`：关闭数据库并退出。
@@ -36,8 +40,8 @@ pub enum Command {
 }
 
 /// 所有的命令名。用来区分"不认识的命令"和"认识的命令、参数个数不对"。
-const COMMAND_NAMES: [&str; 9] = [
-    "put", "get", "delete", "scan", "fill", "compact", "status", "help", "quit",
+const COMMAND_NAMES: [&str; 11] = [
+    "put", "get", "delete", "scan", "fill", "compact", "status", "sync", "crash", "help", "quit",
 ];
 
 /// `help` 打印的内容。
@@ -48,7 +52,9 @@ delete KEY           删除一个 key
 scan [LOWER [UPPER]] 按 key 从小到大列出记录，包含 LOWER、不包含 UPPER
 fill COUNT           写入 COUNT 条 key-000000 = value-000000 这样的记录
 compact              把全部 SST 合并成一个 sorted run（分层时在最底层，tiered 时是唯一的 tier）
-status               冻结的 memtable 个数、各层或各 tier 的 SST 个数、块缓存的用量、目录里的 SST 文件
+status               冻结的 memtable 个数、各层或各 tier 的 SST 个数、块缓存的用量、目录里的 SST 与 WAL 文件
+sync                 把 WAL 同步到磁盘：之前的写入断电也不丢
+crash                立刻结束进程、不关闭数据库，模拟崩溃；下次打开时从 WAL 恢复
 help                 显示本说明
 quit                 关闭数据库并退出（Ctrl-D 也一样）";
 
@@ -89,6 +95,8 @@ pub fn parse(line: &str) -> anyhow::Result<Command> {
             Command::Fill { count }
         }
         ["status"] => Command::Status,
+        ["sync"] => Command::Sync,
+        ["crash"] => Command::Crash,
         ["help"] => Command::Help,
         ["quit"] => Command::Quit,
         ["compact"] => Command::Compact,
@@ -139,6 +147,8 @@ mod tests {
         assert_eq!(parse("fill 100").unwrap(), Command::Fill { count: 100 });
         assert_eq!(parse("status").unwrap(), Command::Status);
         assert_eq!(parse("compact").unwrap(), Command::Compact);
+        assert_eq!(parse("sync").unwrap(), Command::Sync);
+        assert_eq!(parse("crash").unwrap(), Command::Crash);
         assert_eq!(parse("help").unwrap(), Command::Help);
         assert_eq!(parse("quit").unwrap(), Command::Quit);
     }
@@ -209,6 +219,8 @@ mod tests {
             "fill",
             "status now",
             "compact now",
+            "sync now",
+            "crash now",
             "quit now",
         ] {
             let message = parse_error(line);

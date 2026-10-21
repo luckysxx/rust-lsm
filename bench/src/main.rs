@@ -41,6 +41,8 @@ const USAGE: &str = "\
   --tier-size-ratio N  tiered 策略下，下一个 tier 比前面之和大出百分之几才算大得多（默认 1）
   --min-merge-width N  tiered 策略下，按大小比例至少合并几个 tier（默认 2）
   --max-merge-width N  tiered 策略下，减少段数时最多合并几个 tier；0 表示不限（默认 0）
+  --wal MODE         被测对象为 engine 时的 WAL：off（不写 WAL）、on（每次写入追加到 WAL，
+                     不同步）、sync（每次写入追加并同步，返回时已落盘）（默认 off）
   --help             显示本说明
 
 负载：fillseq（按顺序写）、fillrandom、overwrite、readrandom、readmissing、seekrandom（范围扫描）、
@@ -70,6 +72,8 @@ struct Args {
     level_multiplier: u64,
     /// 0 表示取 memtable 上限 × L0 触发值，见 `base_level_megabytes`。
     base_level_mb: usize,
+    /// `off`、`on` 或 `sync`。
+    wal: String,
 }
 
 impl Args {
@@ -137,6 +141,8 @@ impl Args {
             block_cache_size: self.block_cache_megabytes * 1024 * 1024,
             max_levels: self.max_levels,
             compaction,
+            enable_wal: self.wal != "off",
+            sync_writes: self.wal == "sync",
         }
     }
 }
@@ -164,6 +170,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     let mut max_merge_width = 0;
     let mut level_multiplier = 10;
     let mut base_level_mb = 0;
+    let mut wal = "off".to_string();
 
     let mut index = 0;
     while index < raw.len() {
@@ -198,6 +205,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--max-merge-width" => max_merge_width = parse_number(flag, value)? as usize,
             "--level-multiplier" => level_multiplier = parse_number(flag, value)?,
             "--base-level-mb" => base_level_mb = parse_number(flag, value)? as usize,
+            "--wal" => wal = value.clone(),
             _ => return Err(format!("不认识的选项：{flag}")),
         }
         index += 2;
@@ -242,6 +250,9 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     if level_multiplier < 2 {
         return Err("--level-multiplier 必须至少为 2".to_string());
     }
+    if !["off", "on", "sync"].contains(&wal.as_str()) {
+        return Err(format!("--wal 应当是 off、on 或 sync，实际是 {wal}"));
+    }
     Ok(Some(Args {
         config,
         workloads,
@@ -259,6 +270,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         max_merge_width,
         level_multiplier,
         base_level_mb,
+        wal,
     }))
 }
 
@@ -325,7 +337,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("- 被测对象说明：{details}");
     }
     println!(
-        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} {} --wal {} --workloads {}`",
         args.target,
         config.threads,
         config.num,
@@ -336,6 +348,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         args.block_cache_megabytes,
         args.max_levels,
         args.compaction_flags(),
+        args.wal,
         workload_names.join(",")
     );
     println!(
@@ -385,17 +398,19 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     // 空间放大的分母：全部 key 各一份的大小。基准里没有删除，写满之后 key 的个数不变。
     let live_bytes = args.config.num * (KEY_SIZE + args.config.value_size) as u64;
     println!(
-        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 / … 的 SST | 结束时 SST 的总字节 | 空间放大 |"
+        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 其中 WAL (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 / … 的 SST | 结束时 SST 的总字节 | 空间放大 |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     let mut total_user_bytes = 0;
     let mut total_disk_bytes = 0;
+    let mut total_wal_bytes = 0;
     for result in results {
         let Some(stats) = result.stats else {
             continue;
         };
         total_user_bytes += stats.user_bytes_written;
         total_disk_bytes += stats.disk_bytes_written();
+        total_wal_bytes += stats.wal_bytes_written;
         let (layout, total_bytes, space_amplification) = match &result.sst_layout {
             Some(layout) => (
                 format!("{} / {}", layout.l0_files, join_counts(&layout.level_files)),
@@ -405,10 +420,11 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
             None => ("—".to_string(), "—".to_string(), "—".to_string()),
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             result.workload.name(),
             stats.user_bytes_written,
             stats.disk_bytes_written(),
+            stats.wal_bytes_written,
             ratio(stats.write_amplification()),
             ratio(stats.tables_probed_per_get()),
             ratio(stats.tables_skipped_by_bloom_per_get()),
@@ -425,7 +441,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         Some(total_disk_bytes as f64 / total_user_bytes as f64)
     };
     println!(
-        "| 合计 | {total_user_bytes} | {total_disk_bytes} | {} | — | — | — | — | — | — |",
+        "| 合计 | {total_user_bytes} | {total_disk_bytes} | {total_wal_bytes} | {} | — | — | — | — | — | — |",
         ratio(total_write_amplification)
     );
     println!();
@@ -480,6 +496,23 @@ mod tests {
         ));
         assert_eq!(args.target, "btreemap");
         assert_eq!(args.workloads, Workload::DEFAULT.to_vec());
+        assert_eq!(args.wal, "off");
+        assert!(!args.engine_config().enable_wal);
+    }
+
+    // --wal 的三种取值分别对应不写 WAL、写不同步、写并同步；其他取值是错误。
+    #[test]
+    fn wal_flag_selects_the_mode() {
+        let config_of = |mode: &str| {
+            let args = parse_args(&strings(&["--wal", mode])).unwrap().unwrap();
+            let config = args.engine_config();
+            (config.enable_wal, config.sync_writes)
+        };
+
+        assert_eq!(config_of("off"), (false, false));
+        assert_eq!(config_of("on"), (true, false));
+        assert_eq!(config_of("sync"), (true, true));
+        assert!(parse_args(&strings(&["--wal", "always"])).is_err());
     }
 
     // 命令行选项能覆盖各个默认值。

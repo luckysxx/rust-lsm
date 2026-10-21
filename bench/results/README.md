@@ -19,7 +19,7 @@ cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md
 
 ## 比较两次结果的条件
 
-- 同一台机器、同样的电源状态，参数行（`--target`、`--threads`、`--num`、`--value-size`、`--seed`、`--scan-length`、`--memtable-mb`、`--block-cache-mb`、`--max-levels`、`--compaction` 与所选策略的参数、`--workloads`）除了要比较的那一项之外完全相同。
+- 同一台机器、同样的电源状态，参数行（`--target`、`--threads`、`--num`、`--value-size`、`--seed`、`--scan-length`、`--memtable-mb`、`--block-cache-mb`、`--max-levels`、`--compaction` 与所选策略的参数、`--wal`、`--workloads`）除了要比较的那一项之外完全相同。
 - 都是 release 编译，工具链相同。
 - 差距小于同一版本重复运行的浮动（目前约一成）时，不能当作结论。
 
@@ -38,3 +38,4 @@ cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md
 | [2026-10-18-tiered-compaction.md](2026-10-18-tiered-compaction.md) | tiered 与简单分层的对比：整次运行的写放大从 5.4 降到 2～2.6，合并跟得上写入；读与空间取决于停下时剩几个 tier，7 个 tier 时查不存在的 key 慢一半、扫描慢到三分之一 |
 | [2026-10-19-leveled-compaction.md](2026-10-19-leveled-compaction.md) | leveled 与简单分层、tiered 的对比：穿过空层的复制消失（4 层与 2 层相同），整次运行的写放大 4.3，介于两者之间；读与空间接近简单分层；顺序写入时让互不重叠的 L0 文件一起挪，写放大从 1.87 降到 0.95；一千万条时规律不变 |
 | [2026-10-20-manifest.md](2026-10-20-manifest.md) | manifest 的前后对比（接电源）：吞吐与放大基本不变，每次换状态多一次 `F_FULLFSYNC`（约 3 毫秒），在 `state_lock` 里，写入的最大延迟从几十微秒变成几毫秒；冻结极频繁时吞吐低三成；写完之后等后台每条记录多约 3 毫秒 |
+| [2026-10-21-wal.md](2026-10-21-wal.md) | WAL 的代价（电池供电）：每次写入多一次 `write`（约 1 µs），单线程写入慢五到七倍，写放大多 1.10；不合并时读不变；有合并时写入变慢让合并跟得上，形状改变，SST 的写放大与读也跟着变；每次都同步时每秒 362 次；真实进程崩溃（SIGKILL）后完成了的写入一条不少 |

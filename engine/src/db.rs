@@ -23,7 +23,7 @@ use bytes::Bytes;
 
 use crate::compaction::CompactionOptions;
 use crate::error::Result;
-use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator};
+use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator, WriteOptions};
 use crate::stats::StatsSnapshot;
 
 /// flush 线程等信号的最长时间。等满这么久还没有信号，它也会检查一次有没有冻结的
@@ -116,20 +116,40 @@ impl Db {
         })
     }
 
-    /// 写入一条记录。key 与 value 都不能为空。
-    pub fn put(&self, key: &[u8], value: &[u8]) {
-        let froze = self.storage.put(key, value);
-        if froze {
-            self.wake_flush_thread();
-        }
+    /// 写入一条记录，用默认的选项（不同步）。key 与 value 都不能为空。
+    ///
+    /// key 或 value 超过长度上限时返回 [`crate::error::Error::InvalidArgument`]，
+    /// 追加 WAL 失败时返回 [`crate::error::Error::Io`]。
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_opt(key, value, WriteOptions::default())
     }
 
-    /// 删除一个 key。
-    pub fn delete(&self, key: &[u8]) {
-        let froze = self.storage.delete(key);
+    /// 删除一个 key，用默认的选项。
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.delete_opt(key, WriteOptions::default())
+    }
+
+    /// 写入一条记录，选项由调用方给：`sync` 为真时返回之前 WAL 已落盘。
+    pub fn put_opt(&self, key: &[u8], value: &[u8], options: WriteOptions) -> Result<()> {
+        let froze = self.storage.put_opt(key, value, options)?;
         if froze {
             self.wake_flush_thread();
         }
+        Ok(())
+    }
+
+    /// 删除一个 key，选项由调用方给。
+    pub fn delete_opt(&self, key: &[u8], options: WriteOptions) -> Result<()> {
+        let froze = self.storage.delete_opt(key, options)?;
+        if froze {
+            self.wake_flush_thread();
+        }
+        Ok(())
+    }
+
+    /// 把 WAL 同步到磁盘：返回之后，之前完成的写入断电也不会丢。没开 WAL 时什么都不做。
+    pub fn sync(&self) -> Result<()> {
+        self.storage.sync()
     }
 
     /// 查找一个 key；不存在或已被删除时返回 `None`。
@@ -191,8 +211,9 @@ impl Db {
 
     /// 关闭数据库：停下后台线程，把还在内存里的数据全部写成 SST。
     ///
-    /// 目前没有 WAL，memtable 里的数据只在内存里。正常退出前必须调用这个方法，
-    /// 否则最后写入的那部分数据就丢了。
+    /// 没开 WAL 时，memtable 里的数据只在内存里，正常退出前必须调用这个方法，否则最后写入的
+    /// 那部分数据就丢了。开了 WAL 时不调用也不丢（下次打开时重放 WAL），调用之后下次打开
+    /// 不用重放，WAL 也随 flush 删掉。
     ///
     /// 不管成功还是失败，返回时后台线程都已经结束。compaction 线程正在合并时，
     /// 等它把手上这个任务做完。写文件失败时返回错误，没写成的数据仍然留在内存里、
@@ -207,7 +228,7 @@ impl Db {
         // 再停 flush：从这里往后，做 flush 的只有当前这个线程。
         stop_thread(&self.flush_thread, &self.flush_sender, "flush");
         // 可写的那张表里也有数据，冻结之后才能 flush。
-        self.storage.freeze_memtable();
+        self.storage.freeze_memtable()?;
         self.storage.flush_all_imm_memtables()
     }
 
@@ -338,6 +359,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         }
     }
 
@@ -427,8 +449,8 @@ mod tests {
 
         /// 写入一条记录然后冻结，不通知线程。
         fn put_and_freeze(&self, key: &str, value: &str) {
-            self.storage.put(key.as_bytes(), value.as_bytes());
-            self.storage.freeze_memtable();
+            self.storage.put(key.as_bytes(), value.as_bytes()).unwrap();
+            self.storage.freeze_memtable().unwrap();
         }
     }
 
@@ -585,8 +607,8 @@ mod tests {
 
         /// 写入一条记录，冻结并 flush 成一个 L0 文件。在测试自己的线程里做，不经过后台线程。
         fn flush_one_file(&self, key: &str, value: &str) {
-            self.storage.put(key.as_bytes(), value.as_bytes());
-            self.storage.freeze_memtable();
+            self.storage.put(key.as_bytes(), value.as_bytes()).unwrap();
+            self.storage.freeze_memtable().unwrap();
             self.storage.flush_all_imm_memtables().unwrap();
         }
 
@@ -841,11 +863,11 @@ mod tests {
     fn db_reads_what_was_written() {
         let db = TestDb::open(usize::MAX, SOON);
 
-        db.put(b"a", b"1");
-        db.put(b"b", b"2");
-        db.put(b"c", b"3");
-        db.put(b"a", b"11");
-        db.delete(b"b");
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"a", b"11").unwrap();
+        db.delete(b"b").unwrap();
 
         assert_eq!(db.get_str("a"), Some("11".to_string()));
         assert_eq!(db.get_str("b"), None);
@@ -859,7 +881,7 @@ mod tests {
         let db = TestDb::open(64, SOON);
 
         for i in 0..200 {
-            db.put(format!("key-{i:03}").as_bytes(), b"value");
+            db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
         }
 
         assert!(
@@ -880,11 +902,11 @@ mod tests {
         let db = TestDb::open(64, NEVER);
 
         for i in 0..50 {
-            db.put(format!("key-{i:03}").as_bytes(), b"value");
+            db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
         }
         // 删除也一样会叫醒。
         for i in 0..50 {
-            db.delete(format!("key-{i:03}").as_bytes());
+            db.delete(format!("key-{i:03}").as_bytes()).unwrap();
         }
 
         assert!(
@@ -906,7 +928,7 @@ mod tests {
                 scope.spawn(move || {
                     for i in 0..puts_per_writer {
                         let key = format!("w{writer}-{i:04}");
-                        db.put(key.as_bytes(), b"v");
+                        db.put(key.as_bytes(), b"v").unwrap();
                         // 不管它此刻在表里还是已经在文件里，都读得到。
                         assert_eq!(db.get_str(&key), Some("v".to_string()));
                     }
@@ -935,7 +957,7 @@ mod tests {
                     scope.spawn(move || {
                         for i in 0..puts_per_writer {
                             let key = format!("w{writer}-{i:04}");
-                            db.put(key.as_bytes(), b"v");
+                            db.put(key.as_bytes(), b"v").unwrap();
                             assert_eq!(db.get_str(&key), Some("v".to_string()));
                         }
                     });
@@ -966,7 +988,7 @@ mod tests {
         let db = TestDb::open_with_compaction(64, SOON);
 
         for i in 0..300 {
-            db.put(format!("key-{i:03}").as_bytes(), b"value");
+            db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
         }
 
         assert!(
@@ -989,7 +1011,7 @@ mod tests {
         let db = TestDb::open_with_strategy(64, SOON, tiered_options());
 
         for i in 0..300 {
-            db.put(format!("key-{i:03}").as_bytes(), b"value");
+            db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
         }
 
         assert!(
@@ -1009,8 +1031,8 @@ mod tests {
     fn has_pending_compaction_is_false_without_compaction_options() {
         let db = TestDb::open(usize::MAX, SOON);
         for key in ["a", "b", "c"] {
-            db.put(key.as_bytes(), b"v");
-            db.storage.freeze_memtable();
+            db.put(key.as_bytes(), b"v").unwrap();
+            db.storage.freeze_memtable().unwrap();
             db.storage.flush_all_imm_memtables().unwrap();
         }
 
@@ -1024,7 +1046,7 @@ mod tests {
         let db = TestDb::open(64, SOON);
 
         for i in 0..300 {
-            db.put(format!("key-{i:03}").as_bytes(), b"value");
+            db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
         }
 
         assert!(wait_until(|| db.imm_memtable_count() == 0));
@@ -1069,7 +1091,7 @@ mod tests {
                     scope.spawn(move || {
                         for i in 0..puts_per_writer {
                             let key = format!("w{writer}-{i:04}");
-                            db.put(key.as_bytes(), b"v");
+                            db.put(key.as_bytes(), b"v").unwrap();
                             assert_eq!(db.get_str(&key), Some("v".to_string()));
                         }
                     });
@@ -1113,9 +1135,9 @@ mod tests {
     #[test]
     fn close_writes_the_memtable_to_an_sst() {
         let db = TestDb::open(usize::MAX, SOON);
-        db.put(b"a", b"1");
-        db.put(b"b", b"2");
-        db.delete(b"c");
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.delete(b"c").unwrap();
 
         db.close().unwrap();
 
@@ -1135,11 +1157,11 @@ mod tests {
     fn close_flushes_frozen_memtables_and_the_memtable() {
         // 间隔极长，冻结时又绕过了 Db、不通知线程：关闭之前后台线程一张都不会写。
         let db = TestDb::open(usize::MAX, NEVER);
-        db.put(b"a", b"1");
-        db.storage.freeze_memtable();
-        db.put(b"b", b"2");
-        db.storage.freeze_memtable();
-        db.put(b"c", b"3");
+        db.put(b"a", b"1").unwrap();
+        db.storage.freeze_memtable().unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.storage.freeze_memtable().unwrap();
+        db.put(b"c", b"3").unwrap();
         assert_eq!(db.imm_memtable_count(), 2);
 
         db.close().unwrap();
@@ -1167,7 +1189,7 @@ mod tests {
     #[test]
     fn close_twice_is_fine() {
         let db = TestDb::open(usize::MAX, SOON);
-        db.put(b"a", b"1");
+        db.put(b"a", b"1").unwrap();
 
         db.close().unwrap();
         db.close().unwrap();
@@ -1195,7 +1217,7 @@ mod tests {
     #[test]
     fn close_reports_flush_error_and_can_be_retried() {
         let db = TestDb::open(usize::MAX, NEVER);
-        db.put(b"a", b"1");
+        db.put(b"a", b"1").unwrap();
         std::fs::remove_dir_all(db.dir()).unwrap();
 
         let result = db.close();
@@ -1247,5 +1269,48 @@ mod tests {
 
         // 只剩测试自己手里的这一份。
         assert_eq!(Arc::strong_count(&storage), 1);
+    }
+
+    // 开着 WAL，不 close 就释放（像进程被杀掉）：重新打开后数据都在；重放出的表由后台
+    // flush 线程写成 SST，它们的 WAL 随后删掉，只剩新表的 WAL。
+    #[test]
+    fn data_survives_drop_without_close_when_wal_is_enabled() {
+        run_with_deadline("不 close 就重开", || {
+            let dir = tempfile::tempdir().unwrap();
+            let options = LsmStorageOptions {
+                enable_wal: true,
+                ..options_with_limit(200)
+            };
+            let db = Db::open_with_intervals(dir.path(), options.clone(), NEVER, NEVER).unwrap();
+            for i in 0..50 {
+                db.put(format!("key-{i:03}").as_bytes(), b"value").unwrap();
+            }
+            db.delete(b"key-007").unwrap();
+            drop(db);
+
+            let db = Db::open_with_intervals(dir.path(), options, SOON, NEVER).unwrap();
+
+            for i in 0..50 {
+                let expected = if i == 7 {
+                    None
+                } else {
+                    Some(Bytes::from_static(b"value"))
+                };
+                assert_eq!(db.get(format!("key-{i:03}").as_bytes()).unwrap(), expected);
+            }
+            assert!(
+                wait_until(|| db.imm_memtable_count() == 0),
+                "重放出的表没有被 flush"
+            );
+            let wal_count = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| {
+                    let name = entry.as_ref().unwrap().file_name();
+                    name.to_string_lossy().ends_with(".wal")
+                })
+                .count();
+            assert_eq!(wal_count, 1);
+            db.close().unwrap();
+        });
     }
 }

@@ -10,7 +10,9 @@
 //!
 //! 每次 flush 与合并换状态，都先往 manifest 追加一条记录，记下文件列表的变化；
 //! 打开时重放 manifest，恢复各层有哪些 SST，删掉目录里不在其中的残留文件。
-//! memtable 里还没写成 SST 的数据重启后会丢（还没有 WAL）。
+//! 开了 WAL 时，每张 memtable 有自己的 WAL 文件（`<编号>.wal`），写入先追加到它，再插入表。
+//! flush 在 manifest 里记下写成了哪张表（高水位），之后删掉它的 WAL；打开时重放高水位之上的
+//! WAL，重建还没写成 SST 的表。
 //!
 //! 这一层自己不起线程：flush 由调用方触发。平时触发它的是 `db::Db` 的后台线程。
 
@@ -25,6 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use bytes::Bytes;
 
+use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
 use crate::compaction::{CompactionOptions, sorted_by_first_key};
 use crate::error::{Error, Result};
 use crate::iterators::StorageIterator;
@@ -41,6 +44,7 @@ use crate::stats::{Stats, StatsSnapshot};
 use crate::table::{
     BlockCache, FileObject, SsTable, SsTableBuilder, SsTableIterator, key_hash, new_block_cache,
 };
+use crate::wal;
 
 /// `scan` 返回的游标类型，从里往外读：
 /// memtable 那一组归并成一个，L0 的 SST 归并成一个，两路归并把它们合起来；
@@ -109,6 +113,16 @@ pub struct LsmStorageOptions {
     /// `LsmStorage` 自己不起线程，由 `db::Db` 读取这一项：不是 `NoCompaction` 才启动
     /// 后台的 compaction 线程。
     pub compaction: CompactionOptions,
+    /// 写入是否先追加到 WAL。关掉时写入只进内存，进程崩溃会丢掉还没写成 SST 的数据。
+    pub enable_wal: bool,
+}
+
+/// 一次写入的选项。默认不同步：写进操作系统的页缓存就返回，进程崩溃不丢，断电可能丢。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteOptions {
+    /// 返回之前把 WAL 同步到磁盘：断电也不丢这次写入，以及它之前完成的全部写入。
+    /// 没开 WAL 时不起作用。
+    pub sync: bool,
 }
 
 pub struct LsmStorage {
@@ -142,12 +156,16 @@ impl LsmStorage {
     ///
     /// 目录里没有 manifest 时新建一个空的数据库。已有 manifest 时重放它，打开其中记下的
     /// SST，删除目录里不在其中的 SST 文件（崩溃时写了一半的新文件，或者换了状态还没来得及
-    /// 删的旧文件）。memtable 里没有写成 SST 的数据不在任何文件里，重启后没有了。
+    /// 删的旧文件）。
+    ///
+    /// 还没写成 SST 的表：重放编号在高水位之上的 WAL，按新旧重建成冻结的表，等 flush 写成 SST；
+    /// 高水位以下的 WAL 已经没用，删掉。再换上一张新的可写的表。没开 WAL 时，上次留下的 WAL
+    /// 照样重放；从来没开过 WAL 的数据库，memtable 里没写成 SST 的数据重启后就没有了。
     ///
     /// - 选项与数据库的形状对不上（分层与 tiered 互换，或者 `max_levels` 变了）：
     ///   [`Error::IncompatibleOptions`]。不合并、简单分层与 leveled 的形状相同，可以互换。
-    /// - manifest 损坏、manifest 记下的 SST 不在了、目录里有 SST 却没有 manifest：
-    ///   [`Error::Corruption`]。
+    /// - manifest 损坏、manifest 记下的 SST 不在了、目录里有 SST 或 WAL 却没有 manifest、
+    ///   WAL 中间损坏：[`Error::Corruption`]。
     pub fn open(path: &Path, options: LsmStorageOptions) -> Result<Self> {
         assert!(options.max_levels >= 1, "L0 之下至少要有 1 层");
         std::fs::create_dir_all(path)?;
@@ -193,9 +211,25 @@ impl LsmStorage {
 
         remove_unlisted_ssts(path, &layout)?;
 
+        // 还没写成 SST 的表：重放高水位之上的 WAL，新的在前，都作为冻结的表等 flush。
+        let imm_memtables = recover_memtables(path, &layout)?;
+
+        // 可写的表也要一个编号。两边各知道一部分编号：manifest 记着 flush 与合并分给 SST 的，
+        // 还在的 WAL 是冻结时分给表的、不进 manifest。取两者中较大的往后分，谁都不重名，
+        // 新表的编号也比重放出的表都大。
+        let mut next_sst_id: usize = if imm_memtables.is_empty() {
+            layout.next_sst_id
+        } else {
+            layout
+                .next_sst_id
+                .max(imm_memtables.first().unwrap().id() + 1)
+        };
+        let memtable_id = next_sst_id;
+        next_sst_id += 1;
+        let memtable = new_memtable(path, memtable_id, options.enable_wal)?;
         let initial_state = LsmStorageState {
-            memtable: Arc::new(MemTable::new()),
-            imm_memtables: Vec::new(),
+            memtable: Arc::new(memtable),
+            imm_memtables,
             l0_sstables,
             levels,
         };
@@ -205,7 +239,7 @@ impl LsmStorage {
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            next_sst_id: AtomicUsize::new(layout.next_sst_id),
+            next_sst_id: AtomicUsize::new(next_sst_id),
             block_cache,
             stats,
             options,
@@ -278,6 +312,7 @@ impl LsmStorage {
             added: added.iter().map(|sst| sst.id()).collect(),
             placement,
             next_sst_id: self.next_sst_id.load(Ordering::SeqCst),
+            flushed_memtable_id: None,
         }
     }
 
@@ -432,61 +467,115 @@ impl LsmStorage {
         LsmIterator::new(all, bound_to_owned(upper))
     }
 
-    /// 写入一条记录。key 与 value 都不能为空：空 value 留给墓碑使用。
+    /// 写入一条记录，用默认的选项（不同步）。key 与 value 都不能为空：空 value 留给墓碑使用。
     ///
     /// 返回这次写入有没有冻结一张表。冻结了，就有一张表等着 flush。
-    pub fn put(&self, key: &[u8], value: &[u8]) -> bool {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_opt(key, value, WriteOptions::default())
+    }
+
+    /// 删除一个 key：写入一条墓碑，用默认的选项。返回值与 `put` 的含义相同。
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.delete_opt(key, WriteOptions::default())
+    }
+
+    /// 写入一条记录，选项由调用方给。错误与返回值见 `write`。
+    pub fn put_opt(&self, key: &[u8], value: &[u8], options: WriteOptions) -> Result<bool> {
         assert!(!key.is_empty(), "key 不能为空");
         assert!(!value.is_empty(), "value 不能为空，空 value 表示删除");
-        self.write(key, value)
+        self.write(key, value, options)
     }
 
-    /// 删除一个 key：写入一条墓碑。返回值与 `put` 的含义相同。
-    pub fn delete(&self, key: &[u8]) -> bool {
+    /// 删除一个 key，选项由调用方给。
+    pub fn delete_opt(&self, key: &[u8], options: WriteOptions) -> Result<bool> {
         assert!(!key.is_empty(), "key 不能为空");
-        self.write(key, b"")
+        self.write(key, b"", options)
     }
 
-    /// `put` 与 `delete` 共用的写入步骤。
+    /// `put` 与 `delete` 共用的写入步骤。返回这次写入有没有冻结一张表。
     ///
-    /// 写入期间持有 `state` 的读锁：冻结要拿写锁，所以不会有表在写入途中被冻结。
-    /// 表本身允许多个线程同时写入，读锁也不会让写入之间互相等待。
-    fn write(&self, key: &[u8], value: &[u8]) -> bool {
-        self.stats
-            .add_user_bytes_written((key.len() + value.len()) as u64);
+    /// - key 超过 `MAX_KEY_LEN` 或 value 超过 `MAX_VALUE_LEN` 字节：[`Error::InvalidArgument`]，
+    ///   什么都没有写。
+    /// - 追加 WAL、同步或者冻结时建新的 WAL 失败：[`Error::Io`]。
+    ///
+    /// 写入期间持有 `state` 的读锁：冻结要拿写锁，所以不会有表在写入途中被冻结，
+    /// 追加 WAL 与插入的是同一张表。表本身允许多个线程同时写入。
+    fn write(&self, key: &[u8], value: &[u8], options: WriteOptions) -> Result<bool> {
+        if key.len() > MAX_KEY_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "key 有 {} 字节，超过了上限 {MAX_KEY_LEN}",
+                key.len()
+            )));
+        }
+        if value.len() > MAX_VALUE_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "value 有 {} 字节，超过了上限 {MAX_VALUE_LEN}",
+                value.len()
+            )));
+        }
         let size_after_write;
         {
             let guard = self.state.read().unwrap();
-            guard.memtable.put(key, value);
+            guard.memtable.put(key, value)?;
             size_after_write = guard.memtable.approximate_size();
+        }
+        // 写入成功之后才计入：追加 WAL 失败时，这次写入没有被接受，文件里也没有多出这些字节。
+        self.stats
+            .add_user_bytes_written((key.len() + value.len()) as u64);
+        if self.options.enable_wal {
+            let wal_bytes = wal::encoded_len(key.len(), value.len());
+            self.stats.add_wal_bytes_written(wal_bytes as u64);
+        }
+        // 同步要在读锁外：同步时 `snapshot` 还要拿一次读锁，同一个线程持着读锁再拿读锁，
+        // 遇上排队的冻结（写锁）会死锁；而且同步要等几毫秒，持着读锁会让冻结一直等着。
+        if options.sync {
+            self.sync()?;
         }
         // 读锁已经放开：冻结要拿写锁，持着读锁去冻结会等自己，造成死锁。
         self.try_freeze(size_after_write)
+    }
+
+    /// 把还在内存里的每一张表（可写的与冻结的）的 WAL 同步到磁盘；没开 WAL 时什么都不做。
+    ///
+    /// 返回之后，调用之前完成的写入断电也不会丢。冻结的表也要同步：它们的 WAL 里可能还有
+    /// 没同步过的写入，只同步可写的表，断电后会留下"新的写入在、更旧的却没了"。
+    /// 没有新内容的文件同步起来很快。已经写成 SST 的表不在状态里，它的数据已经落盘。
+    pub fn sync(&self) -> Result<()> {
+        if self.options.enable_wal {
+            let snapshot = self.snapshot();
+            snapshot.memtable.sync_wal()?;
+            for memtable in &snapshot.imm_memtables {
+                memtable.sync_wal()?;
+            }
+        }
+        Ok(())
     }
 
     /// 可写的表到了上限就冻结它。返回这一次有没有冻结。
     ///
     /// 先在锁外用写入时看到的大小快速判断；到了上限再拿 `state_lock` 排队。
     /// 排队期间别的线程可能已经冻结过了，所以拿到锁之后要重新检查当前的表。
-    fn try_freeze(&self, size_after_write: usize) -> bool {
+    fn try_freeze(&self, size_after_write: usize) -> Result<bool> {
         let limit = self.options.memtable_size_limit;
         if size_after_write < limit {
-            return false;
+            return Ok(false);
         }
 
         let state_lock = self.state_lock.lock().unwrap();
         let current_size = self.snapshot().memtable.approximate_size();
         if current_size < limit {
-            return false;
+            return Ok(false);
         }
-        self.force_freeze_memtable(&state_lock);
-        true
+        self.force_freeze_memtable(&state_lock)?;
+        Ok(true)
     }
 
     /// 不管可写的表有多大，现在就冻结它。表是空的也照样冻结：flush 遇到空表会直接丢掉。
-    pub fn freeze_memtable(&self) {
+    ///
+    /// 开了 WAL 时要为新表建 WAL 文件，失败时返回错误，状态不变。
+    pub fn freeze_memtable(&self) -> Result<()> {
         let state_lock = self.state_lock.lock().unwrap();
-        self.force_freeze_memtable(&state_lock);
+        self.force_freeze_memtable(&state_lock)
     }
 
     /// 把冻结的 memtable 一张一张写成 SST，直到一张不剩。
@@ -543,24 +632,37 @@ impl LsmStorage {
             removed.is_some_and(|removed| Arc::ptr_eq(&removed, &memtable)),
             "flush 期间冻结列表的末尾变了"
         );
-        let Some(sst) = sst else {
-            // 空表没有写出文件，文件列表没变，不用记进 manifest。
+        if sst.is_none() && !memtable.has_wal() {
+            // 空表没有写出文件，也没有要作废的 WAL：文件列表没变，不用记进 manifest。
             *self.state.write().unwrap() = Arc::new(new_state);
             return Ok(());
-        };
-        // L0 与 tier 的列表都是新的在前：刚写出的这个最新。
+        }
         let placement = if self.options.compaction.flush_to_l0() {
             Placement::L0
         } else {
             Placement::Tier
         };
-        let edit = self.version_edit(std::iter::empty(), std::slice::from_ref(&sst), placement);
-        if self.options.compaction.flush_to_l0() {
-            new_state.l0_sstables.insert(0, sst);
-        } else {
-            new_state.levels.insert(0, vec![sst]);
+        // 其余情况都记一条，带上高水位。空表没有文件，但它的 WAL 也要作废，所以照样记。
+        // Some(x) → [x]，None → []：有没有文件都走下面同一段。
+        let added: Vec<Arc<SsTable>> = sst.into_iter().collect();
+        let mut edit = self.version_edit(std::iter::empty(), &added, placement);
+        edit.flushed_memtable_id = Some(memtable.id());
+        for sst in added {
+            if self.options.compaction.flush_to_l0() {
+                new_state.l0_sstables.insert(0, sst);
+            } else {
+                new_state.levels.insert(0, vec![sst]);
+            }
         }
-        self.commit_state(&mut manifest, new_state, edit)
+        self.commit_state(&mut manifest, new_state, edit)?;
+        drop(manifest);
+
+        // 先记高水位、后删文件：删之前崩溃，重启时它在高水位以下，同样被删掉；反过来的话，
+        // 删了文件、高水位还没记下时崩溃，这张表的写入就丢了。
+        if memtable.has_wal() {
+            std::fs::remove_file(wal_path(&self.path, memtable.id()))?;
+        }
+        Ok(())
     }
 
     /// 把游标从当前位置走到头，按顺序写成一个或多个 SST 文件，返回它们（按 key 排列）。
@@ -621,8 +723,12 @@ impl LsmStorage {
     ///
     /// 当前状态可能正被读者的快照引用，不能原地修改：复制一份，在副本上换表，
     /// 再用写锁把指针换成副本。新表在拿写锁之前就准备好，写锁只持有一瞬间。
-    pub fn force_freeze_memtable(&self, _state_lock: &MutexGuard<'_, Manifest>) {
-        let new_memtable = Arc::new(MemTable::new());
+    ///
+    /// 开了 WAL 时，新表的 WAL 文件也在拿写锁之前建好（连同目录的同步）；建不成就返回错误，
+    /// 状态不变。旧表的 WAL 不在这里同步，由 [`LsmStorage::sync`] 负责。
+    pub fn force_freeze_memtable(&self, _state_lock: &MutexGuard<'_, Manifest>) -> Result<()> {
+        let id = self.allocate_sst_id();
+        let new_memtable = Arc::new(new_memtable(&self.path, id, self.options.enable_wal)?);
 
         let mut guard = self.state.write().unwrap();
         let mut new_state = guard.as_ref().clone();
@@ -631,12 +737,27 @@ impl LsmStorage {
         new_state.imm_memtables.insert(0, old_memtable);
         new_state.memtable = new_memtable;
         *guard = Arc::new(new_state);
+        Ok(())
     }
 }
 
 /// 编号为 `id` 的 SST 文件在目录 `dir` 里的路径，例如 `目录/00007.sst`。
 fn sst_path(dir: &Path, id: usize) -> PathBuf {
     dir.join(format!("{id:05}.sst"))
+}
+
+/// 编号为 `id` 的 memtable 的 WAL 在目录 `dir` 里的路径，例如 `目录/00007.wal`。
+fn wal_path(dir: &Path, id: usize) -> PathBuf {
+    dir.join(format!("{id:05}.wal"))
+}
+
+/// 一张编号为 `id` 的空 memtable；`enable_wal` 时同时在 `dir` 里建好它的 WAL。
+fn new_memtable(dir: &Path, id: usize, enable_wal: bool) -> Result<MemTable> {
+    if enable_wal {
+        MemTable::create_with_wal(id, &wal_path(dir, id))
+    } else {
+        Ok(MemTable::new(id))
+    }
 }
 
 /// 按选项算出数据库的形状：分层的策略是 L0 加 `max_levels` 层，tiered 是一列 tier。
@@ -660,12 +781,11 @@ fn shape_of(options: &LsmStorageOptions) -> Shape {
 fn open_manifest(dir: &Path, shape: Shape) -> Result<(Manifest, RecoveredLayout)> {
     let manifest_path = dir.join(MANIFEST_FILE_NAME);
     if !manifest_path.exists() {
-        let existing = list_sst_ids(dir)?;
-        if !existing.is_empty() {
+        let existing = list_sst_ids(dir)?.len() + list_wal_ids(dir)?.len();
+        if existing > 0 {
             return Err(Error::Corruption(format!(
-                "{} 里有 {} 个 SST 文件，却没有 {MANIFEST_FILE_NAME}",
-                dir.display(),
-                existing.len()
+                "{} 里有 {existing} 个 SST 或 WAL 文件，却没有 {MANIFEST_FILE_NAME}",
+                dir.display()
             )));
         }
         let mut manifest = Manifest::create(&manifest_path)?;
@@ -728,6 +848,50 @@ fn remove_unlisted_ssts(dir: &Path, layout: &RecoveredLayout) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 目录里全部 WAL 文件的编号，没有顺序。名字不是"数字.wal"的文件不算。
+fn list_wal_ids(dir: &Path) -> Result<Vec<usize>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        let Some(stem) = name.strip_suffix(".wal") else {
+            continue;
+        };
+        if let Ok(id) = stem.parse::<usize>() {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// 重放目录里还有用的 WAL，返回重建的表，新的在前（编号大的在前）。
+///
+/// 编号不超过 `layout.flushed_memtable_id`（高水位）的 WAL 已经写成 SST：删掉，不重放，
+/// 否则旧的值会盖住更新的 SST。其余的按编号从小到大逐个重放。
+fn recover_memtables(dir: &Path, layout: &RecoveredLayout) -> Result<Vec<Arc<MemTable>>> {
+    let mut memtables = Vec::new();
+    let mut ids = list_wal_ids(dir)?;
+    // 从旧到新重放；read_dir 给出的顺序没有保证。
+    ids.sort();
+    for id in ids {
+        // 高水位以下的已经写成 SST：删掉，不重放，否则旧值会盖住更新的 SST。
+        if layout
+            .flushed_memtable_id
+            .is_some_and(|high_water| id <= high_water)
+        {
+            std::fs::remove_file(wal_path(dir, id))?;
+            continue;
+        }
+        memtables.push(Arc::new(MemTable::recover_from_wal(
+            id,
+            &wal_path(dir, id),
+        )?));
+    }
+    // 冻结列表新的在前。
+    memtables.reverse();
+    Ok(memtables)
 }
 
 /// 在一个 SST 上建游标，指着范围下界之后的第一条记录。
@@ -807,8 +971,8 @@ mod tests {
             self.dir.path()
         }
 
-        /// 释放引擎，用同样的选项在同一个目录里重新打开，模拟一次重启：
-        /// memtable 里没有写成 SST 的数据不在了。
+        /// 释放引擎，用同样的选项在同一个目录里重新打开，模拟一次没有 `close` 的重启（崩溃）：
+        /// memtable 里没有写成 SST 的数据，开了 WAL 时从 WAL 重建，没开时就没有了。
         pub(super) fn reopen(self) -> TestStorage {
             let options = self.storage.options.clone();
             let TestStorage { storage, dir } = self;
@@ -827,6 +991,11 @@ mod tests {
             names.sort();
             names
         }
+    }
+
+    /// 编号为 `id` 的 SST 的文件名，例如 `00007.sst`。
+    pub(super) fn sst_file_name(id: usize) -> String {
+        format!("{id:05}.sst")
     }
 
     /// 状态里各处的文件编号：L0（新的在前），以及 L1 往下各层（或各个 tier）。
@@ -868,6 +1037,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         })
     }
 
@@ -884,7 +1054,7 @@ mod tests {
     }
 
     fn freeze(storage: &LsmStorage) {
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
     }
 
     // ---------- 写入、删除与读取 ----------
@@ -902,7 +1072,7 @@ mod tests {
     fn write_put_then_get_returns_value() {
         let storage = open_without_auto_freeze();
 
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), Some(Bytes::from_static(b"1")));
         assert_eq!(storage.get(b"b").unwrap(), None);
@@ -913,8 +1083,8 @@ mod tests {
     fn write_delete_hides_value() {
         let storage = open_without_auto_freeze();
 
-        storage.put(b"a", b"1");
-        storage.delete(b"a");
+        storage.put(b"a", b"1").unwrap();
+        storage.delete(b"a").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), None);
     }
@@ -924,9 +1094,9 @@ mod tests {
     fn write_put_after_delete_is_visible() {
         let storage = open_without_auto_freeze();
 
-        storage.put(b"a", b"1");
-        storage.delete(b"a");
-        storage.put(b"a", b"2");
+        storage.put(b"a", b"1").unwrap();
+        storage.delete(b"a").unwrap();
+        storage.put(b"a", b"2").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), Some(Bytes::from_static(b"2")));
     }
@@ -937,7 +1107,7 @@ mod tests {
     fn write_put_rejects_empty_value() {
         let storage = open_without_auto_freeze();
 
-        storage.put(b"a", b"");
+        storage.put(b"a", b"").unwrap();
     }
 
     // ---------- 冻结 ----------
@@ -946,7 +1116,7 @@ mod tests {
     #[test]
     fn freeze_moves_memtable_to_frozen_list() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         freeze(&storage);
 
@@ -964,10 +1134,10 @@ mod tests {
     #[test]
     fn freeze_keeps_data_readable() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         freeze(&storage);
-        storage.put(b"b", b"2");
+        storage.put(b"b", b"2").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), Some(Bytes::from_static(b"1")));
         assert_eq!(storage.get(b"b").unwrap(), Some(Bytes::from_static(b"2")));
@@ -977,10 +1147,10 @@ mod tests {
     #[test]
     fn freeze_newer_value_wins_over_frozen_value() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"old");
+        storage.put(b"a", b"old").unwrap();
 
         freeze(&storage);
-        storage.put(b"a", b"new");
+        storage.put(b"a", b"new").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), Some(Bytes::from_static(b"new")));
     }
@@ -989,9 +1159,9 @@ mod tests {
     #[test]
     fn freeze_newer_frozen_table_wins_over_older_one() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
         freeze(&storage);
-        storage.put(b"a", b"2");
+        storage.put(b"a", b"2").unwrap();
         freeze(&storage);
 
         assert_eq!(storage.snapshot().imm_memtables.len(), 2);
@@ -1002,9 +1172,9 @@ mod tests {
     #[test]
     fn freeze_tombstone_hides_value_in_older_table() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
         freeze(&storage);
-        storage.delete(b"a");
+        storage.delete(b"a").unwrap();
 
         assert_eq!(storage.get(b"a").unwrap(), None);
 
@@ -1017,11 +1187,11 @@ mod tests {
     #[test]
     fn freeze_does_not_change_earlier_snapshot() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
         let before = storage.snapshot();
 
         freeze(&storage);
-        storage.put(b"b", b"2");
+        storage.put(b"b", b"2").unwrap();
 
         assert_eq!(before.imm_memtables.len(), 0);
         assert_eq!(before.memtable.get(b"a"), Some(Bytes::from_static(b"1")));
@@ -1035,8 +1205,8 @@ mod tests {
     fn auto_freeze_does_not_happen_below_limit() {
         let storage = open_with_limit(1000);
 
-        storage.put(b"a", b"1");
-        storage.put(b"b", b"2");
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"2").unwrap();
 
         assert_eq!(storage.snapshot().imm_memtables.len(), 0);
     }
@@ -1047,12 +1217,12 @@ mod tests {
         // 每条记录 2 字节，上限 4 字节：每写两条冻结一次。
         let storage = open_with_limit(4);
 
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
         assert_eq!(storage.snapshot().imm_memtables.len(), 0);
-        storage.put(b"b", b"2");
+        storage.put(b"b", b"2").unwrap();
         assert_eq!(storage.snapshot().imm_memtables.len(), 1);
-        storage.put(b"c", b"3");
-        storage.put(b"d", b"4");
+        storage.put(b"c", b"3").unwrap();
+        storage.put(b"d", b"4").unwrap();
         assert_eq!(storage.snapshot().imm_memtables.len(), 2);
 
         for (key, value) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
@@ -1078,7 +1248,7 @@ mod tests {
                 scope.spawn(move || {
                     for i in 0..puts_per_thread {
                         let key = format!("t{thread_id}-{i:05}");
-                        storage.put(key.as_bytes(), b"v");
+                        storage.put(key.as_bytes(), b"v").unwrap();
                     }
                 });
             }
@@ -1115,13 +1285,13 @@ mod tests {
     #[test]
     fn scan_merges_all_memtables_in_key_order() {
         let storage = open_without_auto_freeze();
-        storage.put(b"e", b"5");
-        storage.put(b"b", b"2");
+        storage.put(b"e", b"5").unwrap();
+        storage.put(b"b", b"2").unwrap();
         freeze(&storage);
-        storage.put(b"d", b"4");
-        storage.put(b"a", b"1");
+        storage.put(b"d", b"4").unwrap();
+        storage.put(b"a", b"1").unwrap();
         freeze(&storage);
-        storage.put(b"c", b"3");
+        storage.put(b"c", b"3").unwrap();
 
         assert_eq!(
             scan_all(&storage),
@@ -1133,12 +1303,12 @@ mod tests {
     #[test]
     fn scan_returns_newest_value_for_each_key() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"oldest");
-        storage.put(b"b", b"oldest");
+        storage.put(b"a", b"oldest").unwrap();
+        storage.put(b"b", b"oldest").unwrap();
         freeze(&storage);
-        storage.put(b"a", b"middle");
+        storage.put(b"a", b"middle").unwrap();
         freeze(&storage);
-        storage.put(b"a", b"newest");
+        storage.put(b"a", b"newest").unwrap();
 
         assert_eq!(
             scan_all(&storage),
@@ -1150,11 +1320,11 @@ mod tests {
     #[test]
     fn scan_hides_deleted_keys() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
-        storage.put(b"b", b"2");
-        storage.put(b"c", b"3");
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"2").unwrap();
+        storage.put(b"c", b"3").unwrap();
         freeze(&storage);
-        storage.delete(b"b");
+        storage.delete(b"b").unwrap();
 
         assert_eq!(scan_all(&storage), expected(&[("a", "1"), ("c", "3")]));
 
@@ -1167,11 +1337,11 @@ mod tests {
     #[test]
     fn scan_shows_key_written_again_after_delete() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
         freeze(&storage);
-        storage.delete(b"a");
+        storage.delete(b"a").unwrap();
         freeze(&storage);
-        storage.put(b"a", b"2");
+        storage.put(b"a", b"2").unwrap();
 
         assert_eq!(scan_all(&storage), expected(&[("a", "2")]));
     }
@@ -1180,11 +1350,11 @@ mod tests {
     #[test]
     fn scan_respects_bounds_across_memtables() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
-        storage.put(b"c", b"3");
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"c", b"3").unwrap();
         freeze(&storage);
-        storage.put(b"b", b"2");
-        storage.put(b"d", b"4");
+        storage.put(b"b", b"2").unwrap();
+        storage.put(b"d", b"4").unwrap();
 
         let mut iter = storage
             .scan(Bound::Included(b"b"), Bound::Excluded(b"d"))
@@ -1204,13 +1374,13 @@ mod tests {
     #[test]
     fn scan_is_not_affected_by_later_freeze() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
-        storage.put(b"c", b"3");
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"c", b"3").unwrap();
         let mut iter = storage.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
 
         freeze(&storage);
-        storage.put(b"b", b"2");
-        storage.put(b"z", b"26");
+        storage.put(b"b", b"2").unwrap();
+        storage.put(b"z", b"26").unwrap();
 
         assert_eq!(collect_all(&mut iter), expected(&[("a", "1"), ("c", "3")]));
         assert_eq!(
@@ -1239,12 +1409,12 @@ mod tests {
                 match random(10) {
                     0 => freeze(&storage),
                     1..=3 => {
-                        storage.delete(key.as_bytes());
+                        storage.delete(key.as_bytes()).unwrap();
                         model.remove(&key);
                     }
                     _ => {
                         let value = format!("v{step}");
-                        storage.put(key.as_bytes(), value.as_bytes());
+                        storage.put(key.as_bytes(), value.as_bytes()).unwrap();
                         model.insert(key.clone(), value);
                     }
                 }
@@ -1325,7 +1495,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = open_without_auto_freeze();
         add_l0_sst(&storage, &dir, 1, &[("a", "old"), ("b", "2")]);
-        storage.put(b"a", b"new");
+        storage.put(b"a", b"new").unwrap();
 
         assert_eq!(get_str(&storage, "a"), Some("new".to_string()));
         assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
@@ -1337,7 +1507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = open_without_auto_freeze();
         add_l0_sst(&storage, &dir, 1, &[("a", "old")]);
-        storage.put(b"a", b"frozen");
+        storage.put(b"a", b"frozen").unwrap();
         freeze(&storage);
 
         assert_eq!(get_str(&storage, "a"), Some("frozen".to_string()));
@@ -1362,7 +1532,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = open_without_auto_freeze();
         add_l0_sst(&storage, &dir, 1, &[("a", "1")]);
-        storage.delete(b"a");
+        storage.delete(b"a").unwrap();
 
         assert_eq!(get_str(&storage, "a"), None);
     }
@@ -1397,9 +1567,9 @@ mod tests {
         let storage = open_without_auto_freeze();
         add_l0_sst(&storage, &dir, 1, &[("a", "sst1"), ("d", "sst1")]);
         add_l0_sst(&storage, &dir, 2, &[("b", "sst2"), ("f", "sst2")]);
-        storage.put(b"c", b"imm");
+        storage.put(b"c", b"imm").unwrap();
         freeze(&storage);
-        storage.put(b"e", b"mem");
+        storage.put(b"e", b"mem").unwrap();
 
         let result = scan_range(&storage, Bound::Unbounded, Bound::Unbounded);
 
@@ -1428,8 +1598,8 @@ mod tests {
             &[("a", "sst1"), ("b", "sst1"), ("c", "sst1"), ("d", "sst1")],
         );
         add_l0_sst(&storage, &dir, 2, &[("b", "sst2"), ("c", "")]);
-        storage.put(b"a", b"mem");
-        storage.delete(b"d");
+        storage.put(b"a", b"mem").unwrap();
+        storage.delete(b"d").unwrap();
 
         let result = scan_range(&storage, Bound::Unbounded, Bound::Unbounded);
 
@@ -1481,9 +1651,9 @@ mod tests {
             1,
             &[("a", "1"), ("c", "3"), ("e", "5"), ("g", "7")],
         );
-        storage.put(b"b", b"2");
-        storage.put(b"d", b"4");
-        storage.put(b"f", b"6");
+        storage.put(b"b", b"2").unwrap();
+        storage.put(b"d", b"4").unwrap();
+        storage.put(b"f", b"6").unwrap();
 
         let result = scan_range(&storage, Bound::Included(b"b"), Bound::Excluded(b"f"));
 
@@ -1537,11 +1707,11 @@ mod tests {
                 for _ in 0..(next_random() % 25) {
                     let key = key_of(next_random() % 60);
                     if next_random() % 4 == 0 {
-                        storage.delete(key.as_bytes());
+                        storage.delete(key.as_bytes()).unwrap();
                         model.insert(key, String::new());
                     } else {
                         let value = format!("mem{batch}-{}", next_random() % 1000);
-                        storage.put(key.as_bytes(), value.as_bytes());
+                        storage.put(key.as_bytes(), value.as_bytes()).unwrap();
                         model.insert(key, value);
                     }
                 }
@@ -1714,7 +1884,7 @@ mod tests {
         let storage = open_without_auto_freeze();
         set_three_l1_ssts(&storage, &dir);
         add_l0_sst(&storage, &dir, 10, &[("e", "")]);
-        storage.put(b"i", b"mem");
+        storage.put(b"i", b"mem").unwrap();
 
         assert_eq!(get_str(&storage, "e"), None);
         assert_eq!(get_str(&storage, "i"), Some("mem".to_string()));
@@ -1742,7 +1912,7 @@ mod tests {
             10,
             &[("b", "new"), ("d", "4"), ("g", ""), ("x", "24")],
         );
-        storage.put(b"h", b"8");
+        storage.put(b"h", b"8").unwrap();
 
         assert_eq!(
             scan_all(&storage),
@@ -1826,7 +1996,7 @@ mod tests {
         );
         set_level_ssts(storage, dir, 1, &[(105, &[("c", ""), ("d", "L1")])]);
         add_l0_sst(storage, dir, 110, &[("e", "L0"), ("m", "L0")]);
-        storage.put(b"a", b"mem");
+        storage.put(b"a", b"mem").unwrap();
     }
 
     // 每一层的 key 都查得到；同一个 key 在几层里都有时，上层的胜出；上层的墓碑盖住下层的值。
@@ -1962,9 +2132,9 @@ mod tests {
     fn put_and_freeze(storage: &LsmStorage, pairs: &[(&str, &str)]) {
         for (key, value) in pairs {
             if value.is_empty() {
-                storage.delete(key.as_bytes());
+                storage.delete(key.as_bytes()).unwrap();
             } else {
-                storage.put(key.as_bytes(), value.as_bytes());
+                storage.put(key.as_bytes(), value.as_bytes()).unwrap();
             }
         }
         freeze(storage);
@@ -1988,6 +2158,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         };
 
         let _storage = LsmStorage::open(&path, options).unwrap();
@@ -2026,7 +2197,7 @@ mod tests {
         let storage = open_without_auto_freeze();
         put_and_freeze(&storage, &[("a", "1"), ("c", "3")]);
         put_and_freeze(&storage, &[("b", "2")]);
-        storage.put(b"d", b"4");
+        storage.put(b"d", b"4").unwrap();
         let before = scan_all(&storage);
 
         storage.force_flush_next_imm_memtable().unwrap();
@@ -2048,15 +2219,22 @@ mod tests {
         assert_eq!(storage.sst_file_names(), Vec::<String>::new());
 
         storage.force_flush_next_imm_memtable().unwrap();
-        assert_eq!(storage.sst_file_names(), vec!["00001.sst"]);
+        let first = state_ids(&storage).0;
+        assert_eq!(first.len(), 1);
+        assert_eq!(storage.sst_file_names(), vec![sst_file_name(first[0])]);
 
         storage.force_flush_next_imm_memtable().unwrap();
-        assert_eq!(storage.sst_file_names(), vec!["00001.sst", "00002.sst"]);
+        let ids = state_ids(&storage).0;
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[1], first[0]);
+        assert!(ids[0] > ids[1]);
+        assert_eq!(
+            storage.sst_file_names(),
+            vec![sst_file_name(ids[1]), sst_file_name(ids[0])]
+        );
 
         let state = storage.snapshot();
-        let ids: Vec<usize> = state.l0_sstables.iter().map(|sst| sst.id()).collect();
-        assert_eq!(ids, vec![2, 1]);
-        // 先冻结的先 flush：编号 1 的文件里是 "a"，编号 2 的文件里是 "b"。
+        // 先冻结的先 flush：编号小的文件里是 "a"，编号大的文件里是 "b"。
         assert_eq!(
             records_in_sst(&state.l0_sstables[1]),
             expected(&[("a", "1")])
@@ -2071,7 +2249,7 @@ mod tests {
     #[test]
     fn flush_without_frozen_memtable_does_nothing() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         storage.force_flush_next_imm_memtable().unwrap();
 
@@ -2137,10 +2315,10 @@ mod tests {
         let storage = open_without_auto_freeze();
         put_and_freeze(&storage, &[("a", "1"), ("b", "2")]);
         storage.force_flush_next_imm_memtable().unwrap();
-        storage.put(b"b", b"22");
-        storage.put(b"c", b"3");
+        storage.put(b"b", b"22").unwrap();
+        storage.put(b"c", b"3").unwrap();
         freeze(&storage);
-        storage.delete(b"a");
+        storage.delete(b"a").unwrap();
 
         assert_eq!(scan_all(&storage), expected(&[("b", "22"), ("c", "3")]));
 
@@ -2190,7 +2368,7 @@ mod tests {
         for i in 0..500 {
             let key = format!("key-{i:04}");
             let value = format!("value-{i:04}");
-            storage.put(key.as_bytes(), value.as_bytes());
+            storage.put(key.as_bytes(), value.as_bytes()).unwrap();
             model.push((key, value));
         }
         freeze(&storage);
@@ -2223,11 +2401,11 @@ mod tests {
                 match next_random() % 20 {
                     0..=11 => {
                         let value = format!("v{step}");
-                        storage.put(key.as_bytes(), value.as_bytes());
+                        storage.put(key.as_bytes(), value.as_bytes()).unwrap();
                         model.insert(key.clone(), value);
                     }
                     12..=15 => {
-                        storage.delete(key.as_bytes());
+                        storage.delete(key.as_bytes()).unwrap();
                         model.remove(&key);
                     }
                     16..=17 => freeze(&storage),
@@ -2273,7 +2451,7 @@ mod tests {
                 handles.push(scope.spawn(move || {
                     for i in 0..puts_per_writer {
                         let key = format!("w{writer}-{i:04}");
-                        storage.put(key.as_bytes(), b"v");
+                        storage.put(key.as_bytes(), b"v").unwrap();
                         // 写完立刻读：不管它此刻在表里还是已经在文件里，都读得到。
                         assert_eq!(get_str(storage, &key), Some("v".to_string()));
                     }
@@ -2439,14 +2617,16 @@ mod tests {
     fn write_reports_whether_it_froze_a_memtable() {
         let storage = open_with_limit(40);
 
-        let first = storage.put(b"key-1", b"0123456789");
+        let first = storage.put(b"key-1", b"0123456789").unwrap();
         assert!(!first);
         assert_eq!(storage.imm_memtable_count(), 0);
 
         // 一直写到发生冻结为止：只有那一次返回真。
         let mut froze_count = 0;
         for i in 2..10 {
-            let froze = storage.put(format!("key-{i}").as_bytes(), b"0123456789");
+            let froze = storage
+                .put(format!("key-{i}").as_bytes(), b"0123456789")
+                .unwrap();
             if froze {
                 froze_count += 1;
             }
@@ -2458,7 +2638,7 @@ mod tests {
         let frozen_before = storage.imm_memtable_count();
         let mut froze_by_delete = false;
         for i in 0..40 {
-            froze_by_delete |= storage.delete(format!("gone-{i:02}").as_bytes());
+            froze_by_delete |= storage.delete(format!("gone-{i:02}").as_bytes()).unwrap();
         }
         assert!(froze_by_delete);
         assert!(storage.imm_memtable_count() > frozen_before);
@@ -2468,10 +2648,10 @@ mod tests {
     #[test]
     fn freeze_memtable_freezes_regardless_of_size() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
-        storage.freeze_memtable();
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
+        storage.freeze_memtable().unwrap();
 
         assert_eq!(storage.imm_memtable_count(), 2);
         assert_eq!(storage.snapshot().memtable.approximate_size(), 0);
@@ -2500,7 +2680,7 @@ mod tests {
     #[test]
     fn flush_all_without_frozen_memtable_does_nothing() {
         let storage = Arc::new(open_without_auto_freeze());
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         flush_all_with_deadline(&storage).unwrap();
 
@@ -2529,9 +2709,11 @@ mod tests {
     fn reads_fill_the_block_cache() {
         let storage = open_with_limit(usize::MAX);
         for i in 0..100 {
-            storage.put(format!("key-{i:03}").as_bytes(), b"value");
+            storage
+                .put(format!("key-{i:03}").as_bytes(), b"value")
+                .unwrap();
         }
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
         storage.flush_all_imm_memtables().unwrap();
         assert_eq!(storage.block_cache_usage(), (0, 0));
 
@@ -2625,12 +2807,12 @@ mod tests {
     #[test]
     fn counters_follow_writes_flushes_and_gets() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
-        storage.put(b"bb", b"22");
-        storage.delete(b"c");
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"bb", b"22").unwrap();
+        storage.delete(b"c").unwrap();
         assert_eq!(storage.stats().user_bytes_written, 2 + 4 + 1);
 
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
         storage.flush_all_imm_memtables().unwrap();
         let sst_file_size = storage.snapshot().l0_sstables[0].file_size();
         assert_eq!(storage.stats().flush_bytes_written, sst_file_size);
@@ -2697,7 +2879,7 @@ mod tests {
     #[test]
     fn gets_answered_from_memory_probe_no_sst() {
         let storage = open_without_auto_freeze();
-        storage.put(b"a", b"1");
+        storage.put(b"a", b"1").unwrap();
 
         assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
 
@@ -2718,10 +2900,11 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         };
         let storage = LsmStorage::open(dir.path(), options).unwrap();
-        storage.put(b"a", b"1");
-        storage.freeze_memtable();
+        storage.put(b"a", b"1").unwrap();
+        storage.freeze_memtable().unwrap();
         storage.flush_all_imm_memtables().unwrap();
 
         for _ in 0..3 {
@@ -2738,12 +2921,12 @@ mod tests {
     fn flush_pairs(storage: &LsmStorage, pairs: &[(&str, &str)]) {
         for (key, value) in pairs {
             if value.is_empty() {
-                storage.delete(key.as_bytes());
+                storage.delete(key.as_bytes()).unwrap();
             } else {
-                storage.put(key.as_bytes(), value.as_bytes());
+                storage.put(key.as_bytes(), value.as_bytes()).unwrap();
             }
         }
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
         storage.flush_all_imm_memtables().unwrap();
     }
 
@@ -2756,6 +2939,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         }
     }
 
@@ -2799,25 +2983,28 @@ mod tests {
         flush_pairs(&storage, &[("a", "2"), ("c", "2")]);
         flush_pairs(&storage, &[("b", ""), ("d", "3")]);
         let before = scan_all(&storage);
-        assert_eq!(state_ids(&storage).0, vec![3, 2, 1]);
+        let ids_before = state_ids(&storage).0;
+        assert_eq!(ids_before.len(), 3);
 
         let storage = storage.reopen();
 
-        assert_eq!(state_ids(&storage).0, vec![3, 2, 1]);
+        assert_eq!(state_ids(&storage).0, ids_before);
         assert_eq!(scan_all(&storage), before);
         assert_eq!(get_str(&storage, "a"), Some("2".to_string()));
         assert_eq!(get_str(&storage, "b"), None);
         flush_pairs(&storage, &[("e", "4")]);
-        assert_eq!(state_ids(&storage).0, vec![4, 3, 2, 1]);
+        let ids_after = state_ids(&storage).0;
+        assert!(ids_after[0] > ids_before[0]);
+        assert_eq!(ids_after[1..], ids_before[..]);
         assert_manifest_matches_state(&storage);
     }
 
-    // 还没有 WAL：没写成 SST 的数据重启之后没有了。
+    // 没开 WAL：没写成 SST 的数据重启之后没有了。
     #[test]
     fn reopen_loses_the_unflushed_memtable() {
         let storage = open_without_auto_freeze();
         flush_pairs(&storage, &[("a", "1")]);
-        storage.put(b"b", b"2");
+        storage.put(b"b", b"2").unwrap();
 
         let storage = storage.reopen();
 
@@ -2831,16 +3018,27 @@ mod tests {
     fn reopen_removes_unlisted_ssts() {
         let storage = open_without_auto_freeze();
         flush_pairs(&storage, &[("a", "1")]);
-        std::fs::write(storage.dir().join("00002.sst"), b"half written").unwrap();
-        std::fs::write(storage.dir().join("00009.sst"), b"left over").unwrap();
+        let listed = state_ids(&storage).0[0];
+        let half_written = sst_file_name(listed + 1);
+        std::fs::write(storage.dir().join(&half_written), b"half written").unwrap();
+        std::fs::write(
+            storage.dir().join(sst_file_name(listed + 100)),
+            b"left over",
+        )
+        .unwrap();
         std::fs::write(storage.dir().join("notes.txt"), b"not ours").unwrap();
 
         let storage = storage.reopen();
 
-        assert_eq!(storage.sst_file_names(), vec!["00001.sst"]);
+        assert_eq!(storage.sst_file_names(), vec![sst_file_name(listed)]);
         assert!(storage.dir().join("notes.txt").exists());
         flush_pairs(&storage, &[("b", "2")]);
-        assert_eq!(storage.sst_file_names(), vec!["00001.sst", "00002.sst"]);
+        let newest = state_ids(&storage).0[0];
+        assert!(newest > listed);
+        assert_eq!(
+            storage.sst_file_names(),
+            vec![sst_file_name(listed), sst_file_name(newest)]
+        );
         assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
     }
 
@@ -2850,8 +3048,9 @@ mod tests {
     fn reopen_does_not_resurrect_a_deleted_key() {
         let storage = open_without_auto_freeze();
         flush_pairs(&storage, &[("k", "old")]);
+        let old_id = state_ids(&storage).0[0];
         flush_pairs(&storage, &[("k", "")]);
-        let old_file = storage.dir().join("00001.sst");
+        let old_file = storage.dir().join(sst_file_name(old_id));
         let old_bytes = std::fs::read(&old_file).unwrap();
         storage.force_full_compaction().unwrap();
         assert_eq!(storage.sst_file_names(), Vec::<String>::new());
@@ -2870,6 +3069,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
         flush_pairs(&storage, &[("a", "1")]);
+        let sst_name = sst_file_name(storage.snapshot().l0_sstables[0].id());
         drop(storage);
         let tiered = CompactionOptions::Tiered(crate::compaction::tiered::TieredOptions {
             num_tiers: 4,
@@ -2893,7 +3093,7 @@ mod tests {
                 ..no_compaction_options()
             },
         ));
-        assert!(dir.path().join("00001.sst").exists());
+        assert!(dir.path().join(&sst_name).exists());
 
         let tiered_dir = tempfile::tempdir().unwrap();
         let tiered_options = LsmStorageOptions {
@@ -2980,9 +3180,528 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = LsmStorage::open(dir.path(), no_compaction_options()).unwrap();
         flush_pairs(&storage, &[("a", "1")]);
+        let sst_name = sst_file_name(storage.snapshot().l0_sstables[0].id());
         drop(storage);
-        std::fs::remove_file(dir.path().join("00001.sst")).unwrap();
+        std::fs::remove_file(dir.path().join(sst_name)).unwrap();
 
         assert_open_corruption(LsmStorage::open(dir.path(), no_compaction_options()));
+    }
+
+    // ---------- WAL ----------
+
+    /// 开着 WAL 的引擎；`memtable_size_limit` 以外的选项与 `open_with_limit` 相同。
+    fn open_with_wal(memtable_size_limit: usize) -> TestStorage {
+        open_with_options(LsmStorageOptions {
+            enable_wal: true,
+            ..open_with_limit(memtable_size_limit).options.clone()
+        })
+    }
+
+    /// 目录里全部 WAL 文件的编号，从小到大。
+    fn wal_ids(dir: &Path) -> Vec<usize> {
+        let mut ids: Vec<usize> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter_map(|name| name.strip_suffix(".wal")?.parse().ok())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// 编号为 `id` 的 WAL 里的全部记录，变成字符串。
+    fn wal_entries(dir: &Path, id: usize) -> Vec<(String, String)> {
+        let (_wal, entries) = crate::wal::Wal::recover(&wal_path(dir, id)).unwrap();
+        entries
+            .iter()
+            .map(|(key, value)| {
+                let key = String::from_utf8(key.to_vec()).unwrap();
+                let value = String::from_utf8(value.to_vec()).unwrap();
+                (key, value)
+            })
+            .collect()
+    }
+
+    // 打开时可写的表就有自己的 WAL；写入与删除按顺序记在里面，文件名是表的编号。
+    #[test]
+    fn wal_records_writes_of_the_current_memtable() {
+        let storage = open_with_wal(usize::MAX);
+
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"2").unwrap();
+        storage.delete(b"a").unwrap();
+
+        let memtable_id = storage.snapshot().memtable.id();
+        assert_eq!(wal_ids(storage.dir()), vec![memtable_id]);
+        assert_eq!(
+            wal_entries(storage.dir(), memtable_id),
+            expected(&[("a", "1"), ("b", "2"), ("a", "")])
+        );
+        assert_eq!(get_str(&storage, "a"), None);
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+    }
+
+    // 冻结时换上的新表有新的 WAL：之前的写入只在旧表的 WAL 里，之后的只在新表的 WAL 里。
+    #[test]
+    fn freeze_starts_a_new_wal() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        let old_id = storage.snapshot().memtable.id();
+
+        freeze(&storage);
+        storage.put(b"b", b"2").unwrap();
+
+        let state = storage.snapshot();
+        let new_id = state.memtable.id();
+        assert!(new_id > old_id);
+        assert_eq!(state.imm_memtables[0].id(), old_id);
+        assert_eq!(wal_ids(storage.dir()), vec![old_id, new_id]);
+        assert_eq!(wal_entries(storage.dir(), old_id), expected(&[("a", "1")]));
+        assert_eq!(wal_entries(storage.dir(), new_id), expected(&[("b", "2")]));
+    }
+
+    // 写满自动冻结时也一样：按编号把各个 WAL 接起来，正好是全部写入的顺序，一条不多、一条不少。
+    #[test]
+    fn wals_in_id_order_replay_all_writes() {
+        let storage = open_with_wal(100);
+        let mut written = Vec::new();
+        for i in 0..60 {
+            let key = format!("key-{:02}", i % 17);
+            let value = if i % 5 == 0 {
+                String::new()
+            } else {
+                format!("v{i}")
+            };
+            if value.is_empty() {
+                storage.delete(key.as_bytes()).unwrap();
+            } else {
+                storage.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+            written.push((key, value));
+        }
+
+        let ids = wal_ids(storage.dir());
+        assert_eq!(ids.len(), storage.imm_memtable_count() + 1);
+        assert!(ids.len() > 2, "应当冻结过好几次");
+        let replayed: Vec<(String, String)> = ids
+            .iter()
+            .flat_map(|&id| wal_entries(storage.dir(), id))
+            .collect();
+        assert_eq!(replayed, written);
+    }
+
+    // 表的编号与 SST 共用一个计数器：flush 出的 SST 与哪张表的编号都不相同。
+    #[test]
+    fn memtable_ids_do_not_collide_with_sst_ids() {
+        let storage = open_with_wal(usize::MAX);
+        let mut memtable_ids = vec![storage.snapshot().memtable.id()];
+        for i in 0..3 {
+            storage.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            freeze(&storage);
+            memtable_ids.push(storage.snapshot().memtable.id());
+            storage.flush_all_imm_memtables().unwrap();
+        }
+
+        let (l0_ids, _) = state_ids(&storage);
+        assert_eq!(l0_ids.len(), 3);
+        for id in &l0_ids {
+            assert!(!memtable_ids.contains(id), "SST {id} 与某张表重名");
+        }
+        let mut all_ids = memtable_ids.clone();
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), memtable_ids.len());
+    }
+
+    // 没开 WAL：目录里不出现 WAL 文件，读写照常。
+    #[test]
+    fn without_wal_no_wal_file_is_created() {
+        let storage = open_without_auto_freeze();
+        storage.put(b"a", b"1").unwrap();
+        freeze(&storage);
+        storage.put(b"b", b"2").unwrap();
+
+        assert_eq!(wal_ids(storage.dir()), Vec::<usize>::new());
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+    }
+
+    // 超长的 key 或 value：返回 InvalidArgument，表里与 WAL 里都没有这次写入；长度正好到上限的可以写。
+    #[test]
+    fn too_long_key_or_value_is_rejected() {
+        let storage = open_with_wal(usize::MAX);
+        let long_key = vec![b'k'; MAX_KEY_LEN + 1];
+        let long_value = vec![b'v'; MAX_VALUE_LEN + 1];
+
+        let key_result = storage.put(&long_key, b"v");
+        let value_result = storage.put(b"k", &long_value);
+        let delete_result = storage.delete(&long_key);
+
+        for result in [key_result, value_result, delete_result] {
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(storage.get(b"k").unwrap(), None);
+        let memtable_id = storage.snapshot().memtable.id();
+        assert!(wal_entries(storage.dir(), memtable_id).is_empty());
+        assert_eq!(storage.stats().user_bytes_written, 0);
+
+        let max_key = vec![b'k'; MAX_KEY_LEN];
+        let max_value = vec![b'v'; MAX_VALUE_LEN];
+        storage.put(&max_key, &max_value).unwrap();
+        assert_eq!(storage.get(&max_key).unwrap().unwrap().len(), MAX_VALUE_LEN);
+    }
+
+    // 带同步的写入、显式的 sync 都能成功，写入照常记在 WAL 里；冻结的表也一起同步。
+    #[test]
+    fn sync_writes_and_explicit_sync_succeed() {
+        let storage = open_with_wal(usize::MAX);
+        let sync = WriteOptions { sync: true };
+
+        storage.put_opt(b"a", b"1", sync).unwrap();
+        freeze(&storage);
+        storage.put(b"b", b"2").unwrap();
+        storage.delete_opt(b"a", sync).unwrap();
+        storage.sync().unwrap();
+
+        let ids = wal_ids(storage.dir());
+        assert_eq!(ids.len(), 2);
+        assert_eq!(wal_entries(storage.dir(), ids[0]), expected(&[("a", "1")]));
+        assert_eq!(
+            wal_entries(storage.dir(), ids[1]),
+            expected(&[("b", "2"), ("a", "")])
+        );
+        assert_eq!(get_str(&storage, "a"), None);
+    }
+
+    // 计数器记下追加到 WAL 的字节；没开 WAL 时是 0。
+    #[test]
+    fn wal_bytes_are_counted() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"ab", b"xyz").unwrap();
+        storage.delete(b"ab").unwrap();
+
+        let memtable_id = storage.snapshot().memtable.id();
+        let file_len = std::fs::metadata(wal_path(storage.dir(), memtable_id))
+            .unwrap()
+            .len();
+        assert_eq!(storage.stats().wal_bytes_written, file_len);
+
+        let without_wal = open_without_auto_freeze();
+        without_wal.put(b"ab", b"xyz").unwrap();
+        assert_eq!(without_wal.stats().wal_bytes_written, 0);
+    }
+
+    // 几个线程同时写同一个 key，期间不断冻结：按编号重放全部 WAL，最后一条就是读到的值。
+    #[test]
+    fn wal_order_matches_reads_under_concurrent_writes_and_freezes() {
+        crate::test_util::run_with_slow_deadline("并发写入与冻结", || {
+            let storage = open_with_wal(200);
+            let threads = 4;
+            let puts_per_thread = 300;
+            thread::scope(|scope| {
+                for thread_id in 0..threads {
+                    let storage = &storage;
+                    scope.spawn(move || {
+                        for i in 0..puts_per_thread {
+                            let value = format!("t{thread_id}-{i:03}");
+                            storage.put(b"k", value.as_bytes()).unwrap();
+                        }
+                    });
+                }
+            });
+
+            let ids = wal_ids(storage.dir());
+            assert!(ids.len() > 2, "应当冻结过好几次");
+            let replayed: Vec<(String, String)> = ids
+                .iter()
+                .flat_map(|&id| wal_entries(storage.dir(), id))
+                .collect();
+            assert_eq!(replayed.len(), threads * puts_per_thread);
+            let (_, last_value) = replayed.last().unwrap();
+            assert_eq!(get_str(&storage, "k").as_ref(), Some(last_value));
+        });
+    }
+
+    // 几个线程同时做带同步的写入，表很小、不断冻结：同步要等磁盘，期间冻结照常进行，不会卡死。
+    #[test]
+    fn sync_writes_do_not_block_concurrent_freezes() {
+        crate::test_util::run_with_slow_deadline("带同步的写入与冻结同时进行", || {
+            let storage = open_with_wal(200);
+            let sync = WriteOptions { sync: true };
+            let threads = 4;
+            let puts_per_thread = 40;
+            thread::scope(|scope| {
+                for thread_id in 0..threads {
+                    let storage = &storage;
+                    scope.spawn(move || {
+                        for i in 0..puts_per_thread {
+                            let key = format!("t{thread_id}-{i:03}");
+                            storage
+                                .put_opt(key.as_bytes(), b"0123456789", sync)
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+
+            assert!(storage.imm_memtable_count() > 2, "应当冻结过好几次");
+            for thread_id in 0..threads {
+                for i in 0..puts_per_thread {
+                    let key = format!("t{thread_id}-{i:03}");
+                    assert_eq!(get_str(&storage, &key), Some("0123456789".to_string()));
+                }
+            }
+        });
+    }
+
+    // ---------- WAL 的作废与重放 ----------
+
+    /// manifest 里最后一条记录。
+    fn last_manifest_edit(storage: &TestStorage) -> VersionEdit {
+        let path = storage.dir().join(MANIFEST_FILE_NAME);
+        let (_, records) = Manifest::recover(&path).unwrap();
+        match records.last().unwrap() {
+            ManifestRecord::Edit(edit) => edit.clone(),
+            other => panic!("最后一条应当是 Edit，实际是 {other:?}"),
+        }
+    }
+
+    // flush 一张带 WAL 的表：记录带上它的编号（高水位），它的 WAL 被删掉，其余的 WAL 还在。
+    #[test]
+    fn flush_records_the_high_water_and_removes_the_wal() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        let flushed_id = storage.snapshot().memtable.id();
+        freeze(&storage);
+        let current_id = storage.snapshot().memtable.id();
+
+        storage.flush_all_imm_memtables().unwrap();
+
+        let edit = last_manifest_edit(&storage);
+        assert_eq!(edit.flushed_memtable_id, Some(flushed_id));
+        assert_eq!(edit.added, state_ids(&storage).0);
+        assert_eq!(wal_ids(storage.dir()), vec![current_id]);
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+    }
+
+    // 空表也要作废它的 WAL：记一条没有文件、只带高水位的记录，WAL 被删掉。
+    #[test]
+    fn flushing_an_empty_memtable_still_retires_its_wal() {
+        let storage = open_with_wal(usize::MAX);
+        let empty_id = storage.snapshot().memtable.id();
+        freeze(&storage);
+
+        storage.flush_all_imm_memtables().unwrap();
+
+        let edit = last_manifest_edit(&storage);
+        assert_eq!(edit.flushed_memtable_id, Some(empty_id));
+        assert!(edit.added.is_empty());
+        assert!(!wal_ids(storage.dir()).contains(&empty_id));
+        assert!(storage.sst_file_names().is_empty());
+    }
+
+    // 没开 WAL 时 flush 的记录也带高水位；空表照旧不写记录。
+    #[test]
+    fn without_wal_flush_records_the_high_water_but_empty_flush_does_not() {
+        let storage = open_without_auto_freeze();
+        storage.put(b"a", b"1").unwrap();
+        let flushed_id = storage.snapshot().memtable.id();
+        freeze(&storage);
+        storage.flush_all_imm_memtables().unwrap();
+        let records_before = Manifest::recover(&storage.dir().join(MANIFEST_FILE_NAME))
+            .unwrap()
+            .1
+            .len();
+
+        freeze(&storage);
+        storage.flush_all_imm_memtables().unwrap();
+
+        let (_, records) = Manifest::recover(&storage.dir().join(MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(records.len(), records_before);
+        assert_eq!(
+            last_manifest_edit(&storage).flushed_memtable_id,
+            Some(flushed_id)
+        );
+    }
+
+    // 不 flush 就重启（崩溃）：可写的表与冻结的表都从 WAL 重建，读到的与重启前一样；
+    // 同一个 key 在几张表里，读到的仍是最新的。
+    #[test]
+    fn reopen_replays_the_wals_of_unflushed_memtables() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"1").unwrap();
+        freeze(&storage);
+        storage.put(b"a", b"2").unwrap();
+        storage.delete(b"b").unwrap();
+        freeze(&storage);
+        storage.put(b"c", b"3").unwrap();
+        let before = scan_all(&storage);
+        let state = storage.snapshot();
+        let mut old_ids: Vec<usize> = state.imm_memtables.iter().map(|t| t.id()).collect();
+        old_ids.insert(0, state.memtable.id());
+
+        let storage = storage.reopen();
+
+        assert_eq!(scan_all(&storage), before);
+        assert_eq!(get_str(&storage, "a"), Some("2".to_string()));
+        assert_eq!(get_str(&storage, "b"), None);
+        let state = storage.snapshot();
+        // 原来的三张表都成了冻结的表，新的在前；换上一张编号更大的新表。
+        let recovered: Vec<usize> = state.imm_memtables.iter().map(|t| t.id()).collect();
+        assert_eq!(recovered, old_ids);
+        assert!(state.memtable.id() > old_ids[0]);
+        assert_eq!(state.memtable.approximate_size(), 0);
+    }
+
+    // 没 flush 过就重启：manifest 记下的下一个编号还是 1，新表的编号要越过还在的 WAL，
+    // 不能重名（重名时建 WAL 会失败，打不开）。
+    #[test]
+    fn reopen_picks_an_id_above_the_live_wals() {
+        let storage = open_with_wal(usize::MAX);
+        for i in 0..3 {
+            storage.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            freeze(&storage);
+        }
+        let newest_before = storage.snapshot().memtable.id();
+
+        let storage = storage.reopen();
+
+        let new_id = storage.snapshot().memtable.id();
+        assert!(new_id > newest_before);
+        assert_eq!(wal_ids(storage.dir()).last(), Some(&new_id));
+        assert_eq!(get_str(&storage, "k2"), Some("v".to_string()));
+    }
+
+    // 重放出的表照常 flush：WAL 被删掉，数据进了 SST；再重启只剩可写的表的 WAL，数据都在。
+    #[test]
+    fn recovered_memtables_flush_and_their_wals_go_away() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        freeze(&storage);
+        storage.put(b"b", b"2").unwrap();
+        let storage = storage.reopen();
+
+        storage.flush_all_imm_memtables().unwrap();
+
+        let current_id = storage.snapshot().memtable.id();
+        assert_eq!(wal_ids(storage.dir()), vec![current_id]);
+        assert_eq!(state_ids(&storage).0.len(), 2);
+        assert_manifest_matches_state(&storage);
+
+        let storage = storage.reopen();
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+        assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
+        assert_eq!(storage.imm_memtable_count(), 1);
+    }
+
+    // 高水位已经记下、WAL 还没来得及删时崩溃：重启时它们不重放、被删掉，旧值不会盖住更新的 SST。
+    // 编号低于高水位的与正好等于高水位的（最后一次 flush 的那张表）都要删。
+    #[test]
+    fn reopen_drops_wals_up_to_the_high_water() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"k", b"old").unwrap();
+        let old_wal = wal_path(storage.dir(), storage.snapshot().memtable.id());
+        let old_bytes = std::fs::read(&old_wal).unwrap();
+        freeze(&storage);
+        storage.flush_all_imm_memtables().unwrap();
+        storage.put(b"k", b"new").unwrap();
+        let last_id = storage.snapshot().memtable.id();
+        let last_wal = wal_path(storage.dir(), last_id);
+        let last_bytes = std::fs::read(&last_wal).unwrap();
+        freeze(&storage);
+        storage.flush_all_imm_memtables().unwrap();
+        assert_eq!(
+            last_manifest_edit(&storage).flushed_memtable_id,
+            Some(last_id)
+        );
+        // 模拟崩溃：两张表的 WAL 都没有删成。
+        std::fs::write(&old_wal, &old_bytes).unwrap();
+        std::fs::write(&last_wal, &last_bytes).unwrap();
+
+        let storage = storage.reopen();
+
+        assert_eq!(get_str(&storage, "k"), Some("new".to_string()));
+        assert!(!old_wal.exists());
+        assert!(!last_wal.exists());
+        // 只重放了崩溃时那张可写的空表。
+        assert_eq!(storage.imm_memtable_count(), 1);
+    }
+
+    // 最新的 WAL 末尾只写了一半（崩溃在追加途中）：截掉那半条，前面完整的写入都在，之后照常写。
+    #[test]
+    fn reopen_cuts_a_torn_wal_tail() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"2").unwrap();
+        let id = storage.snapshot().memtable.id();
+        let half = crate::wal::encode_entry(b"c", b"3");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal_path(storage.dir(), id))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &half[..half.len() - 3]).unwrap();
+        drop(file);
+
+        let storage = storage.reopen();
+
+        assert_eq!(scan_all(&storage), expected(&[("a", "1"), ("b", "2")]));
+        storage.put(b"d", b"4").unwrap();
+        let storage = storage.reopen();
+        assert_eq!(get_str(&storage, "d"), Some("4".to_string()));
+        assert_eq!(get_str(&storage, "c"), None);
+    }
+
+    // WAL 中间损坏：打不开，是 Corruption，文件不动。
+    #[test]
+    fn reopen_refuses_a_corrupted_wal() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        storage.put(b"b", b"2").unwrap();
+        let id = storage.snapshot().memtable.id();
+        let options = storage.options.clone();
+        let TestStorage { storage, dir } = storage;
+        drop(storage);
+        let path = wal_path(dir.path(), id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[6] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_open_corruption(LsmStorage::open(dir.path(), options));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    // 关掉 WAL 重新打开：上次留下的 WAL 照样重放，数据不丢；新表没有 WAL。
+    #[test]
+    fn reopen_without_wal_still_replays_existing_wals() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"a", b"1").unwrap();
+        let options = LsmStorageOptions {
+            enable_wal: false,
+            ..storage.options.clone()
+        };
+        let TestStorage { storage, dir } = storage;
+        drop(storage);
+
+        let storage = LsmStorage::open(dir.path(), options).unwrap();
+
+        assert_eq!(storage.get(b"a").unwrap(), Some(Bytes::from_static(b"1")));
+        assert!(!storage.snapshot().memtable.has_wal());
+        storage.flush_all_imm_memtables().unwrap();
+        assert_eq!(wal_ids(dir.path()), Vec::<usize>::new());
+    }
+
+    // 目录里有 WAL 却没有 manifest：不是这个引擎留下的，打不开，文件不动。
+    #[test]
+    fn wals_without_a_manifest_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00001.wal");
+        std::fs::write(&path, crate::wal::encode_entry(b"a", b"1")).unwrap();
+
+        assert_open_corruption(LsmStorage::open(dir.path(), no_compaction_options()));
+        assert!(path.exists());
+        assert!(!dir.path().join(MANIFEST_FILE_NAME).exists());
     }
 }

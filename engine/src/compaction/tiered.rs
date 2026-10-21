@@ -405,7 +405,7 @@ mod tests {
             ids.iter().map(|id| tiny_sst(dir, *id)).collect()
         };
         LsmStorageState {
-            memtable: Arc::new(MemTable::new()),
+            memtable: Arc::new(MemTable::new(0)),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels: tiers.iter().map(|ids| to_ssts(ids)).collect(),

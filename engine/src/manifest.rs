@@ -63,6 +63,11 @@ pub struct VersionEdit {
     pub placement: Placement,
     /// 追加这条记录时下一个要分配的编号。重放后取最后一条的。
     pub next_sst_id: usize,
+    /// 这次换状态把编号为多少的 memtable 写成了 SST：flush 才有，合并、挪动是 `None`。
+    /// flush 从最旧的表开始一张一张做，所以编号不超过它的表都已写成 SST，它们的 WAL 不用再重放。
+    /// 是 `None` 时不写进 JSON；L14 之前写的记录也没有这一项，读出来都是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flushed_memtable_id: Option<usize>,
 }
 
 /// 加上的文件放到哪里。
@@ -124,7 +129,7 @@ impl Manifest {
 }
 
 /// 同步 `path` 所在的目录。
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -210,6 +215,9 @@ pub struct RecoveredLayout {
     pub levels: Vec<Vec<usize>>,
     /// 下一个要分配的编号。
     pub next_sst_id: usize,
+    /// 已经写成 SST 的 memtable 里编号最大的一张（高水位）：编号不超过它的 WAL 都没用了。
+    /// `None` 表示还没有 flush 过。
+    pub flushed_memtable_id: Option<usize>,
 }
 
 impl RecoveredLayout {
@@ -225,6 +233,7 @@ impl RecoveredLayout {
             l0: Vec::new(),
             levels,
             next_sst_id: 1,
+            flushed_memtable_id: None,
         }
     }
 }
@@ -252,6 +261,19 @@ pub fn replay(records: &[ManifestRecord]) -> Result<RecoveredLayout> {
         };
         apply_edit(&mut layout, edit)?;
         layout.next_sst_id = edit.next_sst_id;
+        if let Some(flushed) = edit.flushed_memtable_id {
+            // flush 从最旧的表开始做，表的编号按冻结的先后递增：高水位只会往上走。
+            if layout
+                .flushed_memtable_id
+                .is_some_and(|previous| flushed <= previous)
+            {
+                return Err(Error::Corruption(format!(
+                    "manifest 第 {} 条记录 flush 的 memtable {flushed} 不比之前的大",
+                    index + 1
+                )));
+            }
+            layout.flushed_memtable_id = Some(flushed);
+        }
     }
     Ok(layout)
 }
@@ -348,18 +370,21 @@ mod tests {
                 added: vec![1],
                 placement: Placement::L0,
                 next_sst_id: 2,
+                flushed_memtable_id: None,
             }),
             ManifestRecord::Edit(VersionEdit {
                 removed: vec![2, 1],
                 added: vec![3, 4],
                 placement: Placement::Level(1),
                 next_sst_id: 5,
+                flushed_memtable_id: None,
             }),
             ManifestRecord::Edit(VersionEdit {
                 removed: vec![],
                 added: vec![5],
                 placement: Placement::Tier,
                 next_sst_id: 6,
+                flushed_memtable_id: None,
             }),
         ]
     }
@@ -394,6 +419,7 @@ mod tests {
             added: vec![3],
             placement: Placement::Level(1),
             next_sst_id: 4,
+            flushed_memtable_id: None,
         });
 
         let frame = encode_record(&record);
@@ -607,6 +633,7 @@ mod tests {
             added: added.to_vec(),
             placement,
             next_sst_id: next,
+            flushed_memtable_id: None,
         })
     }
 
@@ -840,5 +867,77 @@ mod tests {
             replay(&recovered).unwrap().levels,
             vec![vec![3], vec![], vec![]]
         );
+    }
+
+    /// 一条 flush 的 Edit 记录：把编号为 `flushed` 的 memtable 写成了 `added`。
+    fn flush_edit(added: &[usize], flushed: usize, next: usize) -> ManifestRecord {
+        ManifestRecord::Edit(VersionEdit {
+            removed: vec![],
+            added: added.to_vec(),
+            placement: Placement::L0,
+            next_sst_id: next,
+            flushed_memtable_id: Some(flushed),
+        })
+    }
+
+    // L14 之前写的记录没有 flushed_memtable_id：照样解得出来，这一项是 None。
+    #[test]
+    fn old_record_without_flushed_memtable_id_decodes() {
+        let json = r#"{"Edit":{"removed":[],"added":[1],"placement":"L0","next_sst_id":2}}"#;
+
+        let record: ManifestRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(record, edit(&[], &[1], Placement::L0, 2));
+    }
+
+    // 高水位取最后一条 flush 记录的；合并的记录（None）不改变它；没有 flush 过时是 None。
+    #[test]
+    fn replay_keeps_the_latest_flushed_memtable_id() {
+        let none = replay_levels(vec![edit(&[], &[1], Placement::L0, 2)]).unwrap();
+        assert_eq!(none.flushed_memtable_id, None);
+
+        let layout = replay_levels(vec![
+            flush_edit(&[2], 1, 4),
+            flush_edit(&[4], 3, 6),
+            edit(&[4, 2], &[6], Placement::Level(1), 7),
+            flush_edit(&[], 5, 8),
+        ])
+        .unwrap();
+
+        assert_eq!(layout.flushed_memtable_id, Some(5));
+        assert_eq!(layout.l0, Vec::<usize>::new());
+        assert_eq!(layout.levels[0], vec![6]);
+    }
+
+    // 空表的 flush：没有加上文件，只把高水位往上推；tiered 时也不留下空的 tier。
+    #[test]
+    fn replay_empty_flush_only_moves_the_high_water() {
+        let levels = replay_levels(vec![flush_edit(&[], 1, 2)]).unwrap();
+        assert!(levels.l0.is_empty());
+        assert_eq!(levels.flushed_memtable_id, Some(1));
+
+        let empty_tier_flush = ManifestRecord::Edit(VersionEdit {
+            removed: vec![],
+            added: vec![],
+            placement: Placement::Tier,
+            next_sst_id: 2,
+            flushed_memtable_id: Some(1),
+        });
+        let tiers = replay_tiers(vec![empty_tier_flush]).unwrap();
+        assert!(tiers.levels.is_empty());
+        assert_eq!(tiers.flushed_memtable_id, Some(1));
+    }
+
+    // 高水位倒退或者不变：flush 的顺序被打乱，是 Corruption。
+    #[test]
+    fn replay_rejects_a_flushed_memtable_id_going_back() {
+        assert_corruption(replay_levels(vec![
+            flush_edit(&[2], 3, 4),
+            flush_edit(&[4], 1, 5),
+        ]));
+        assert_corruption(replay_levels(vec![
+            flush_edit(&[2], 3, 4),
+            flush_edit(&[4], 3, 5),
+        ]));
     }
 }

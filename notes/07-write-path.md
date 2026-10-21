@@ -96,7 +96,7 @@ flush 要读完一整张表、写文件、同步，耗时以毫秒到秒计。�
 - **后台持续失败时拒绝写入**：RocksDB 把后台的写盘失败记为 background error，此后的写入直接返回这个错误。
 - **长度上限**：key 与 value 来自程序外部（命令行、网络）时，超长是输入的问题而不是调用方的程序错误，应当返回错误而不是 panic。
 
-LevelDB、RocksDB 的 `Put` 从一开始就返回 `Status`，mini-lsm 的 `put` 也从一开始就返回 `Result<()>`：它们预先为 WAL 留好了位置，接口以后不用再改。本项目先按当前的实际情况写，到 WAL 时再改，这次改动由编译器找出所有调用处。
+LevelDB、RocksDB 的 `Put` 从一开始就返回 `Status`，mini-lsm 的 `put` 也从一开始就返回 `Result<()>`：它们预先为 WAL 留好了位置，接口以后不用再改。本项目先按当前的实际情况写，到 WAL 时再改，这次改动由编译器找出所有调用处。[L14](14-wal.md) 已改为返回 `Result`：追加 WAL 可能失败，超长的 key 或 value 返回 `InvalidArgument`；空 key、空 value 仍是 panic。
 
 ## 常见错误
 

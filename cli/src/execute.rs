@@ -16,7 +16,7 @@ use crate::command::{Command, HELP};
 pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> anyhow::Result<()> {
     match command {
         Command::Put { key, value } => {
-            db.put(key.as_bytes(), value.as_bytes());
+            db.put(key.as_bytes(), value.as_bytes())?;
             writeln!(out, "OK")?;
         }
         Command::Get { key } => {
@@ -31,7 +31,7 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
             }
         }
         Command::Delete { key } => {
-            db.delete(key.as_bytes());
+            db.delete(key.as_bytes())?;
             writeln!(out, "OK")?;
         }
         Command::Scan { lower, upper } => {
@@ -58,7 +58,7 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
             for i in 0..*count {
                 let key = format!("key-{i:06}");
                 let value = format!("value-{i:06}");
-                db.put(key.as_bytes(), value.as_bytes());
+                db.put(key.as_bytes(), value.as_bytes())?;
             }
             writeln!(out, "写入 {count} 条")?;
         }
@@ -97,15 +97,25 @@ pub fn execute(db: &Db, dir: &Path, command: &Command, out: &mut impl Write) -> 
             }
             let (cached_blocks, cached_bytes) = db.block_cache_usage();
             writeln!(out, "块缓存：{cached_blocks} 个块，{cached_bytes} 字节")?;
-            let files = sst_files(dir)?;
+            let files = files_with_suffix(dir, ".sst")?;
             writeln!(out, "目录里的 SST 文件：{}", files.len())?;
             for (name, size) in files {
                 writeln!(out, "  {name}  {size} 字节")?;
             }
+            // 每张还在内存里的表一个 WAL；表写成 SST 之后它的 WAL 被删掉。
+            let wals = files_with_suffix(dir, ".wal")?;
+            writeln!(out, "目录里的 WAL 文件：{}", wals.len())?;
+            for (name, size) in wals {
+                writeln!(out, "  {name}  {size} 字节")?;
+            }
+        }
+        Command::Sync => {
+            db.sync()?;
+            writeln!(out, "OK")?;
         }
         Command::Help => writeln!(out, "{HELP}")?,
-        // 由调用方处理：它要结束读输入的循环。
-        Command::Quit => {}
+        // 由调用方处理：一个要结束读输入的循环，一个要结束整个进程。
+        Command::Quit | Command::Crash => {}
     }
     Ok(())
 }
@@ -116,13 +126,13 @@ fn join_counts(counts: &[usize]) -> String {
     texts.join(" / ")
 }
 
-/// 目录里的 SST 文件：文件名与长度（字节），按文件名排序。
-pub fn sst_files(dir: &Path) -> std::io::Result<Vec<(String, u64)>> {
+/// 目录里文件名以 `suffix` 结尾的文件（例如 `.sst`）：文件名与长度（字节），按文件名排序。
+pub fn files_with_suffix(dir: &Path, suffix: &str) -> std::io::Result<Vec<(String, u64)>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".sst") {
+        if name.ends_with(suffix) {
             let size = entry.metadata()?.len();
             files.push((name, size));
         }
@@ -185,6 +195,7 @@ mod tests {
                 target_sst_size: 4096,
                 max_levels: 3,
                 compaction,
+                enable_wal: true,
             };
             let db = Db::open(dir.path(), options).unwrap();
             Self { db, dir }
@@ -256,9 +267,12 @@ mod tests {
     #[test]
     fn status_shows_counts_and_files() {
         let db = TestDb::open(usize::MAX);
-        assert_eq!(
-            db.run("status"),
-            "冻结的 memtable：0\nL0 的 SST：0\nL1 的 SST：0\nL2 的 SST：0\nL3 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：0\n"
+        let status = db.run("status");
+        assert!(
+            status.starts_with(
+                "冻结的 memtable：0\nL0 的 SST：0\nL1 的 SST：0\nL2 的 SST：0\nL3 的 SST：0\n块缓存：0 个块，0 字节\n目录里的 SST 文件：0\n目录里的 WAL 文件：1\n"
+            ),
+            "{status}"
         );
         db.run("put a 1");
 
@@ -271,7 +285,9 @@ mod tests {
             ),
             "{status}"
         );
-        assert!(status.contains("00001.sst"), "{status}");
+        // 文件名是编号，memtable 也占编号，所以不写死是哪一个。
+        let file_lines = status.lines().filter(|line| line.contains(".sst ")).count();
+        assert_eq!(file_lines, 1, "{status}");
     }
 
     // compact 把全部文件合并进最底层，旧文件从目录里删掉；数据照常读得到。
@@ -291,7 +307,10 @@ mod tests {
             format!("合并完成：L0 有 0 个 SST，L1 往下各层依次有 0 / 0 / {bottom_count} 个\n")
         );
         assert!(bottom_count > 0);
-        assert_eq!(sst_files(db.dir.path()).unwrap().len(), bottom_count);
+        assert_eq!(
+            files_with_suffix(db.dir.path(), ".sst").unwrap().len(),
+            bottom_count
+        );
         assert_eq!(db.run("get key-000123"), "value-000123\n");
     }
 
@@ -337,19 +356,33 @@ mod tests {
         assert_eq!(db.run("help"), format!("{HELP}\n"));
     }
 
-    // 只列出 .sst 文件，按文件名排序，长度是文件的实际长度。
+    // 只列出给定后缀的文件（这里是 .sst），按文件名排序，长度是文件的实际长度。
     #[test]
-    fn sst_files_lists_only_sst_files_sorted() {
+    fn files_with_suffix_lists_only_matching_files_sorted() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("00002.sst"), b"xx").unwrap();
         std::fs::write(dir.path().join("00001.sst"), b"x").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
 
-        let files = sst_files(dir.path()).unwrap();
+        let files = files_with_suffix(dir.path(), ".sst").unwrap();
 
         assert_eq!(
             files,
             vec![("00001.sst".to_string(), 1), ("00002.sst".to_string(), 2)]
         );
+    }
+
+    // 写入之后，可写的表的 WAL 变大；sync 回答 OK。
+    #[test]
+    fn status_shows_the_wal_growing_and_sync_succeeds() {
+        let db = TestDb::open(usize::MAX);
+        let wal_size = || files_with_suffix(db.dir.path(), ".wal").unwrap()[0].1;
+        assert_eq!(wal_size(), 0);
+
+        db.run("put a 1");
+
+        assert!(wal_size() > 0);
+        assert_eq!(db.run("sync"), "OK\n");
+        assert!(db.run("status").contains("目录里的 WAL 文件：1"));
     }
 }

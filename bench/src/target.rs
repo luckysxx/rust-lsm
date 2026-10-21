@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use lsm::compaction::CompactionOptions;
 use lsm::db::Db;
 use lsm::iterators::StorageIterator;
-use lsm::lsm_storage::LsmStorageOptions;
+use lsm::lsm_storage::{LsmStorageOptions, WriteOptions};
 use lsm::manifest::{MANIFEST_FILE_NAME, Manifest};
 use lsm::mem_table::{MemTable, MemTableIterator};
 use lsm::stats::StatsSnapshot;
@@ -106,14 +106,15 @@ impl KvTarget for BTreeMapTarget {
 /// `MemTable` 的 `put` 与 `get` 只需要 `&self`，本身可以被多个线程同时调用，
 /// 所以这里不加锁。与 `BTreeMapTarget` 相比，差别就是"一把锁加平衡树"和
 /// "无锁跳表"。
-#[derive(Default)]
 pub struct MemTableTarget {
     mem_table: Arc<MemTable>,
 }
 
 impl MemTableTarget {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            mem_table: Arc::new(MemTable::new(0)),
+        }
     }
 }
 
@@ -123,7 +124,7 @@ impl KvTarget for MemTableTarget {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
-        self.mem_table.put(key, value);
+        self.mem_table.put(key, value).expect("写入失败");
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -137,7 +138,8 @@ impl KvTarget for MemTableTarget {
     }
 }
 
-/// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；没有 WAL。
+/// 完整的引擎：memtable 写满即冻结，后台线程把冻结的表写成 L0 的 SST；`config.enable_wal`
+/// 时写入先追加到 WAL，`config.sync_writes` 时每次写入还要同步。
 ///
 /// `config.compaction` 为 `None` 时没有自动的 compaction：L0 的文件只增不减，只有执行
 /// `compact` 负载时才全部合并到最底层。给了参数时，后台线程按简单分层策略反复合并。
@@ -164,6 +166,10 @@ pub struct EngineConfig {
     pub max_levels: usize,
     /// 后台自动合并的策略与参数。
     pub compaction: CompactionOptions,
+    /// 写入是否先追加到 WAL。
+    pub enable_wal: bool,
+    /// 每次写入是否同步 WAL（`WriteOptions::sync`）。只在 `enable_wal` 时有意义。
+    pub sync_writes: bool,
 }
 
 #[cfg(test)]
@@ -175,6 +181,8 @@ impl EngineConfig {
             block_cache_size,
             max_levels: 4,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
+            sync_writes: false,
         }
     }
 }
@@ -189,6 +197,7 @@ impl EngineTarget {
             target_sst_size: config.memtable_size_limit,
             max_levels: config.max_levels,
             compaction: config.compaction.clone(),
+            enable_wal: config.enable_wal,
         };
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let db = Db::open(dir.path(), options).expect("打开引擎失败");
@@ -226,7 +235,10 @@ impl KvTarget for EngineTarget {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
-        self.db.put(key, value);
+        let options = WriteOptions {
+            sync: self.config.sync_writes,
+        };
+        self.db.put_opt(key, value, options).expect("写入失败");
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -296,8 +308,13 @@ impl KvTarget for EngineTarget {
         let cached_megabytes = cached_bytes as f64 / (1024.0 * 1024.0);
         let (manifest_records, manifest_bytes) = self.manifest_usage();
         let manifest_kilobytes = manifest_bytes as f64 / 1024.0;
+        let wal = match (self.config.enable_wal, self.config.sync_writes) {
+            (false, _) => "不写 WAL",
+            (true, false) => "写入追加到 WAL、不同步",
+            (true, true) => "写入追加到 WAL 并同步",
+        };
         Some(format!(
-            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，{strategy}；\
+            "memtable 上限 {memtable_megabytes} MB，块缓存 {cache_megabytes} MB，{wal}，{strategy}；\
              结束时有 {frozen} 张冻结的 memtable 等待落盘，{shape}，\
              {levels_name}依次有 {level_files} 个，块缓存里有 {cached_blocks} 个块（{cached_megabytes:.1} MB），\
              MANIFEST 有 {manifest_records} 条记录（{manifest_kilobytes:.1} KB）"
@@ -474,6 +491,28 @@ mod tests {
         assert!(stats.flush_bytes_written > 0);
     }
 
+    // 开了 WAL：写入追加到 WAL，计数器记下 WAL 的字节，报告里写明；sync 模式照常写入。
+    #[test]
+    fn engine_target_with_wal_counts_wal_bytes() {
+        for sync_writes in [false, true] {
+            let config = EngineConfig {
+                enable_wal: true,
+                sync_writes,
+                ..EngineConfig::without_compaction(1 << 20, 0)
+            };
+            let target = EngineTarget::new(config);
+            for i in 0..20 {
+                target.put(format!("key-{i:03}").as_bytes(), b"value");
+            }
+
+            let stats = target.stats().unwrap();
+            // 每条：4 字节长度、2 + 7 字节 key、2 + 5 字节 value、4 字节校验和。
+            assert_eq!(stats.wal_bytes_written, 20 * (4 + 2 + 7 + 2 + 5 + 4));
+            assert_eq!(target.get(b"key-019"), Some(b"value".to_vec()));
+            assert!(target.details().unwrap().contains("WAL"));
+        }
+    }
+
     // 开了自动合并：等后台工作做完之后，冻结的表全部落了盘，也没有待做的合并；
     // 有文件被合并进了 L1 往下的层。
     #[test]
@@ -486,6 +525,8 @@ mod tests {
                 level0_file_num_compaction_trigger: 2,
                 size_ratio_percent: 200,
             }),
+            enable_wal: false,
+            sync_writes: false,
         };
         let target = EngineTarget::new(config);
         for i in 0..200 {
@@ -515,6 +556,8 @@ mod tests {
                 min_merge_width: 2,
                 max_merge_width: None,
             }),
+            enable_wal: false,
+            sync_writes: false,
         };
         let target = EngineTarget::new(config);
         for i in 0..200 {

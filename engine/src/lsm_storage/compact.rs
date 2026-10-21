@@ -759,12 +759,12 @@ mod tests {
     fn flush_records(storage: &LsmStorage, pairs: &[(&str, &str)]) {
         for (key, value) in pairs {
             if value.is_empty() {
-                storage.delete(key.as_bytes());
+                storage.delete(key.as_bytes()).unwrap();
             } else {
-                storage.put(key.as_bytes(), value.as_bytes());
+                storage.put(key.as_bytes(), value.as_bytes()).unwrap();
             }
         }
-        storage.freeze_memtable();
+        storage.freeze_memtable().unwrap();
         storage.flush_all_imm_memtables().unwrap();
     }
 
@@ -939,6 +939,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction: CompactionOptions::NoCompaction,
+            enable_wal: false,
         });
         let keys = numbered_keys(100);
         let pairs: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "value")).collect();
@@ -981,6 +982,7 @@ mod tests {
             target_sst_size: 1024,
             max_levels: 3,
             compaction,
+            enable_wal: false,
         })
     }
 
@@ -1430,7 +1432,11 @@ mod tests {
         let storage = three_tiers();
 
         assert_eq!(storage.l0_sstable_count(), 0);
-        assert_eq!(tier_ids(&storage), vec![vec![3], vec![2], vec![1]]);
+        let tiers = tier_ids(&storage);
+        assert_eq!(tiers.len(), 3);
+        assert!(tiers.iter().all(|tier| tier.len() == 1));
+        // 编号随 flush 递增：最前面的 tier 编号最大。
+        assert!(tiers[0][0] > tiers[1][0] && tiers[1][0] > tiers[2][0]);
         assert_eq!(get_str(&storage, "a"), Some("3".to_string()));
         assert_eq!(get_str(&storage, "b"), Some("2".to_string()));
         assert_eq!(get_str(&storage, "c"), None);
@@ -1474,11 +1480,14 @@ mod tests {
         let (storage, task, output) = run_tiered_task_for(three_tiers(), 2);
         // 合并的期间，又 flush 出一个 tier，放在最前面。
         flush_records(&storage, &[("b", "newer")]);
+        let before = tier_ids(&storage);
+        let newest = before[0].clone();
+        let oldest = before[before.len() - 1].clone();
 
         let storage = apply_tiered_with_deadline(storage, task, output.clone());
 
         let output_ids: Vec<usize> = output.iter().map(|sst| sst.id()).collect();
-        assert_eq!(tier_ids(&storage), vec![vec![5], output_ids, vec![1]]);
+        assert_eq!(tier_ids(&storage), vec![newest, output_ids, oldest]);
         assert_eq!(get_str(&storage, "a"), Some("3".to_string()));
         assert_eq!(get_str(&storage, "b"), Some("newer".to_string()));
         assert_eq!(get_str(&storage, "c"), None);
@@ -1593,10 +1602,12 @@ mod tests {
     fn tiered_full_compaction_with_one_tier_does_nothing() {
         let storage = open_tiered(100);
         flush_records(&storage, &[("a", "1"), ("b", "")]);
+        let before = tier_ids(&storage);
 
         let storage = full_compaction(storage);
 
-        assert_eq!(tier_ids(&storage), vec![vec![1]]);
+        assert_eq!(before.len(), 1);
+        assert_eq!(tier_ids(&storage), before);
     }
 
     // ---------- leveled：apply_leveled_result、run_leveled_task、compact_once ----------

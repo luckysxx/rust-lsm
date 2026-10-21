@@ -2,35 +2,112 @@
 //!
 //! 一张可以被多个线程同时读写的有序表。删除不移除记录，而是写入一条
 //! value 为空的记录（墓碑），所以表里的记录只增不减。
+//!
+//! 开了 WAL 时，每张表有自己的 WAL 文件：写入先追加到 WAL，再插入表。崩溃之后重放这个文件，
+//! 就能重建这张表。
 
 use std::ops::Bound;
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::Result;
 use crate::iterators::StorageIterator;
+use crate::wal::Wal;
 
-#[derive(Default)]
 pub struct MemTable {
+    /// 表的编号，与 SST 共用一个计数器，所以不会与任何文件重名。WAL 的文件名就是它。
+    id: usize,
     /// 并发有序表，key 与 value 都由表自己持有。
     map: SkipMap<Bytes, Bytes>,
     /// 写入过的 key 与 value 的长度之和，覆盖写重复计入。
     approximate_size: AtomicUsize,
+    /// 这张表的 WAL。没开 WAL 时是 `None`，写入只进内存。
+    wal: Option<Wal>,
+    /// 有 WAL 时，"追加 WAL、插入表"两步一起在这把锁里做：WAL 里的先后就是插入的先后，
+    /// 重放得到的表与崩溃前的一样。没有 WAL 时不用它，写入之间不排队。
+    write_lock: Mutex<()>,
 }
 
 impl MemTable {
-    pub fn new() -> Self {
-        Self::default()
+    /// 一张没有 WAL 的空表，写入只进内存。
+    pub fn new(id: usize) -> Self {
+        Self {
+            id,
+            map: SkipMap::new(),
+            approximate_size: AtomicUsize::new(0),
+            wal: None,
+            write_lock: Mutex::new(()),
+        }
     }
 
-    /// 写入一条记录，覆盖同一个 key 原有的记录。
+    /// 一张带 WAL 的空表：在 `path` 新建 WAL 文件并同步所在的目录。文件已经存在时返回错误。
+    pub fn create_with_wal(id: usize, path: &Path) -> Result<Self> {
+        let wal = Wal::create(path)?;
+        let mut table = Self::new(id);
+        table.wal = Some(wal);
+        Ok(table)
+    }
+
+    /// 从 `path` 的 WAL 重建一张表：按写入的顺序把记录插回去，之后的写入接着追加到这个文件。
+    ///
+    /// 末尾写了一半的记录被截掉（见 [`Wal::recover`]）；中间损坏时返回
+    /// [`crate::error::Error::Corruption`]。
+    pub fn recover_from_wal(id: usize, path: &Path) -> Result<Self> {
+        let (wal, entries) = Wal::recover(path)?;
+        let mut table = Self::new(id);
+        for (key, value) in entries {
+            table.insert(&key, &value);
+        }
+        table.wal = Some(wal);
+        Ok(table)
+    }
+
+    /// 表的编号。
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// 这张表有没有 WAL。
+    pub fn has_wal(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// 写入一条记录，覆盖同一个 key 原有的记录。value 为空表示这个 key 被删除。
+    ///
+    /// 有 WAL 时先追加到 WAL、再插入表，两步在 `write_lock` 里一起做；追加失败时返回错误，
+    /// 表不变。追加只写进页缓存、不同步，要落到磁盘上再调用 [`MemTable::sync_wal`]。
     ///
     /// key 和 value 各拷贝一次，之后表里的数据与调用方的缓冲区无关。
-    /// value 为空表示这个 key 被删除。
-    pub fn put(&self, key: &[u8], value: &[u8]) {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        match &self.wal {
+            Some(wal) => {
+                let _guard = self.write_lock.lock().unwrap();
+                wal.append(key, value)?;
+                self.insert(key, value);
+            }
+            None => {
+                self.insert(key, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// 把这张表的 WAL 同步到磁盘；没有 WAL 时什么都不做。
+    ///
+    /// 不拿 `write_lock`：同步期间别的线程照常写入。返回之后，调用之前完成的写入都已落盘。
+    pub fn sync_wal(&self) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.sync()?;
+        }
+        Ok(())
+    }
+
+    /// 只插入表，不碰 WAL。
+    fn insert(&self, key: &[u8], value: &[u8]) {
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
         self.approximate_size
@@ -146,9 +223,9 @@ mod tests {
 
     /// 建一张表并按给定的顺序写入。
     fn table_with(pairs: &[(&str, &str)]) -> Arc<MemTable> {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
         for (key, value) in pairs {
-            table.put(key.as_bytes(), value.as_bytes());
+            table.put(key.as_bytes(), value.as_bytes()).unwrap();
         }
         Arc::new(table)
     }
@@ -166,7 +243,7 @@ mod tests {
     // 没写过的 key 查不到，返回 None。
     #[test]
     fn get_missing_key_returns_none() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
 
         assert_eq!(table.get(b"a"), None);
     }
@@ -174,10 +251,10 @@ mod tests {
     // 写入之后能读到同样的字节，没写过的 key 不受影响。
     #[test]
     fn put_then_get_returns_value() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
 
-        table.put(b"a", b"1");
-        table.put(b"b", b"22");
+        table.put(b"a", b"1").unwrap();
+        table.put(b"b", b"22").unwrap();
 
         assert_eq!(table.get(b"a"), Some(Bytes::from_static(b"1")));
         assert_eq!(table.get(b"b"), Some(Bytes::from_static(b"22")));
@@ -187,10 +264,10 @@ mod tests {
     // 同一个 key 写两次，读到的是后写的值。
     #[test]
     fn put_overwrites_existing_key() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
 
-        table.put(b"a", b"old");
-        table.put(b"a", b"new");
+        table.put(b"a", b"old").unwrap();
+        table.put(b"a", b"new").unwrap();
 
         assert_eq!(table.get(b"a"), Some(Bytes::from_static(b"new")));
     }
@@ -199,10 +276,10 @@ mod tests {
     // 两者含义不同：None 表示"这张表不知道"，Some(空) 表示"已删除"。
     #[test]
     fn empty_value_is_kept_as_tombstone() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
 
-        table.put(b"a", b"1");
-        table.put(b"a", b"");
+        table.put(b"a", b"1").unwrap();
+        table.put(b"a", b"").unwrap();
 
         assert_eq!(table.get(b"a"), Some(Bytes::new()));
     }
@@ -210,11 +287,11 @@ mod tests {
     // put 拷贝了数据：调用方之后改动自己的缓冲区，表里的内容不变。
     #[test]
     fn put_copies_callers_buffers() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
         let mut key = b"key".to_vec();
         let mut value = b"value".to_vec();
 
-        table.put(&key, &value);
+        table.put(&key, &value).unwrap();
         key[0] = b'X';
         value[0] = b'X';
 
@@ -225,8 +302,8 @@ mod tests {
     // get 交出的值不依赖表：表被释放之后，手里的值仍然可读。
     #[test]
     fn value_outlives_table() {
-        let table = MemTable::new();
-        table.put(b"a", b"still here");
+        let table = MemTable::new(0);
+        table.put(b"a", b"still here").unwrap();
 
         let value = table.get(b"a").unwrap();
         drop(table);
@@ -237,11 +314,11 @@ mod tests {
     // 估算的大小是写入的 key 长度与 value 长度之和，空表为 0。
     #[test]
     fn approximate_size_adds_key_and_value_lengths() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
         assert_eq!(table.approximate_size(), 0);
 
-        table.put(b"a", b"1");
-        table.put(b"bb", b"222");
+        table.put(b"a", b"1").unwrap();
+        table.put(b"bb", b"222").unwrap();
 
         assert_eq!(table.approximate_size(), 2 + 5);
     }
@@ -249,11 +326,11 @@ mod tests {
     // 同一个 key 写两次，估算的大小把两次都算进去，不扣掉被覆盖的那一次。
     #[test]
     fn approximate_size_adds_same_key_lengths() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
         assert_eq!(table.approximate_size(), 0);
 
-        table.put(b"a", b"1");
-        table.put(b"a", b"222");
+        table.put(b"a", b"1").unwrap();
+        table.put(b"a", b"222").unwrap();
 
         assert_eq!(table.approximate_size(), 2 + 4);
     }
@@ -261,7 +338,7 @@ mod tests {
     // 多个线程同时写入各自的 key，一条都不丢，大小也没有少算。
     #[test]
     fn concurrent_puts_are_all_visible() {
-        let table = MemTable::new();
+        let table = MemTable::new(0);
         let threads = 8;
         let puts_per_thread = 1000;
 
@@ -271,7 +348,7 @@ mod tests {
                 scope.spawn(move || {
                     for i in 0..puts_per_thread {
                         let key = format!("t{thread_id}-{i:04}");
-                        table.put(key.as_bytes(), b"v");
+                        table.put(key.as_bytes(), b"v").unwrap();
                     }
                 });
             }
@@ -390,11 +467,115 @@ mod tests {
         iter.next().unwrap();
         assert_eq!(iter.key(), b"d");
 
-        table.put(b"a", b"1");
-        table.put(b"e", b"5");
+        table.put(b"a", b"1").unwrap();
+        table.put(b"e", b"5").unwrap();
 
         let rest = collect_all(&mut iter);
 
         assert_eq!(rest, expected(&[("d", "4"), ("e", "5")]));
+    }
+
+    // ---------- WAL ----------
+
+    /// 读出 WAL 文件里的全部记录，变成字符串。
+    fn wal_entries(path: &Path) -> Vec<(String, String)> {
+        let (_wal, entries) = Wal::recover(path).unwrap();
+        entries
+            .iter()
+            .map(|(key, value)| {
+                let key = String::from_utf8(key.to_vec()).unwrap();
+                let value = String::from_utf8(value.to_vec()).unwrap();
+                (key, value)
+            })
+            .collect()
+    }
+
+    // 带 WAL 的表：每次写入按顺序追加到 WAL，墓碑也在其中；表里照常读得到。
+    #[test]
+    fn wal_records_every_put_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00007.wal");
+        let table = MemTable::create_with_wal(7, &path).unwrap();
+
+        table.put(b"a", b"1").unwrap();
+        table.put(b"b", b"2").unwrap();
+        table.put(b"a", b"").unwrap();
+        table.sync_wal().unwrap();
+
+        assert_eq!(table.id(), 7);
+        assert_eq!(table.get(b"a"), Some(Bytes::new()));
+        assert_eq!(table.get(b"b"), Some(Bytes::from_static(b"2")));
+        let expected = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+            ("a".to_string(), String::new()),
+        ];
+        assert_eq!(wal_entries(&path), expected);
+    }
+
+    // WAL 文件已经存在时建表失败，不覆盖原来的文件。
+    #[test]
+    fn create_with_wal_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00007.wal");
+        let table = MemTable::create_with_wal(7, &path).unwrap();
+        table.put(b"a", b"1").unwrap();
+
+        assert!(MemTable::create_with_wal(7, &path).is_err());
+        assert_eq!(wal_entries(&path).len(), 1);
+    }
+
+    // 没有 WAL 的表不建文件；sync_wal 什么都不做。
+    #[test]
+    fn table_without_wal_writes_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = MemTable::new(3);
+
+        table.put(b"a", b"1").unwrap();
+        table.sync_wal().unwrap();
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(table.get(b"a"), Some(Bytes::from_static(b"1")));
+    }
+
+    // 几个线程在同一时刻写同一个 key：WAL 里最后一条的值就是表里的值，重放得到的与崩溃前一样。
+    // 每个 key 都先用 Barrier 让线程对齐再一起写；追加之后停一小段长短不一的时间，
+    // 两步之间没有锁时插入的先后就会与追加的先后不同。
+    #[test]
+    fn wal_order_matches_table_under_concurrent_puts() {
+        crate::test_util::run_with_slow_deadline("并发写同一个 key", || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("00001.wal");
+            let table = MemTable::create_with_wal(1, &path).unwrap();
+            table.wal.as_ref().unwrap().make_appends_slow();
+            let threads = 4;
+            let keys = 50;
+            let barrier = std::sync::Barrier::new(threads);
+            thread::scope(|scope| {
+                for thread_id in 0..threads {
+                    let table = &table;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        for i in 0..keys {
+                            let key = format!("k{i:02}");
+                            let value = format!("t{thread_id}");
+                            barrier.wait();
+                            table.put(key.as_bytes(), value.as_bytes()).unwrap();
+                        }
+                    });
+                }
+            });
+
+            let entries = wal_entries(&path);
+            assert_eq!(entries.len(), threads * keys);
+            let mut last_in_wal = std::collections::BTreeMap::new();
+            for (key, value) in entries {
+                last_in_wal.insert(key, value);
+            }
+            for (key, value) in &last_in_wal {
+                let in_table = table.get(key.as_bytes()).unwrap();
+                assert_eq!(value.as_bytes(), &in_table[..], "{key}");
+            }
+        });
     }
 }

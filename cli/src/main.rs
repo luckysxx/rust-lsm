@@ -26,7 +26,9 @@ const USAGE: &str = "\
                    合并策略要与写入时的形状相同（simple 与 leveled 可以互换）
   memtable 上限    可写的 memtable 写满多少字节就冻结（默认 4096）。
                    取得小，几十条记录就能看到 SST 文件出现
-  合并策略         simple（简单分层，默认）、tiered 或 leveled";
+  合并策略         simple（简单分层，默认）、tiered 或 leveled
+
+写入先追加到 WAL（不同步）：进程崩溃或者输入 crash 退出之后，再次打开时数据都在。";
 
 /// memtable 上限的默认值，字节。取得小，用 `fill` 写几十条就会冻结。
 const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4096;
@@ -81,6 +83,8 @@ fn main() -> anyhow::Result<()> {
         target_sst_size: memtable_size_limit,
         max_levels: MAX_LEVELS,
         compaction,
+        // 打开 WAL：可以用 crash 命令或 Ctrl-C 结束进程，再打开看数据是否都在。
+        enable_wal: true,
     };
     let db = Db::open(&dir, options).with_context(|| format!("打开数据库：{}", dir.display()))?;
     println!("已打开 {}。输入 help 查看命令。", dir.display());
@@ -132,6 +136,11 @@ fn run(db: &Db, dir: &Path) -> anyhow::Result<()> {
         };
         if command == Command::Quit {
             return Ok(());
+        }
+        if command == Command::Crash {
+            // 不关闭数据库、不运行任何清理，进程立刻结束：与被 kill 掉一样。
+            println!("进程立刻结束，没有关闭数据库。再次打开时从 WAL 恢复。");
+            std::process::abort();
         }
         if let Err(error) = execute(db, dir, &command, &mut stdout) {
             eprintln!("错误：{error:#}");

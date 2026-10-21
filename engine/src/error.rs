@@ -16,6 +16,9 @@ pub enum Error {
     /// 打开已有的数据库时，选项与数据库的形状对不上：例如用 tiered 打开按分层写的数据库，
     /// 或者 `max_levels` 变了。里面是一句说明。
     IncompatibleOptions(String),
+    /// 调用方给的参数不能接受：例如 key 或 value 超过了长度上限。里面是一句说明。
+    /// 这次调用什么都没有做。
+    InvalidArgument(String),
 }
 
 /// 引擎里通用的返回类型：成功是 `T`，失败是 [`Error`]。
@@ -40,6 +43,7 @@ impl fmt::Display for Error {
             Error::Io(error) => write!(f, "读写文件失败：{error}"),
             Error::Corruption(message) => write!(f, "文件内容损坏：{message}"),
             Error::IncompatibleOptions(message) => write!(f, "选项与数据库不符：{message}"),
+            Error::InvalidArgument(message) => write!(f, "参数不对：{message}"),
         }
     }
 }
@@ -49,7 +53,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(error) => Some(error),
-            Error::Corruption(_) | Error::IncompatibleOptions(_) => None,
+            Error::Corruption(_) | Error::IncompatibleOptions(_) | Error::InvalidArgument(_) => {
+                None
+            }
         }
     }
 }
@@ -98,6 +104,7 @@ mod tests {
         let io_error = Error::from(std::io::Error::other("磁盘满了"));
         let corruption = Error::Corruption("块的条数超出了文件长度".to_string());
         let incompatible = Error::IncompatibleOptions("数据库是 tiered".to_string());
+        let invalid = Error::InvalidArgument("key 有 70000 字节".to_string());
 
         assert_eq!(io_error.to_string(), "读写文件失败：磁盘满了");
         assert_eq!(
@@ -108,6 +115,7 @@ mod tests {
             incompatible.to_string(),
             "选项与数据库不符：数据库是 tiered"
         );
+        assert_eq!(invalid.to_string(), "参数不对：key 有 70000 字节");
     }
 
     // Io 能说出更底层的原因，Corruption 没有更底层的原因。
