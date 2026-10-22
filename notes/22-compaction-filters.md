@@ -9,6 +9,6 @@
 
 ## 资料
 
-- mini-lsm 教程第三周第 7 章：[week3-07-compaction-filter.md](../../references/mini-lsm/mini-lsm-book/src/week3-07-compaction-filter.md)。
+- mini-lsm 教程第三周第 7 章：[week3-07-compaction-filter.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week3-07-compaction-filter.md)。
 
 返回 [本组目录](README.md)。

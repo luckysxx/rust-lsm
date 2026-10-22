@@ -11,7 +11,7 @@
 | B+Tree | LSM |
 | --- | --- |
 | 覆盖与删除就地进行，找到那一页改掉；空出来的页进空闲列表 | 覆盖与删除只写新记录，旧数据先不管；compaction 把推迟的整理批量补上 |
-| 旧页要等登记过的读者都结束才能回收（[页回收与读者](../../storage/notes/05-storage-recovery/07-page-reclamation-and-readers.md)） | 旧文件要等拿着旧状态的读者都结束才能真正释放；Unix 上可以先删文件名，把"等读者"交给操作系统 |
+| 旧页要等登记过的读者都结束才能回收（存储笔记《页回收与读者》） | 旧文件要等拿着旧状态的读者都结束才能真正释放；Unix 上可以先删文件名，把"等读者"交给操作系统 |
 | 写完新页再切换 meta，切换是一步 | 写完新文件再换状态指针，换状态是一步 |
 
 ## 问题：文件只增不减
@@ -167,7 +167,7 @@ RocksDB 的 leveled 本身就是混合的：它的 L0 文件按新旧排列、�
 - **状态**：`LsmStorageState` 多了 `l1_sstables`，按 key 排好、互不重叠。
 - **读**：`get` 把"在一个 SST 里找 key"（范围检查、问 filter、计数、定位）抽成 `get_from_sst`，L0 逐个调用，L1 用 `find_sst_index` 找到唯一的候选再调用。`scan` 只把与范围相交的 L1 文件交给串接游标，再用两路归并接在"memtable + L0"后面。
 - **写 SST**：`write_ssts(游标, 目标大小, 是否丢掉墓碑)` 由 flush 与 compaction 共用：flush 传"不限大小、保留墓碑"，compaction 传"按目标大小切分、丢掉墓碑"。目标大小是选项 `target_sst_size`。`SsTableBuilder` 多了 `is_empty` 与 `estimated_size`。
-- **compaction**：放在 `lsm_storage` 的子模块 `lsm_storage/compact.rs` 里。子模块能看到父模块的私有字段与方法，所以可以直接给 `LsmStorage` 加方法，而不必把 `state`、`write_ssts` 等改成公开的（见 [[rust-learning/notes/13-engineering/02-模块、可见性与重导出|模块、可见性与重导出]]）。`compact` 只写新文件；`apply_compaction_result` 换状态；`force_full_compaction` 串起全部步骤，L0 为空时什么也不做。`compaction_lock` 让 compaction 排队，它与 `flush_lock` 是两把锁，flush 与 compaction 可以同时进行。
+- **compaction**：放在 `lsm_storage` 的子模块 `lsm_storage/compact.rs` 里。子模块能看到父模块的私有字段与方法，所以可以直接给 `LsmStorage` 加方法，而不必把 `state`、`write_ssts` 等改成公开的（见 Rust 笔记《模块、可见性与重导出》）。`compact` 只写新文件；`apply_compaction_result` 换状态；`force_full_compaction` 串起全部步骤，L0 为空时什么也不做。`compaction_lock` 让 compaction 排队，它与 `flush_lock` 是两把锁，flush 与 compaction 可以同时进行。
 - **对外**：`Db::force_full_compaction`、`Db::l1_sstable_count`；命令行程序的 `compact` 命令，`status` 显示 L1 的文件数。
 - **测试**：会走循环的测试放在带时限的线程里，循环里漏了让游标前进、换状态时拿着写锁再去读状态（死锁）都会在几秒内报"卡住"，而不是让整个测试进程停住。
 
@@ -183,7 +183,7 @@ RocksDB 的 leveled 本身就是混合的：它的 L0 文件按新旧排列、�
 
 ## 工业对照
 
-**mini-lsm**（[compact.rs](../../references/mini-lsm/mini-lsm/src/compact.rs)）：`force_full_compaction` 与 `compact` 的分工、锁外合并锁内换状态、按编号拿掉 L0 的输入与本项目相同；串接游标 `SstConcatIterator` 的做法也相同。它在换状态的同时写 manifest，本项目到 L13 再加。
+**mini-lsm**（[compact.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/compact.rs)）：`force_full_compaction` 与 `compact` 的分工、锁外合并锁内换状态、按编号拿掉 L0 的输入与本项目相同；串接游标 `SstConcatIterator` 的做法也相同。它在换状态的同时写 manifest，本项目到 L13 再加。
 
 **RocksDB**：手动的全量合并是 `CompactRange`。状态是一串引用计数的 `Version`，compaction 的结果是一条 `VersionEdit`（加哪些文件、删哪些文件），应用到当前版本上得到新版本；没有任何 `Version` 再引用的文件才被删除。compaction 读输入时默认不放进块缓存（`fill_cache = false`），避免用即将作废的块挤掉有用的块；本项目的合并目前经过块缓存，见基准记录。
 
@@ -263,8 +263,8 @@ impl Drop for FileHandleInner {
 
 ## 资料
 
-- mini-lsm 教程第二周第 1 章：[week2-01-compaction.md](../../references/mini-lsm/mini-lsm-book/src/week2-01-compaction.md)；三种放大与两个极端见 [week2-overview.md](../../references/mini-lsm/mini-lsm-book/src/week2-overview.md)。
-- 已学内容中相关的篇：[页回收与读者](../../storage/notes/05-storage-recovery/07-page-reclamation-and-readers.md)、[B+Tree 与 LSM](../../storage/notes/06-storage-comparisons/03-btree-and-lsm.md)。
+- mini-lsm 教程第二周第 1 章：[week2-01-compaction.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-01-compaction.md)；三种放大与两个极端见 [week2-overview.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-overview.md)。
+- 已学内容中相关的篇：存储笔记《页回收与读者》、《B+Tree 与 LSM》。
 - 基准记录：[全量 compaction 的前后对比](../bench/results/2026-10-15-full-compaction.md)。
 
 返回 [本组目录](README.md)。

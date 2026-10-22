@@ -1,8 +1,8 @@
 # LSM 引擎的实现笔记
 
-本组用 Rust 写一个 LSM 存储引擎，以 mini-lsm 为骨架对照，按它的三周顺序推进。这里只放 LSM 具体实现的内容；换一种引擎仍然成立的知识（文件与持久化、页缓存、提交与恢复、并发）在 [存储笔记](../../storage/notes/README.md) 中，需要时链接过去。LSM 的整体思路先读 [B+Tree 与 LSM](../../storage/notes/06-storage-comparisons/03-btree-and-lsm.md)。
+本组笔记讲怎样用 Rust 写一个 LSM 存储引擎，以 mini-lsm 为骨架对照，按它的三周顺序推进。这里只放 LSM 具体实现的内容；换一种引擎仍然成立的知识（文件与持久化、页缓存、提交与恢复、并发）在作者另外的存储笔记里（随一个 Go 写的 B+Tree 引擎，尚未公开），文中写作“存储笔记《标题》”；“Rust 笔记《标题》”“知识库笔记《标题》”同样指作者另外的笔记。这些引用只是延伸阅读，各篇不读它们也能看懂。
 
-每篇标题下有一行状态：已有正文 / 部分已整理 / 未教学。部分已整理的篇在大纲中把未展开的项标"（未展开）"。
+每篇标题下有一行状态：已有正文（讲解完整）、部分已整理（有些项只列了要点，标"（未展开）"）、未教学（只有大纲，对应的功能还没有实现）。
 
 ## 全景
 
@@ -96,7 +96,7 @@ db/
 - **`Arc`、`Bytes`**：几方共同拿着，最后一方放手时释放。表里"谁拿着"一栏有几项，释放的条件就是这几项全部放手。
 - **借用**：不拿着，只是看；被借的东西先没了就不能再看，编译器会检查。
 
-用 `Arc` 的三处（状态、memtable、块）是同一个理由：引擎活得久，但它手里的东西会被换掉，而换掉的那一刻可能还有读者在用。这与 B+Tree 里旧页等读者结束后才回收是同一件事，见 [页回收与读者](../../storage/notes/05-storage-recovery/07-page-reclamation-and-readers.md)；`Arc` 的引用计数相当于自动的读者登记。类型怎样表达这些关系见 [[rust-learning/notes/09-concurrency/04-Arc：跨线程共享所有权|Arc：跨线程共享所有权]]。
+用 `Arc` 的三处（状态、memtable、块）是同一个理由：引擎活得久，但它手里的东西会被换掉，而换掉的那一刻可能还有读者在用。这与 B+Tree 里旧页等读者结束后才回收是同一件事，见存储笔记《页回收与读者》；`Arc` 的引用计数相当于自动的读者登记。类型怎样表达这些关系见 Rust 笔记《Arc：跨线程共享所有权》。
 
 ## 起步
 
@@ -140,10 +140,8 @@ db/
 | L21 | [可串行化校验](21-serializable-validation.md) | 未教学 | 读写集合、提交时校验、记录回收 | 第三周第 6 章 |
 | L22 | [compaction filter](22-compaction-filters.md) | 未教学 | 接口、按前缀删除 | 第三周第 7 章 |
 
-## 代码、进度与资料
+## 代码与资料
 
 - [代码与运行方式](../README.md)、[基准结果记录](../bench/results/README.md)。
-- [实现与验证状态](../../docs/status.md)、[学习进度](../../docs/learning-progress.md)、[完整清单](../../docs/curriculum.md#l)。
-- [项目总目录](../../docs/index.md)、[学习路线](../../docs/roadmap.md)、[本阶段的起点与已定决定](../../docs/rust-lsm-handoff.md)。
-- [参考源码](../../references/README.md)：mini-lsm 固定在 tag v202608，[教程目录](../../references/mini-lsm/mini-lsm-book/src/SUMMARY.md)。
-- Rust 语言本身的知识在 [[rust-learning/notes/README|Rust 笔记]]，按需查阅。
+- [已知问题与限制](../README.md#已知问题与限制)、[后续安排](../README.md#后续安排)。
+- 参考源码的链接都指向固定的版本：mini-lsm 是 tag v202608（[教程目录](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/SUMMARY.md)），GreptimeDB 是 tag v1.2.1（存储引擎在 [`src/mito2`](https://github.com/GreptimeTeam/greptimedb/tree/v1.2.1/src/mito2)）。

@@ -3,11 +3,11 @@
 2026-10-08。要回答的问题：引擎的 memtable 选并发跳表而不是"一把锁加平衡树"，在这台机器上换来了什么、付出了什么。
 
 - 机器：Apple M5，10 个逻辑 CPU，32 GB 内存，macOS 26.6.2，使用电池。
-- 代码状态：提交 b93ea7d 之上未提交的工作区；`MemTable` 为 `SkipMap<Bytes, Bytes>` 加一个原子计数器，被测对象见 `bench/src/target.rs`。
+- 代码状态：提交 84c081f 之上未提交的工作区；`MemTable` 为 `SkipMap<Bytes, Bytes>` 加一个原子计数器，被测对象见 `bench/src/target.rs`。
 - 每种组合运行 3 次，下表取中位数。同一组合三次之间的浮动多数在一成以内，`btreemap` 单线程的 `fillrandom` 有一次低了约三成。
 - 两个被测对象都不写磁盘；`get` 都返回 value 的一份拷贝，`put` 都拷贝 key 与 value。
 
-重跑方式（在 `lsm/` 下，`T` 取 1、2、4、8，`NAME` 取 `btreemap`、`memtable`）：
+重跑方式（在仓库根目录下，`T` 取 1、2、4、8，`NAME` 取 `btreemap`、`memtable`）：
 
 ```sh
 cargo run --release -p lsm-bench -- --target NAME --threads T

@@ -23,7 +23,7 @@
 | 崩溃原子 | 重启之后整批都在，或者整批都不在 | 做到：整批是 WAL 里的一条记录 |
 | 可见原子 | 别的线程读的时候，不会看到半批 | 没做：要等序号（时间戳） |
 
-崩溃原子用的是存储笔记里"单一发布点"的办法（[原子写批次](../../storage/notes/05-storage-recovery/06-atomic-write-batches.md)）：整批编码成一条记录，外层帧的长度与校验和保证一条记录要么完整、要么作为残尾被截掉，不需要新的机制。拆成几条记录就不行：崩溃时可能只写进了前几条，重放出半批。
+崩溃原子用的是存储笔记里"单一发布点"的办法（存储笔记《原子写批次》）：整批编码成一条记录，外层帧的长度与校验和保证一条记录要么完整、要么作为残尾被截掉，不需要新的机制。拆成几条记录就不行：崩溃时可能只写进了前几条，重放出半批。
 
 可见原子要等第三周：每批分一个时间戳，整批插完才推进"已发布的时间戳"，读者只看已发布的部分。mini-lsm 这一章也明确只做接口，不保证可见原子。
 
@@ -180,7 +180,7 @@ pub fn sync_to(&self, end: u64) -> Result<bool> {
 }
 ```
 
-条件变量是和一把锁配对的等待队列，自己不记任何数据；条件放在那把锁保护的数据里（这里是 `synced` 与 `syncing`）。`wait` 收走锁的守卫，放锁并睡下（两件事一步完成，通知不会落在中间的空隙里），被叫醒后重新拿锁才返回，所以醒来时又拿着锁，可以安全地复查。醒来一定要复查：允许没人通知也醒来，而且从被叫醒到重新拿到锁之间，别人可能已经改了状态（例如另一个醒来的人先当了 leader）。条件变量本身见 [[rust-learning/notes/09-concurrency/09-Condvar-与条件等待|Condvar 与条件等待]]。
+条件变量是和一把锁配对的等待队列，自己不记任何数据；条件放在那把锁保护的数据里（这里是 `synced` 与 `syncing`）。`wait` 收走锁的守卫，放锁并睡下（两件事一步完成，通知不会落在中间的空隙里），被叫醒后重新拿锁才返回，所以醒来时又拿着锁，可以安全地复查。醒来一定要复查：允许没人通知也醒来，而且从被叫醒到重新拿到锁之间，别人可能已经改了状态（例如另一个醒来的人先当了 leader）。条件变量本身见 Rust 笔记《Condvar 与条件等待》。
 
 同一个时刻，两种写法的区别：
 
@@ -332,7 +332,7 @@ RocksDB 用 `WALRecoveryMode` 让用户选：
 
 ## 工业对照
 
-**mini-lsm**（[week2-07-snacks.md](../../references/mini-lsm/mini-lsm-book/src/week2-07-snacks.md)）：`write_batch` 收 `WriteBatchRecord<T: AsRef<[u8]>>`，`put` 与 `delete` 转给它，这一章不保证原子可见。校验和：每个块后面 4 字节 crc32；索引与 filter 各带 crc32（filter 的校验和只算 filter 自己）；WAL 每条记录带 crc32；manifest 每条 JSON 前加长度、后加 crc32。设计问题里问到"只提供写批次、由单一写线程从 mpsc 通道接收"（BadgerDB 的做法，即上面的 B）。
+**mini-lsm**（[week2-07-snacks.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-07-snacks.md)）：`write_batch` 收 `WriteBatchRecord<T: AsRef<[u8]>>`，`put` 与 `delete` 转给它，这一章不保证原子可见。校验和：每个块后面 4 字节 crc32；索引与 filter 各带 crc32（filter 的校验和只算 filter 自己）；WAL 每条记录带 crc32；manifest 每条 JSON 前加长度、后加 crc32。设计问题里问到"只提供写批次、由单一写线程从 mpsc 通道接收"（BadgerDB 的做法，即上面的 B）。
 
 **RocksDB**：
 
@@ -347,11 +347,11 @@ RocksDB 用 `WALRecoveryMode` 让用户选：
 
 ### 导读：mito2 的写入请求
 
-路径在 `references/greptimedb/src/mito2/src/` 下。mito2 是 B：每个 region 按表编号与 region 编号取模分到一个 region worker（`region_id_to_index`），一个 worker 负责一组 region 的全部请求。
+路径在 GreptimeDB v1.2.1 的 [`src/mito2/src/`](https://github.com/GreptimeTeam/greptimedb/tree/v1.2.1/src/mito2/src/) 下。mito2 是 B：每个 region 按表编号与 region 编号取模分到一个 region worker（`region_id_to_index`），一个 worker 负责一组 region 的全部请求。
 
-1. **攒一批请求**：[worker.rs](../../references/greptimedb/src/mito2/src/worker.rs) 的 `run`。先等到一个请求，再用 `try_recv` 最多攒到 `worker_request_batch_size` 个，然后 `handle_requests` 一起处理。对应 C 里"fsync 期间排队的写者"，区别是它攒的是整个请求，连 WAL 的写入也合并了。
-2. **一次写 WAL**：[worker/handle_write.rs](../../references/greptimedb/src/mito2/src/worker/handle_write.rs) 的 `handle_write_requests`。先检查内存压力（拒绝或暂停写入，即写入停顿），再按 region 准备写入上下文；然后每个 region 的写入 `add_wal_entry` 放进同一个 `WalWriter`，一次 `write_to_wal`；成功后按返回的 `last_entry_ids` 推进各 region 的条目编号，失败则这一批全部失败。对应本项目的 `write` 与 `Wal::append`。
-3. **跳过 WAL**：同一段里 `region_ctx.skip_wal()` 为真的 region 不写 WAL：表选项 `skip_wal`（`store-api/src/mito_engine_options.rs` 的 `SKIP_WAL_KEY`），或者 WAL 的 provider 是 `Noop`（[region_write_ctx.rs](../../references/greptimedb/src/mito2/src/region_write_ctx.rs) 的 `skip_wal`）。
+1. **攒一批请求**：[worker.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/worker.rs) 的 `run`。先等到一个请求，再用 `try_recv` 最多攒到 `worker_request_batch_size` 个，然后 `handle_requests` 一起处理。对应 C 里"fsync 期间排队的写者"，区别是它攒的是整个请求，连 WAL 的写入也合并了。
+2. **一次写 WAL**：[worker/handle_write.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/worker/handle_write.rs) 的 `handle_write_requests`。先检查内存压力（拒绝或暂停写入，即写入停顿），再按 region 准备写入上下文；然后每个 region 的写入 `add_wal_entry` 放进同一个 `WalWriter`，一次 `write_to_wal`；成功后按返回的 `last_entry_ids` 推进各 region 的条目编号，失败则这一批全部失败。对应本项目的 `write` 与 `Wal::append`。
+3. **跳过 WAL**：同一段里 `region_ctx.skip_wal()` 为真的 region 不写 WAL：表选项 `skip_wal`（`store-api/src/mito_engine_options.rs` 的 `SKIP_WAL_KEY`），或者 WAL 的 provider 是 `Noop`（[region_write_ctx.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/region_write_ctx.rs) 的 `skip_wal`）。
 4. **之后写 memtable**：写完 WAL 再把每个 region 的写入放进 memtable，序号在 WAL 之前分配，所以插入不必和 WAL 在同一把锁里。
 
 可以先跳过的：bulk 请求、写入停顿与拒绝的细节、各阶段的计时。与本项目对照：mito2 一个 worker 一个线程，天然排成一列，合并 WAL 写入不需要额外的锁；本项目的写者各自在调用线程里写，只合并 fsync。
@@ -378,8 +378,8 @@ RocksDB 用 `WALRecoveryMode` 让用户选：
 
 ## 资料
 
-- mini-lsm 教程第二周第 7 章：[week2-07-snacks.md](../../references/mini-lsm/mini-lsm-book/src/week2-07-snacks.md)。
-- 已学内容中相关的篇：[原子写批次](../../storage/notes/05-storage-recovery/06-atomic-write-batches.md)、[文件格式与元数据校验](../../storage/notes/05-storage-recovery/03-file-format-and-meta-validation.md)、[提交顺序与同步](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md)、[WAL](14-wal.md)、[SST 格式](05-sst-format.md)。
+- mini-lsm 教程第二周第 7 章：[week2-07-snacks.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-07-snacks.md)。
+- 已学内容中相关的篇：存储笔记《原子写批次》、《文件格式与元数据校验》、《提交顺序与同步》、[WAL](14-wal.md)、[SST 格式](05-sst-format.md)。
 - RocksDB Wiki：Write Batch With Index、WAL Recovery Modes、Pipelined Write、Block-based Table Format。源码（v9.10.0）：`db/write_thread.cc`、`db/write_batch.cc`、`table/block_based/block_based_table_builder.cc`。
 - LevelDB：`db/db_impl.cc` 的 `DBImpl::Write`、`BuildBatchGroup`。
 - PostgreSQL：`src/backend/access/transam/xlog.c` 的 `XLogFlush`；文档 WAL Configuration（`commit_delay`、`synchronous_commit`）。

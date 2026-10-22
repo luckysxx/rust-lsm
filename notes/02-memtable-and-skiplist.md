@@ -4,7 +4,7 @@
 
 ## 问题
 
-LSM 把写入先攒在内存里，攒够一批再顺序写成一个文件（为什么这样比逐条改页便宜，见 [B+Tree 也可以把写入攒在内存里](../../storage/notes/06-storage-comparisons/03-btree-and-lsm.md#btree-也可以把写入攒在内存里)）。攒写入的那张内存表就是 memtable。它要满足：
+LSM 把写入先攒在内存里，攒够一批再顺序写成一个文件（为什么这样比逐条改页便宜，见存储笔记《B+Tree 与 LSM》的“B+Tree 也可以把写入攒在内存里”一节）。攒写入的那张内存表就是 memtable。它要满足：
 
 - `put(key, value)` 与 `get(key)`，key 和 value 是任意字节串。
 - 能按 key 的顺序遍历。
@@ -24,7 +24,7 @@ LSM 把写入先攒在内存里，攒够一批再顺序写成一个文件（为�
 
 ## 为什么并发成了问题
 
-CoW B+Tree 没有这个问题：只有一个写者，读者读的是已提交的旧页，写者写的是新页，读写碰不到同一块内存（见 [单机 KV API](../../storage/notes/05-storage-recovery/08-single-node-kv-api.md)）。memtable 两条都不成立：
+CoW B+Tree 没有这个问题：只有一个写者，读者读的是已提交的旧页，写者写的是新页，读写碰不到同一块内存（见存储笔记《单机 KV API》）。memtable 两条都不成立：
 
 - 读写碰的是同一个结构。写入一完成就要对读者可见，没有"提交后才发布"这一步；读者遍历到一半时，写者可能正在插入。
 - 前台写入只是追加日志加改内存，本身很便宜，所有写线程都挤在 memtable 上。只允许一个写者就浪费了多核。
@@ -147,7 +147,7 @@ pub fn get(&self, key: &[u8]) -> Option<Bytes>
 pub fn approximate_size(&self) -> usize
 ```
 
-**`put` 的接收者是 `&self` 而不是 `&mut self`。** Rust 里 `&mut` 的含义是独占：同一时刻只能有一个。多个线程要同时写入，它们手里只能是共享引用 `&self`，修改由内部的并发结构自己保证安全。跳表的 `insert` 和原子计数器的 `fetch_add` 都只需要 `&self`。这类"通过共享引用修改"的类型见 [[rust-learning/notes/09-concurrency/12-原子类型与-compare_exchange|原子类型]]与 [[rust-learning/notes/09-concurrency/03-Send-与-Sync|Send 与 Sync]]。
+**`put` 的接收者是 `&self` 而不是 `&mut self`。** Rust 里 `&mut` 的含义是独占：同一时刻只能有一个。多个线程要同时写入，它们手里只能是共享引用 `&self`，修改由内部的并发结构自己保证安全。跳表的 `insert` 和原子计数器的 `fetch_add` 都只需要 `&self`。这类"通过共享引用修改"的类型见 Rust 笔记《原子类型》与《Send 与 Sync》。
 
 `get` 的返回值 `Option<Bytes>` 对应查找的三种结果：`None`、`Some(空)`、`Some(非空)`。memtable 自己不解释墓碑，原样交给上一层。
 
@@ -155,9 +155,9 @@ pub fn approximate_size(&self) -> usize
 
 ## GreptimeDB 的 memtable
 
-GreptimeDB 的存储引擎 mito2 里，memtable 是一个 trait（[memtable.rs](../../references/greptimedb/src/mito2/src/memtable.rs) 的 `Memtable`），有几种实现。与这里相同的地方：写入方法的接收者是 `&self`，trait 要求 `Send + Sync`，表以 `Arc<dyn Memtable>` 的形式被多处共享。
+GreptimeDB 的存储引擎 mito2 里，memtable 是一个 trait（[memtable.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/memtable.rs) 的 `Memtable`），有几种实现。与这里相同的地方：写入方法的接收者是 `&self`，trait 要求 `Send + Sync`，表以 `Arc<dyn Memtable>` 的形式被多处共享。
 
-不同的地方来自它是时序数据库。以 [time_series.rs](../../references/greptimedb/src/mito2/src/memtable/time_series.rs) 的实现为例：
+不同的地方来自它是时序数据库。以 [time_series.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/memtable/time_series.rs) 的实现为例：
 
 | | 本项目 | mito2 的时序 memtable |
 | --- | --- | --- |
@@ -209,7 +209,7 @@ state_lock   互斥锁，让改变结构的操作排队
 - **读者不长时间持锁。** 读者只在复制指针的一瞬间持读锁，之后在快照上查找。以后点查还要读磁盘，持锁查找会让冻结一直拿不到写锁。旧状态及其引用的表由引用计数保活，最后一个读者放手时才释放。
 - **`state_lock` 之后要重新检查。** 排队期间别的线程可能已经冻结过，当初"表满了"的判断已经过期。先在锁外检查，拿到锁后再确认，第三个问题被挡住。
 
-Rust 里锁、守卫与 `Arc` 的用法见 [[rust-learning/notes/09-concurrency/05-Mutex-与锁守卫|Mutex 与锁守卫]]、[[rust-learning/notes/09-concurrency/06-RwLock-与读写访问|RwLock 与读写访问]]、[[rust-learning/notes/09-concurrency/04-Arc：跨线程共享所有权|Arc]]。
+Rust 里锁、守卫与 `Arc` 的用法见 Rust 笔记《Mutex 与锁守卫》、《RwLock 与读写访问》、《Arc》。
 
 为什么不直接在写锁里检查并冻结：以后准备一张新表包含创建 WAL 文件，是磁盘操作。放在写锁里，这几毫秒所有读写都停住；放在 `state_lock` 里只挡住别的结构变更，写锁只在最后切换指针时持有。
 
@@ -225,11 +225,11 @@ Rust 里锁、守卫与 `Arc` 的用法见 [[rust-learning/notes/09-concurrency/
 
 ### 工业对照：mini-lsm 与 GreptimeDB
 
-mini-lsm 的结构与上面相同：`state: Arc<RwLock<Arc<LsmStorageState>>>` 加 `state_lock: Mutex<()>`（[lsm_storage.rs](../../references/mini-lsm/mini-lsm/src/lsm_storage.rs)）。
+mini-lsm 的结构与上面相同：`state: Arc<RwLock<Arc<LsmStorageState>>>` 加 `state_lock: Mutex<()>`（[lsm_storage.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/lsm_storage.rs)）。
 
-mito2 的状态同样是"读写锁保护一个指向不可变版本的指针"（[region/version.rs](../../references/greptimedb/src/mito2/src/region/version.rs)）：`VersionControl` 里是 `RwLock<VersionControlData>`，其中的 `version` 是 `Arc<Version>`；`Version` 包含 memtable、SST 等，memtable 部分是 [MemtableVersion](../../references/greptimedb/src/mito2/src/memtable/version.rs)，由一张 `mutable` 和一个 `immutables` 列表组成。读者调用 `current()`，持读锁复制一份后放锁。[freeze_mutable](../../references/greptimedb/src/mito2/src/region/version.rs#L99-L121) 读出当前版本，构造换好表的新版本，最后拿写锁换上去。
+mito2 的状态同样是"读写锁保护一个指向不可变版本的指针"（[region/version.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/region/version.rs)）：`VersionControl` 里是 `RwLock<VersionControlData>`，其中的 `version` 是 `Arc<Version>`；`Version` 包含 memtable、SST 等，memtable 部分是 [MemtableVersion](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/memtable/version.rs)，由一张 `mutable` 和一个 `immutables` 列表组成。读者调用 `current()`，持读锁复制一份后放锁。[freeze_mutable](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/region/version.rs#L99-L121) 读出当前版本，构造换好表的新版本，最后拿写锁换上去。
 
-差别在重复冻结怎样避免。mito2 没有相当于 `state_lock` 的锁，`freeze_mutable` 里也没有重新检查，因为它在更上一层排除了并发：每个 region 绑定到一个固定的工作线程，对这个 region 的写入、冻结、flush 的调度都由这一个线程依次处理（[worker.rs](../../references/greptimedb/src/mito2/src/worker.rs)；冻结由 [flush.rs](../../references/greptimedb/src/mito2/src/flush.rs#L1240) 中的调度器调用，调度器只能被独占访问）。结构变更天然串行，不需要锁。
+差别在重复冻结怎样避免。mito2 没有相当于 `state_lock` 的锁，`freeze_mutable` 里也没有重新检查，因为它在更上一层排除了并发：每个 region 绑定到一个固定的工作线程，对这个 region 的写入、冻结、flush 的调度都由这一个线程依次处理（[worker.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/worker.rs)；冻结由 [flush.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/flush.rs#L1240) 中的调度器调用，调度器只能被独占访问）。结构变更天然串行，不需要锁。
 
 | | 本项目与 mini-lsm | mito2 |
 | --- | --- | --- |
@@ -243,7 +243,7 @@ mito2 的状态同样是"读写锁保护一个指向不可变版本的指针"（
 
 GreptimeDB 的代码量很大（mito2 一个引擎就有十五万行），异步、泛型、列式数据、错误处理与指标统计交织在一起，直接通读很难。读它的办法是每次只看与自己刚实现的功能对应的一小段，并且知道哪些行可以先跳过。
 
-下面这段是 [region/version.rs](../../references/greptimedb/src/mito2/src/region/version.rs#L98-L121) 中的冻结，与本项目的 `force_freeze_memtable` 做的是同一件事：
+下面这段是 [region/version.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/region/version.rs#L98-L121) 中的冻结，与本项目的 `force_freeze_memtable` 做的是同一件事：
 
 ```rust
 /// Returns current copy of data.
@@ -316,7 +316,7 @@ pub(crate) fn freeze_mutable(&self) -> Result<()> {
 | --- | --- |
 | 每个事务持读锁，关闭取写锁等所有事务结束 | 每次写入持状态的读锁，冻结取写锁等所有写入结束 |
 | 映射列表是原子指针指向的不可变列表，扩容时复制后切换 | 引擎状态是读写锁保护的指针指向的不可变快照，冻结时复制后切换 |
-| 事务内的内存节点，提交时一次编码成页（[原子写批次](../../storage/notes/05-storage-recovery/06-atomic-write-batches.md)） | 跨越很多次写入的内存表，写满后一次编码成 SST |
+| 事务内的内存节点，提交时一次编码成页（存储笔记《原子写批次》） | 跨越很多次写入的内存表，写满后一次编码成 SST |
 | 单写者；读者读旧页，不与写者碰同一块内存 | 多写者；读者与写者在同一个结构上 |
 | 删除从页里移除记录 | 删除是插入墓碑，表只增不减 |
 | 读者拿到的是页的借用视图，事务结束后失效 | 读者拿到带引用计数的缓冲，不受表的生命周期约束 |
@@ -339,6 +339,6 @@ pub(crate) fn freeze_mutable(&self) -> Result<()> {
 
 ## 资料
 
-- mini-lsm 教程第一周第 1 章：[week1-01-memtable.md](../../references/mini-lsm/mini-lsm-book/src/week1-01-memtable.md)；参考实现 [mem_table.rs](../../references/mini-lsm/mini-lsm/src/mem_table.rs)。
+- mini-lsm 教程第一周第 1 章：[week1-01-memtable.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-01-memtable.md)；参考实现 [mem_table.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/mem_table.rs)。
 
 返回 [本组目录](README.md)。

@@ -129,7 +129,7 @@ struct MemTableIterator {
 | 三 | 游标不拥有表，由调用方持有快照，游标只借用 | O(1) | 每一层游标的类型都要带上借用的标记，对外接口变成"先取快照、再建游标"两步 |
 | 四 | 创建游标时把范围内的记录全部拷进一个数组 | 创建时 O(范围大小) | 只要前几条也得拷完；多占一份内存 |
 
-mini-lsm 用第二种（[mem_table.rs](../../references/mini-lsm/mini-lsm/src/mem_table.rs) 的 `MemTableIterator`）。本项目用第一种：游标里只有自己拥有的东西，不引入新的依赖。
+mini-lsm 用第二种（[mem_table.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/mem_table.rs) 的 `MemTableIterator`）。本项目用第一种：游标里只有自己拥有的东西，不引入新的依赖。
 
 实测（100 万条记录的跳表从头扫到尾，release 编译，三轮）：顺着跳表走每步约 70 纳秒，每步重新定位约 140 到 175 纳秒，慢 2 到 2.5 倍。前者没有计入第二种做法每步还要做的克隆，实际差距略小。
 
@@ -137,7 +137,7 @@ mini-lsm 用第二种（[mem_table.rs](../../references/mini-lsm/mini-lsm/src/me
 
 ### 导读：mito2 时序 memtable 的迭代器
 
-mito2 的时序 memtable 用的是第一种做法（[memtable/time_series.rs](../../references/greptimedb/src/mito2/src/memtable/time_series.rs)）：
+mito2 的时序 memtable 用的是第一种做法（[memtable/time_series.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/memtable/time_series.rs)）：
 
 ```rust
 struct Iter {
@@ -238,7 +238,7 @@ pub struct MergeIterator<I: StorageIterator> {
 
 ### 导读：mito2 的比较规则
 
-mito2 归并时堆里比较的写法（[read/flat_merge.rs](../../references/greptimedb/src/mito2/src/read/flat_merge.rs)）与上面是同一个形状：
+mito2 归并时堆里比较的写法（[read/flat_merge.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/read/flat_merge.rs)）与上面是同一个形状：
 
 ```rust
 impl Ord for RowCursor {
@@ -294,13 +294,13 @@ impl<T> Ord for GenericNode<T> {
 
 **LevelDB、RocksDB、Pebble** 的迭代器都是这种游标式的接口（定位、前进、是否有效、当前的 key 与 value），归并迭代器内部用堆。
 
-**mini-lsm**：接口是 [iterators.rs](../../references/mini-lsm/mini-lsm/src/iterators.rs) 的 `StorageIterator`，四个方法 `key`、`value`、`is_valid`、`next`，`next` 返回 `Result`，因为以后前进一步可能要读磁盘。归并在 [merge_iterator.rs](../../references/mini-lsm/mini-lsm/src/iterators/merge_iterator.rs)：
+**mini-lsm**：接口是 [iterators.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/iterators.rs) 的 `StorageIterator`，四个方法 `key`、`value`、`is_valid`、`next`，`next` 返回 `Result`，因为以后前进一步可能要读磁盘。归并在 [merge_iterator.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/iterators/merge_iterator.rs)：
 
 - 堆里的元素是（来源序号，游标），比较规则是先 key、后序号，再整体取反，因为 Rust 标准库的 `BinaryHeap` 是大顶堆。
 - 当前最小的那个游标单独拿在堆外，其余的在堆里。前进时先把堆顶上 key 与当前相同的游标逐个前进，再让当前的游标前进，然后与堆顶比较，必要时交换。本项目现在用的就是这种结构。一处不同：mini-lsm 的当前游标走到头、堆也空了时，仍把那个无效的游标留在 `current` 里，`is_valid` 要去问里面的游标；本项目在走到头时整个换掉 `current`（堆空则为 `None`），`is_valid` 只看是不是 `Some`。另外 mini-lsm 的堆元素里放的是 `Box<I>`，交换时只搬一个指针；本项目直接放游标，交换时搬整个游标结构体，游标只有几十到一百多字节，差别很小。
-- 去掉墓碑与检查范围上界在更外面一层（[lsm_iterator.rs](../../references/mini-lsm/mini-lsm/src/lsm_iterator.rs) 的 `LsmIterator`）；再外面的 `FusedIterator` 保证游标无效或出过错之后再调用是安全的。
+- 去掉墓碑与检查范围上界在更外面一层（[lsm_iterator.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/lsm_iterator.rs) 的 `LsmIterator`）；再外面的 `FusedIterator` 保证游标无效或出过错之后再调用是安全的。
 
-**GreptimeDB mito2**（[read/flat_merge.rs](../../references/greptimedb/src/mito2/src/read/flat_merge.rs)、[read/flat_dedup.rs](../../references/greptimedb/src/mito2/src/read/flat_dedup.rs)）同样用堆做归并，差别来自它是列式的时序引擎：
+**GreptimeDB mito2**（[read/flat_merge.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/read/flat_merge.rs)、[read/flat_dedup.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/read/flat_dedup.rs)）同样用堆做归并，差别来自它是列式的时序引擎：
 
 | | 本项目与 mini-lsm | mito2 |
 | --- | --- | --- |
@@ -339,7 +339,7 @@ impl<T> Ord for GenericNode<T> {
 
 ## 资料
 
-- mini-lsm 教程第一周第 2 章：[week1-02-merge-iterator.md](../../references/mini-lsm/mini-lsm-book/src/week1-02-merge-iterator.md)。
-- 已学内容中相关的篇：[扫描与游标](../../storage/notes/04-btree-tree/05-scan-and-leaf-links.md)。
+- mini-lsm 教程第一周第 2 章：[week1-02-merge-iterator.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-02-merge-iterator.md)。
+- 已学内容中相关的篇：存储笔记《扫描与叶子链接》。
 
 返回 [本组目录](README.md)。

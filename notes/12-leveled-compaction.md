@@ -195,7 +195,7 @@ L0 放在 `l0_sstables`、L1 往下放在 `levels`，写代码时常要分开处
 
 ## 工业对照
 
-**mini-lsm**（[leveled.rs](../../references/mini-lsm/mini-lsm/src/compact/leveled.rs)）：规则相同。不同处：任务里记文件编号，状态里有"编号 → 文件"的表；分数用浮点数，排序后取最大；L0 的任务拿全部 L0；换状态时把输出与留下的文件拼起来按首 key 排序，manifest 重放时文件还没打开、拿不到首 key，所以那时先不排（`in_recovery`）；没有 trivial move（列为加分项）；层数是策略参数。
+**mini-lsm**（[leveled.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/compact/leveled.rs)）：规则相同。不同处：任务里记文件编号，状态里有"编号 → 文件"的表；分数用浮点数，排序后取最大；L0 的任务拿全部 L0；换状态时把输出与留下的文件拼起来按首 key 排序，manifest 重放时文件还没打开、拿不到首 key，所以那时先不排（`in_recovery`）；没有 trivial move（列为加分项）；层数是策略参数。
 
 **RocksDB**：
 
@@ -224,7 +224,7 @@ L0 放在 `l0_sstables`、L1 往下放在 `levels`，写代码时常要分开处
 
 ## 资料
 
-- mini-lsm 教程第二周第 4 章：[week2-04-leveled.md](../../references/mini-lsm/mini-lsm-book/src/week2-04-leveled.md)；三种放大见 [week2-overview.md](../../references/mini-lsm/mini-lsm-book/src/week2-overview.md)。
+- mini-lsm 教程第二周第 4 章：[week2-04-leveled.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-04-leveled.md)；三种放大见 [week2-overview.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-overview.md)。
 - RocksDB Wiki：Leveled Compaction；Dynamic Level Size for Level-Based Compaction。
 - 前几篇：[简单分层 compaction](10-simple-leveled-compaction.md)、[tiered compaction](11-tiered-compaction.md)、[compaction 的执行](09-compaction-execution.md)。
 - 基准记录：[leveled compaction：穿过空层的复制消失，写放大介于简单分层与 tiered 之间](../bench/results/2026-10-19-leveled-compaction.md)。

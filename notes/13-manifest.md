@@ -16,7 +16,7 @@
 | 双 meta 交替写，打开时选校验和对得上、版本较新的那份 | 只往末尾追加记录，打开时从头重放，末尾不完整的一条当作没写过 |
 | 空闲页的回收 | 删除文件，交给文件系统 |
 
-提交顺序与同步的一般原理见 [提交顺序与同步](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](../../storage/notes/05-storage-recovery/05-open-and-crash-recovery.md)；目录为什么要单独同步见 [父目录的同步](../../storage/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
+提交顺序与同步的一般原理见存储笔记《提交顺序与同步》、《打开与故障恢复》；目录为什么要单独同步见存储笔记《写入、同步与错误边界》的“父目录的同步”一节。
 
 ## 问题：为什么不能直接看目录
 
@@ -174,7 +174,7 @@ RocksDB 也把形状相关的选项记在文件里核对：打开时 `num_levels
 - **命令行程序**：不再拒绝已有 SST 的目录；用另一种形状打开时报"选项与数据库不符：数据库的形状是 Levels { max_levels: 4 }，选项要求的是 Tiers"。
 - **测试**：编码与解码（任意位置截断、最后一条坏、中间一条坏、不是记录的 JSON、长度是 `u64::MAX`）；文件的新建、追加、截掉残尾后接着追加、中间损坏时不动文件；重放的每种放法与每种损坏；重启后 L0 顺序与数据不变、新编号不重名、没 flush 的数据丢失、孤儿被删而别的文件不动、旧输入残留时删掉的 key 不复活、换形状被拒绝、分层策略之间可以互换、空 manifest、有 SST 没 manifest、记下的 SST 不见了；四组策略参数随机写入与合并后重启，状态与数据相同，再全量合并、重启；leveled 把文件插到层中间之后重启顺序不变；随机多轮测试每一轮都核对"重放 manifest 得到的列表 = 当前状态"；`Db` 层四个线程写入、后台 flush 与合并同时进行，关闭后重开状态相同。变异检查 15 个，第一轮漏了 2 个（随机数据下各层总是被整层替换，测不出"打开时不排序"；合并之后 L0 已空，全量合并什么也不做，测不出"全量合并记错层"），补了测试之后全部被发现。没有测到的：追加失败时状态不变（要能注入写入错误）。
 - **测试的时限**：每次换状态多一次 fsync，整套测试从约 9 秒变成约 13 秒；macOS 的 `sync_all` 是 `F_FULLFSYNC`，所有测试一起跑时一次要几十毫秒，要同步几百次的随机测试超过了 5 秒的时限。这类测试改用 [test_util.rs](../engine/src/test_util.rs) 的 `run_with_slow_deadline`（30 秒），卡住时照样超时。
-- **Rust 工程**：依赖用 `cargo add -p lsm serde --features derive`、`serde_json`、`crc32fast` 加进引擎这个 crate；`derive` 为什么要单独打开见 [[rust-learning/notes/13-engineering/06-features-与-cfg-条件编译|features 与 cfg 条件编译]]。`version_edit` 的参数 `removed: impl Iterator<Item = &'a Arc<SsTable>>` 让调用方直接传 `iter().chain(...)`、`iter().flatten()`、`iter::empty()`，不必先收集成 `Vec`；为什么要写 `'a` 见 [[rust-learning/notes/04-traits/09-impl-Trait：隐藏具体实现类型|impl Trait：隐藏具体实现类型]]。`Shape` 与 `Placement` 派生了 `Copy`，`match (layout.shape, edit.placement)` 复制出两个值，分支里可以随意修改 `layout`。
+- **Rust 工程**：依赖用 `cargo add -p lsm serde --features derive`、`serde_json`、`crc32fast` 加进引擎这个 crate；`derive` 为什么要单独打开见 Rust 笔记《features 与 cfg 条件编译》。`version_edit` 的参数 `removed: impl Iterator<Item = &'a Arc<SsTable>>` 让调用方直接传 `iter().chain(...)`、`iter().flatten()`、`iter::empty()`，不必先收集成 `Vec`；为什么要写 `'a` 见 Rust 笔记《impl Trait：隐藏具体实现类型》。`Shape` 与 `Placement` 派生了 `Copy`，`match (layout.shape, edit.placement)` 复制出两个值，分支里可以随意修改 `layout`。
 
 ## 效果
 
@@ -188,7 +188,7 @@ RocksDB 也把形状相关的选项记在文件里核对：打开时 `num_levels
 
 ## 工业对照
 
-**mini-lsm**（[manifest.rs](../../references/mini-lsm/mini-lsm/src/manifest.rs)）：帧的格式相同（8 字节长度、JSON、crc32），中间一条校验和不对时报错，末尾不完整时截掉。记录是任务本身：`Flush(id)`、`NewMemtable(id)`、`Compaction(task, 输出编号)`，重放时调用策略的换状态函数，所以 leveled 的换状态有 `in_recovery` 参数（文件还没打开，先不按首 key 排序）。`add_record` 的第一个参数是 `&MutexGuard<()>`，只是为了让没拿 `state_lock` 的调用编译不过，与本项目把 manifest 放进锁里是同一个目的。
+**mini-lsm**（[manifest.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/manifest.rs)）：帧的格式相同（8 字节长度、JSON、crc32），中间一条校验和不对时报错，末尾不完整时截掉。记录是任务本身：`Flush(id)`、`NewMemtable(id)`、`Compaction(task, 输出编号)`，重放时调用策略的换状态函数，所以 leveled 的换状态有 `in_recovery` 参数（文件还没打开，先不按首 key 排序）。`add_record` 的第一个参数是 `&MutexGuard<()>`，只是为了让没拿 `state_lock` 的调用编译不过，与本项目把 manifest 放进锁里是同一个目的。
 
 **RocksDB**：
 
@@ -201,14 +201,14 @@ RocksDB 也把形状相关的选项记在文件里核对：打开时 `num_levels
 
 ### 导读：mito2 的 manifest
 
-mito2 的数据放在对象存储上，对象不能追加，所以"日志"是一个个单独的文件。路径都在 `references/greptimedb/src/mito2/src/manifest/` 下。
+mito2 的数据放在对象存储上，对象不能追加，所以"日志"是一个个单独的文件。路径都在 GreptimeDB v1.2.1 的 [`src/mito2/src/manifest/`](https://github.com/GreptimeTeam/greptimedb/tree/v1.2.1/src/mito2/src/manifest/) 下。
 
-1. **记录长什么样**：[action.rs](../../references/greptimedb/src/mito2/src/manifest/action.rs) 的 `RegionMetaAction`（`Change`、`Edit`、`Remove`、`Truncate` 等）与 `RegionEdit`：`files_to_add`、`files_to_remove` 都是完整的 `FileMeta`（其中有层号、时间范围、大小），另有 `flushed_entry_id`、`flushed_sequence`（WAL 写到哪里已经落进 SST）。一次更新是一个 `RegionMetaActionList`，几条 action 一起生效，相当于本项目的"一次换状态一条记录"。
+1. **记录长什么样**：[action.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/manifest/action.rs) 的 `RegionMetaAction`（`Change`、`Edit`、`Remove`、`Truncate` 等）与 `RegionEdit`：`files_to_add`、`files_to_remove` 都是完整的 `FileMeta`（其中有层号、时间范围、大小），另有 `flushed_entry_id`、`flushed_sequence`（WAL 写到哪里已经落进 SST）。一次更新是一个 `RegionMetaActionList`，几条 action 一起生效，相当于本项目的"一次换状态一条记录"。
 2. **重放**：同一文件的 `RegionManifestBuilder::apply_edit`。文件按 `file_id` 放进一个 `HashMap`，没有顺序问题：层号与时间范围都在 `FileMeta` 里。被去掉的文件记进 `removed_files` 并带上时间戳，之后由 GC 延迟删除，而不是换状态后立刻删。
-3. **文件怎样命名**：[storage.rs](../../references/greptimedb/src/mito2/src/manifest/storage.rs) 的 `delta_file`（`{version:020}.json`）、`checkpoint_file`，以及 `LAST_CHECKPOINT_FILE`（`_last_checkpoint`，指向最新的 checkpoint，作用相当于 `CURRENT`）。
-4. **打开**：[manager.rs](../../references/greptimedb/src/mito2/src/manifest/manager.rs) 的 `RegionManifestManager::open`：先读最新的 checkpoint，从它的下一个版本开始取出全部增量文件，逐个解码、逐条 apply。
+3. **文件怎样命名**：[storage.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/manifest/storage.rs) 的 `delta_file`（`{version:020}.json`）、`checkpoint_file`，以及 `LAST_CHECKPOINT_FILE`（`_last_checkpoint`，指向最新的 checkpoint，作用相当于 `CURRENT`）。
+4. **打开**：[manager.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/manifest/manager.rs) 的 `RegionManifestManager::open`：先读最新的 checkpoint，从它的下一个版本开始取出全部增量文件，逐个解码、逐条 apply。
 5. **更新**：同一文件的 `update`：先 `save` 增量文件，再把 action 用到内存里的 manifest 上，顺序与本项目的"先记、再换"相同。
-6. **checkpoint**：[checkpointer.rs](../../references/greptimedb/src/mito2/src/manifest/checkpointer.rs)。距上一次 checkpoint 超过 `checkpoint_distance` 个版本（`manifest_checkpoint_distance` 默认 10）时，在后台写一份全量，之后可以删掉更早的增量文件。
+6. **checkpoint**：[checkpointer.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/manifest/checkpointer.rs)。距上一次 checkpoint 超过 `checkpoint_distance` 个版本（`manifest_checkpoint_distance` 默认 10）时，在后台写一份全量，之后可以删掉更早的增量文件。
 
 与本项目对照：都是增量记法，都先持久化再生效；mito2 每条增量一个文件、有 checkpoint、删除延迟交给 GC，本项目是一个追加的文件、没有 checkpoint、换状态后立刻删。
 
@@ -231,9 +231,9 @@ mito2 的数据放在对象存储上，对象不能追加，所以"日志"是一
 
 ## 资料
 
-- mini-lsm 教程第二周第 5 章：[week2-05-manifest.md](../../references/mini-lsm/mini-lsm-book/src/week2-05-manifest.md)；代码 [manifest.rs](../../references/mini-lsm/mini-lsm/src/manifest.rs)。
+- mini-lsm 教程第二周第 5 章：[week2-05-manifest.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-05-manifest.md)；代码 [manifest.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/manifest.rs)。
 - RocksDB Wiki：MANIFEST；WAL Recovery Modes。
-- 存储笔记：[文件格式与元数据校验](../../storage/notes/05-storage-recovery/03-file-format-and-meta-validation.md)、[提交顺序与同步](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](../../storage/notes/05-storage-recovery/05-open-and-crash-recovery.md)、[父目录的同步](../../storage/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
+- 存储笔记：《文件格式与元数据校验》、《提交顺序与同步》、《打开与故障恢复》、《写入、同步与错误边界》的“父目录的同步”一节。
 - 基准记录：[manifest 的前后对比](../bench/results/2026-10-20-manifest.md)。
 
 返回 [本组目录](README.md)。

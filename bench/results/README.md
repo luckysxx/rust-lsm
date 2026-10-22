@@ -4,7 +4,7 @@
 
 ## 怎样记一次结果
 
-在 `lsm/` 目录下运行，输出保存为 `日期-说明.md`：
+在仓库根目录下运行，输出保存为 `日期-说明.md`：
 
 ```sh
 cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md

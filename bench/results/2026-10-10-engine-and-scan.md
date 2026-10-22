@@ -3,11 +3,11 @@
 2026-10-10。要回答的问题：把多张 memtable 组织起来的引擎层，相对单张 memtable 和内存基线，写入、点查、范围扫描各是什么水平；冻结的表不落盘、越积越多时，读的代价怎样变化。
 
 - 机器：Apple M5，10 个逻辑 CPU，32 GB 内存，macOS 26.6.2，使用电池。
-- 代码状态：提交 b93ea7d 之上未提交的工作区。引擎层支持写入、删除、点查、范围扫描、写满冻结；冻结的 memtable 不会被写成 SST，只增不减。memtable 的游标每前进一步重新定位一次。
+- 代码状态：提交 84c081f 之上未提交的工作区。引擎层支持写入、删除、点查、范围扫描、写满冻结；冻结的 memtable 不会被写成 SST，只增不减。memtable 的游标每前进一步重新定位一次。
 - 单线程。每种组合运行 3 次，下表取中位数；同一组合三次之间的浮动在一成以内。
 - 负载依次执行：`fillrandom`、`overwrite`、`readrandom`、`readmissing`、`seekrandom`，共用同一个库。`seekrandom` 做 1 万次扫描，每次从一个随机的已有 key 起读 100 条。
 
-重跑方式（在 `lsm/` 下）：
+重跑方式（在仓库根目录下）：
 
 ```sh
 cargo run --release -p lsm-bench -- --target btreemap

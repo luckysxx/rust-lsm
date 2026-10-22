@@ -11,6 +11,6 @@
 
 ## 资料
 
-- mini-lsm 教程第三周第 6 章：[week3-06-serializable.md](../../references/mini-lsm/mini-lsm-book/src/week3-06-serializable.md)。
+- mini-lsm 教程第三周第 6 章：[week3-06-serializable.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week3-06-serializable.md)。
 
 返回 [本组目录](README.md)。

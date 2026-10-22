@@ -15,7 +15,7 @@
 | meta 页换完之前，新页都不算数 | manifest 记下"哪张表已写成 SST"之前，它的 WAL 都不能删 |
 | 打开时选一个有效的 meta，高水位以上的页视为不存在 | 打开时重放 manifest 得到高水位，高水位以上的 WAL 重放，以下的删掉 |
 
-一般原理见 [提交顺序与同步](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](../../storage/notes/05-storage-recovery/05-open-and-crash-recovery.md)；数据库 WAL 与 Raft 日志的区别见 [[_knowledge/数据库/05-预写日志与复制日志|预写日志与复制日志]]。用 Raft 的话说：日志是事实，memtable 是把日志应用之后的状态机；重放就是从头应用一遍日志。
+一般原理见存储笔记《提交顺序与同步》、《打开与故障恢复》；数据库 WAL 与 Raft 日志的区别见知识库笔记《预写日志与复制日志》。用 Raft 的话说：日志是事实，memtable 是把日志应用之后的状态机；重放就是从头应用一遍日志。
 
 ## 什么时候算写成功：持久化的四级
 
@@ -209,7 +209,7 @@ manifest 用 JSON 是因为一次运行只有几十条、要能读懂；WAL 一�
 - **模块**：[wal.rs](../engine/src/wal.rs)。`Wal` 只有一个打开的文件，自己不带锁：`create`（`create_new`，同步父目录）、`recover`（读出全部，`decode_entries` 逐帧解，残尾 `set_len` 截掉并同步）、`append`（`encode_entry` 拼好一帧，`(&File).write_all` 一次写出，不同步）、`sync`（`sync_all`）。`encoded_len` 算一条的长度，给计数器用。
 - **memtable**：`MemTable` 多了 `id`、`wal: Option<Wal>`、`write_lock`。`put` 返回 `Result`：有 WAL 时在 `write_lock` 里先 `append` 再插入，没有 WAL 时直接插入、不拿锁。`sync_wal` 不拿锁，同步期间别的线程照常写。`recover_from_wal` 用 `insert`（只插表、累加大小，不碰 WAL）把记录插回去，再把打开着的 WAL 放进表里。
 - **写入**：`put`、`delete` 返回 `Result<bool>`（有没有冻结一张表），`put_opt`、`delete_opt` 多一个 `WriteOptions { sync }`。`write` 的顺序：检查长度（超过 65535 字节返回 `Error::InvalidArgument`，什么都不做）→ 读锁里写入表 → 计数（用户字节、WAL 字节）→ 需要时 `sync` → 试着冻结。`sync` 取一份快照，把可写的表与每一张冻结的表的 WAL 都同步一遍（RocksDB 的排法）。空 key、空 value 仍是 panic：那是调用方违反约定，见 [L07](07-write-path.md#写入为什么暂时不返回错误)。
-- **同步在读锁外**：`sync` 里的 `snapshot` 还要拿一次读锁。同一个线程持着读锁再拿读锁，遇上排队的写者会死锁：std 的 `RwLock` 在 macOS 与 Linux 上都是写者优先，有人在等写锁时新的读请求也要排队。见 [[rust-learning/notes/09-concurrency/06-RwLock-与读写访问|RwLock 与读写访问]]。
+- **同步在读锁外**：`sync` 里的 `snapshot` 还要拿一次读锁。同一个线程持着读锁再拿读锁，遇上排队的写者会死锁：std 的 `RwLock` 在 macOS 与 Linux 上都是写者优先，有人在等写锁时新的读请求也要排队。见 Rust 笔记《RwLock 与读写访问》。
 - **冻结**：`force_freeze_memtable` 返回 `Result`：从计数器取号，开了 WAL 时建新表与它的 WAL（连同目录的同步），都在拿写锁之前；建不成时状态不变。不同步旧表的 WAL。
 - **flush**：空表且没有 WAL 时只换状态；其余都记一条，`added` 是 `sst.into_iter().collect()`（`Some` 得到一个元素、`None` 得到空），`flushed_memtable_id` 是这张表的编号；`commit_state` 成功、放开 `state_lock` 之后删 WAL。
 - **manifest**：`VersionEdit` 加 `flushed_memtable_id: Option<usize>`，带 `#[serde(default, skip_serializing_if = "Option::is_none")]`：L14 之前的记录没有这一项，读出来是 `None`；合并的记录不写这一项，与原来的格式一样。`replay` 取最后一条 flush 的记录作高水位，倒退或重复时报损坏。
@@ -230,7 +230,7 @@ manifest 用 JSON 是因为一次运行只有几十条、要能读懂；WAL 一�
 
 ## 工业对照
 
-**mini-lsm**（[wal.rs](../../references/mini-lsm/mini-lsm/src/wal.rs)、[lsm_storage.rs](../../references/mini-lsm/mini-lsm/src/lsm_storage.rs)）：每张表一个 `<id>.wal`，记录是 `key_len | key | value_len | value | crc32`（没有外层的长度）；`Wal` 里是 `Mutex<BufWriter<File>>`，`put` 只写进缓冲区，`sync` 才 `flush` 加 `sync_all`，所以没调用 `sync` 时进程崩溃也会丢。manifest 每建一张表记一条 `NewMemtable(id)`，flush 之后 SST 沿用表的编号；冻结时换完表、放开写锁之后同步旧表的 WAL，`sync()` 先拿 `state_lock` 再只同步当前的表。打开时重放的表全部放进冻结列表，跳过空的；有 WAL 时 `close` 只同步、不 flush。
+**mini-lsm**（[wal.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/wal.rs)、[lsm_storage.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/lsm_storage.rs)）：每张表一个 `<id>.wal`，记录是 `key_len | key | value_len | value | crc32`（没有外层的长度）；`Wal` 里是 `Mutex<BufWriter<File>>`，`put` 只写进缓冲区，`sync` 才 `flush` 加 `sync_all`，所以没调用 `sync` 时进程崩溃也会丢。manifest 每建一张表记一条 `NewMemtable(id)`，flush 之后 SST 沿用表的编号；冻结时换完表、放开写锁之后同步旧表的 WAL，`sync()` 先拿 `state_lock` 再只同步当前的表。打开时重放的表全部放进冻结列表，跳过空的；有 WAL 时 `close` 只同步、不 flush。
 
 **RocksDB**：
 
@@ -245,12 +245,12 @@ manifest 用 JSON 是因为一次运行只有几十条、要能读懂；WAL 一�
 
 ### 导读：mito2 的 WAL
 
-mito2 不自己写 WAL 文件：所有 region 共用一个日志库（单机时是 raft-engine，分布式时是 Kafka），每条记录有一个递增的条目编号（entry id）。路径都在 `references/greptimedb/src/mito2/src/` 下。
+mito2 不自己写 WAL 文件：所有 region 共用一个日志库（单机时是 raft-engine，分布式时是 Kafka），每条记录有一个递增的条目编号（entry id）。路径都在 GreptimeDB v1.2.1 的 [`src/mito2/src/`](https://github.com/GreptimeTeam/greptimedb/tree/v1.2.1/src/mito2/src/) 下。
 
-1. **写入**：[wal.rs](../../references/greptimedb/src/mito2/src/wal.rs) 的 `WalWriter`。`add_entry` 把一个 region 的一批写入编码成一条，带上 region 与条目编号，先放进 `entries`；`write_to_wal` 把攒下的几条用 `append_batch` 一次交给日志库。一次写入请求里几个 region 的记录一起写，相当于 group commit。对应本项目的 `Wal::append`，差别是它按批写、本项目每条写一次。
-2. **flush 记下高水位**：[flush.rs](../../references/greptimedb/src/mito2/src/flush.rs) 构造 `RegionEdit` 时，`flushed_entry_id` 取这次 flush 所用的版本数据里记的最后一个条目编号（`version_data.last_entry_id`），`flushed_sequence` 取已提交的最后一个序号，然后 `update_manifest` 写进 manifest。对应本项目 `force_flush_next_imm_memtable` 里的 `edit.flushed_memtable_id = Some(memtable.id())` 与 `commit_state`。差别：mito2 一次 flush 这个 region 的全部冻结表，所以高水位直接是"写到哪一条了"；本项目一次一张，高水位是表的编号。
-3. **作废**：[worker/handle_flush.rs](../../references/greptimedb/src/mito2/src/worker/handle_flush.rs) 的 `handle_flush_finished`：先把 edit 用到内存里的版本上，再调用 `wal.obsolete(region_id, flushed_entry_id, …)`，让日志库把这个 region 编号不超过它的条目标为可删。顺序与本项目的"先记高水位、后删 WAL"相同；它删的是条目而不是文件，空间由日志库回收。
-4. **重放**：[region/opener.rs](../../references/greptimedb/src/mito2/src/region/opener.rs) 的 `replay_memtable`。从 `flushed_entry_id + 1` 开始读这个 region 的条目；读到不超过 `flushed_entry_id` 的旧条目时，按选项报错或者告警跳过；每条里的写入照常写进 memtable，并沿用 WAL 里记的序号（"respect the sequence in WAL during replay"）。对应本项目的 `recover_memtables` 与 `recover_from_wal`：先按高水位过滤，再插回表。可以先跳过的：`bulk_entries` 与补列的那一段（时序数据的批量写入与表结构变更），以及最后的计时与日志。
+1. **写入**：[wal.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/wal.rs) 的 `WalWriter`。`add_entry` 把一个 region 的一批写入编码成一条，带上 region 与条目编号，先放进 `entries`；`write_to_wal` 把攒下的几条用 `append_batch` 一次交给日志库。一次写入请求里几个 region 的记录一起写，相当于 group commit。对应本项目的 `Wal::append`，差别是它按批写、本项目每条写一次。
+2. **flush 记下高水位**：[flush.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/flush.rs) 构造 `RegionEdit` 时，`flushed_entry_id` 取这次 flush 所用的版本数据里记的最后一个条目编号（`version_data.last_entry_id`），`flushed_sequence` 取已提交的最后一个序号，然后 `update_manifest` 写进 manifest。对应本项目 `force_flush_next_imm_memtable` 里的 `edit.flushed_memtable_id = Some(memtable.id())` 与 `commit_state`。差别：mito2 一次 flush 这个 region 的全部冻结表，所以高水位直接是"写到哪一条了"；本项目一次一张，高水位是表的编号。
+3. **作废**：[worker/handle_flush.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/worker/handle_flush.rs) 的 `handle_flush_finished`：先把 edit 用到内存里的版本上，再调用 `wal.obsolete(region_id, flushed_entry_id, …)`，让日志库把这个 region 编号不超过它的条目标为可删。顺序与本项目的"先记高水位、后删 WAL"相同；它删的是条目而不是文件，空间由日志库回收。
+4. **重放**：[region/opener.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/region/opener.rs) 的 `replay_memtable`。从 `flushed_entry_id + 1` 开始读这个 region 的条目；读到不超过 `flushed_entry_id` 的旧条目时，按选项报错或者告警跳过；每条里的写入照常写进 memtable，并沿用 WAL 里记的序号（"respect the sequence in WAL during replay"）。对应本项目的 `recover_memtables` 与 `recover_from_wal`：先按高水位过滤，再插回表。可以先跳过的：`bulk_entries` 与补列的那一段（时序数据的批量写入与表结构变更），以及最后的计时与日志。
 5. **重放进哪里**：它把重放的写入写进当前可写的 memtable（`region_write_ctx.write_memtable()`），不另建冻结的表；靠序号决定新旧，所以不用关心重放出来的表排在哪里。
 
 与本项目对照：都是"manifest 记高水位，打开时重放高水位之上的部分，先记后删"。差别来自共用的日志库与序号：作废是按条目编号截断而不是删文件；并发写入的先后靠序号而不是锁；重放直接写进可写的表。
@@ -274,9 +274,9 @@ mito2 不自己写 WAL 文件：所有 region 共用一个日志库（单机时�
 
 ## 资料
 
-- mini-lsm 教程第二周第 6 章：[week2-06-wal.md](../../references/mini-lsm/mini-lsm-book/src/week2-06-wal.md)；代码 [wal.rs](../../references/mini-lsm/mini-lsm/src/wal.rs)。
+- mini-lsm 教程第二周第 6 章：[week2-06-wal.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-06-wal.md)；代码 [wal.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/wal.rs)。
 - RocksDB Wiki：Write Ahead Log、WAL Recovery Modes、WAL Performance。源码（v9.10.0）：`db/db_impl/db_impl_write.cc` 的 `WriteToWAL`，`db/db_impl/db_impl_open.cc` 的 `RecoverLogFiles`，`include/rocksdb/options.h` 的 `avoid_flush_during_recovery`。
-- 存储笔记：[提交顺序与同步](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](../../storage/notes/05-storage-recovery/05-open-and-crash-recovery.md)、[父目录的同步](../../storage/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
+- 存储笔记：《提交顺序与同步》、《打开与故障恢复》、《写入、同步与错误边界》的“父目录的同步”一节。
 - 基准记录：[WAL 的代价](../bench/results/2026-10-21-wal.md)。
 
 返回 [本组目录](README.md)。

@@ -3,12 +3,12 @@
 2026-10-19。要回答的问题：在 L10、L11 的同一组负载下，leveled（按字节的目标、从最底层往上建层、部分合并、trivial move）的写放大、读与空间各是多少；简单分层里"穿过空层的复制"是否消失；顺序写入时 trivial move 能省多少；数据量大十倍时这些差别是否还在。
 
 - 机器：Apple M5（Mac17,2），10 个逻辑 CPU，32 GB 内存，macOS 26.6.2，**使用电池**；内置 SSD，APFS。
-- 代码状态：提交 2592fac 之上加了 L12 的工作区，即与本记录一起提交的那一版（`compaction::leveled`、`CompactionOptions::Leveled`、部分合并与 trivial move 的执行；基准驱动新增 `--compaction leveled`、`--level-multiplier`、`--base-level-mb`）。分两批跑：第一批时 trivial move 只挪单个文件；第二批之前改成了几个互不重叠的 L0 文件可以一起挪（见"顺序写入"一节）。随机写入下 L0 的文件彼此重叠，这个改动不起作用：第二批重跑 L 三次，整次运行的写放大 4.52 [4.26-5.10]、扫描 10.2 万次/秒，都在第一批的浮动之内。
+- 代码状态：提交 f52656c 之上加了 L12 的工作区，即与本记录一起提交的那一版（`compaction::leveled`、`CompactionOptions::Leveled`、部分合并与 trivial move 的执行；基准驱动新增 `--compaction leveled`、`--level-multiplier`、`--base-level-mb`）。分两批跑：第一批时 trivial move 只挪单个文件；第二批之前改成了几个互不重叠的 L0 文件可以一起挪（见"顺序写入"一节）。随机写入下 L0 的文件彼此重叠，这个改动不起作用：第二批重跑 L 三次，整次运行的写放大 4.52 [4.26-5.10]、扫描 10.2 万次/秒，都在第一批的浮动之内。
 - 对照对象：同一天、同一版代码上重跑的简单分层（L0 之下 4 层与 2 层）与 tiered（`num_tiers` 8），不是 L10、L11 记录里的数字。
 - 每个配置运行 3 次，下表取中位数，方括号里是三次的最小与最大值。
 - 读负载都在后台合并做完之后才开始，读的是合并停下时的形状。
 
-重跑方式（在 `lsm/` 下，只差后面的合并参数）：
+重跑方式（在仓库根目录下，只差后面的合并参数）：
 
 ```sh
 cargo run --release -p lsm-bench -- --target engine --memtable-mb 4 --block-cache-mb 64 --workloads fillrandom,overwrite,readrandom,readmissing,seekrandom \

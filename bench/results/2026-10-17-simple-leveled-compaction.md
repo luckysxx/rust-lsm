@@ -3,11 +3,11 @@
 2026-10-17。要回答的问题：后台按简单分层策略自动合并之后，读回到了"全量合并一次"的水平没有；为此付出多少写放大；三个参数（L0 触发值、层间比例、层数）各起多大作用；合并跟不跟得上写入。
 
 - 机器：Apple M5（Mac17,2），10 个逻辑 CPU，32 GB 内存，macOS 26.6.2，**使用电池**；内置 SSD，APFS。
-- 代码状态：提交 97d516a 之上加了 L10 的工作区，即与本记录一起提交的那一版（多层状态与读路径、`compaction::simple_leveled`、按任务合并的 `compact_once`、后台 compaction 线程；基准驱动新增 `--max-levels`、`--compaction`、`--l0-trigger`、`--size-ratio`，每段负载之后连同后台合并一起等完）。"修复之后"一节之前的数字都是在归并游标修改之前测的；提交里的归并游标是修改之后的版本，所以按提交重跑时，扫描的数字应当与"修复之后"一节相近。
+- 代码状态：提交 4c04c95 之上加了 L10 的工作区，即与本记录一起提交的那一版（多层状态与读路径、`compaction::simple_leveled`、按任务合并的 `compact_once`、后台 compaction 线程；基准驱动新增 `--max-levels`、`--compaction`、`--l0-trigger`、`--size-ratio`，每段负载之后连同后台合并一起等完）。"修复之后"一节之前的数字都是在归并游标修改之前测的；提交里的归并游标是修改之后的版本，所以按提交重跑时，扫描的数字应当与"修复之后"一节相近。
 - 每个配置运行 3 次，下表取中位数，方括号里是三次的最小与最大值。
 - 读负载都在后台合并做完之后才开始，所以读的是合并停下时的形状。
 
-重跑方式（在 `lsm/` 下，五组只差后面的合并参数）：
+重跑方式（在仓库根目录下，五组只差后面的合并参数）：
 
 ```sh
 cargo run --release -p lsm-bench -- --target engine --memtable-mb 4 --block-cache-mb 64 --workloads fillrandom,overwrite,readrandom,readmissing,seekrandom \

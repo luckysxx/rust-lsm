@@ -10,7 +10,7 @@
 
 ## 资料
 
-- mini-lsm 教程第三周第 1 章：[week3-01-ts-key-refactor.md](../../references/mini-lsm/mini-lsm-book/src/week3-01-ts-key-refactor.md)。
-- 已学内容中相关的篇：[MVCC 与版本回收](../../storage/notes/06-storage-comparisons/04-mvcc-and-version-reclamation.md)。
+- mini-lsm 教程第三周第 1 章：[week3-01-ts-key-refactor.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week3-01-ts-key-refactor.md)。
+- 已学内容中相关的篇：存储笔记《MVCC 与版本回收》。
 
 返回 [本组目录](README.md)。

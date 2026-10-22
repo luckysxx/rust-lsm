@@ -16,7 +16,7 @@
 | B+Tree | LSM |
 | --- | --- |
 | 一个 key 只可能在一个地方：从根走一条路径就能确定有没有，查不存在的 key 与查存在的 key 代价相同 | 一个 key 可能在每张 memtable、每个 L0 文件、每一层里；查不存在的 key 要问遍所有候选。Bloom filter 让每个候选能便宜地回答"这里一定没有" |
-| 页内的长 key 与前缀压缩（[长 key 与分隔键](../../storage/notes/06-storage-comparisons/02-large-keys-and-separators.md)） | 块内 key 的前缀压缩：页和块里的 key 都有序，相邻的 key 前缀相似 |
+| 页内的长 key 与前缀压缩（存储笔记《长 key 与分隔键》） | 块内 key 的前缀压缩：页和块里的 key 都有序，相邻的 key 前缀相似 |
 | meta 页里的魔数与版本 | SST 末尾的魔数与格式版本号，见 [SST 格式](05-sst-format.md#文件的组成) |
 
 ## Bloom filter
@@ -237,7 +237,7 @@ filter 只能回答**某一个** key 在不在，而一个范围里可能的 key
 
 ## 工业对照
 
-**mini-lsm**（[table/bloom.rs](../../references/mini-lsm/mini-lsm/src/table/bloom.rs)）：位置公式、`delta` 的取法、k 的算法与本项目相同；哈希用 `farmhash::fingerprint32`。它的 filter 编码末尾多一个 crc32 校验和，本项目的校验和放到 [写批次与校验和](15-write-batch-and-checksums.md) 统一做。前缀压缩同样参照块的第一个 key。
+**mini-lsm**（[table/bloom.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/table/bloom.rs)）：位置公式、`delta` 的取法、k 的算法与本项目相同；哈希用 `farmhash::fingerprint32`。它的 filter 编码末尾多一个 crc32 校验和，本项目的校验和放到 [写批次与校验和](15-write-batch-and-checksums.md) 统一做。前缀压缩同样参照块的第一个 key。
 
 **LevelDB 与 RocksDB**：
 
@@ -316,9 +316,9 @@ if self.in_memory.last() == Some(&fbf) {
 
 ## 资料
 
-- mini-lsm 教程第一周第 7 章：[week1-07-sst-optimizations.md](../../references/mini-lsm/mini-lsm-book/src/week1-07-sst-optimizations.md)。
+- mini-lsm 教程第一周第 7 章：[week1-07-sst-optimizations.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-07-sst-optimizations.md)。
 - Kirsch, Mitzenmacher. *Less Hashing, Same Performance: Building a Better Bloom Filter*（2006）：两个哈希值线性组合出 k 个位置。
-- 已学内容中相关的篇：[长 key 与分隔键](../../storage/notes/06-storage-comparisons/02-large-keys-and-separators.md)、[B+Tree 与 LSM](../../storage/notes/06-storage-comparisons/03-btree-and-lsm.md)。
+- 已学内容中相关的篇：存储笔记《长 key 与分隔键》、《B+Tree 与 LSM》。
 - 基准记录：[Bloom filter 的前后对比](../bench/results/2026-10-14-bloom-filter.md)、[块内 key 前缀压缩的前后对比](../bench/results/2026-10-15-prefix-compression.md)。
 
 返回 [本组目录](README.md)。

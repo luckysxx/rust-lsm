@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = { workspace = true }
 rust-version = { workspace = true }
 publish = { workspace = true }
+license = { workspace = true }
 description = "LSM 引擎的基准驱动：固定负载、吞吐、延迟分位数与放大"
 
 [dependencies]

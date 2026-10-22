@@ -190,7 +190,7 @@ leveled 用写换读和空间，tiered 反过来。
 
 ## 工业对照
 
-**mini-lsm**（[simple_leveled.rs](../../references/mini-lsm/mini-lsm/src/compact/simple_leveled.rs)、[compact.rs](../../references/mini-lsm/mini-lsm/src/compact.rs)）：规则相同。不同处：上层用 `Option<usize>` 表示（`None` 是 L0）；任务里记文件编号，状态里有一张"编号 → 文件"的表；层数是策略参数；后台每 50 毫秒只做一个任务；L0 的任务把"下层是最底层"固定为 false（只有一层时会多保留墓碑）。
+**mini-lsm**（[simple_leveled.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/compact/simple_leveled.rs)、[compact.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/compact.rs)）：规则相同。不同处：上层用 `Option<usize>` 表示（`None` 是 L0）；任务里记文件编号，状态里有一张"编号 → 文件"的表；层数是策略参数；后台每 50 毫秒只做一个任务；L0 的任务把"下层是最底层"固定为 false（只有一层时会多保留墓碑）。
 
 **RocksDB**：
 
@@ -288,9 +288,9 @@ self.dispatch_compaction_planning(plan_id, request, compact_options, time_range)
 
 ## 资料
 
-- mini-lsm 教程第二周第 2 章：[week2-02-simple.md](../../references/mini-lsm/mini-lsm-book/src/week2-02-simple.md)；三种放大见 [week2-overview.md](../../references/mini-lsm/mini-lsm-book/src/week2-overview.md)。
+- mini-lsm 教程第二周第 2 章：[week2-02-simple.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-02-simple.md)；三种放大见 [week2-overview.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-overview.md)。
 - 上一篇：[compaction 的执行](09-compaction-execution.md)；归并游标的改动：[迭代器接口与多路归并](03-iterators-and-merge.md#归并的实现)。
 - 基准记录：[简单分层 compaction：自动合并下的三种放大](../bench/results/2026-10-17-simple-leveled-compaction.md)。
-- Rust：[[rust-learning/notes/13-engineering/02-模块、可见性与重导出|模块、可见性与重导出]]。
+- Rust 笔记：《模块、可见性与重导出》。
 
 返回 [本组目录](README.md)。

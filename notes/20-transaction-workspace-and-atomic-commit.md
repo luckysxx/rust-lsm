@@ -11,7 +11,7 @@
 
 ## 资料
 
-- mini-lsm 教程第三周第 5 章：[week3-05-txn-occ.md](../../references/mini-lsm/mini-lsm-book/src/week3-05-txn-occ.md)。
-- 已学内容中相关的篇：[原子写批次](../../storage/notes/05-storage-recovery/06-atomic-write-batches.md)。
+- mini-lsm 教程第三周第 5 章：[week3-05-txn-occ.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week3-05-txn-occ.md)。
+- 已学内容中相关的篇：存储笔记《原子写批次》。
 
 返回 [本组目录](README.md)。

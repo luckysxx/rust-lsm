@@ -43,7 +43,7 @@ flush 一张冻结的 memtable：
     整个文件写完并同步之后，才登记进 MANIFEST
 ```
 
-封好的块是立刻写进文件，还是先攒在内存里最后一次写出，是实现上的选择。mini-lsm 把所有块攒在一个 `Vec<u8>` 里，最后一次写出整个文件（[table/builder.rs](../../references/mini-lsm/mini-lsm/src/table/builder.rs) 的 `build`）；LevelDB、RocksDB 封一个块就往文件里追加一个，文件很大时不必在内存里多留一份。两种做法对外没有区别，因为写到一半的 SST 不算数：只有整个文件写完、同步、登记之后它才存在，中途崩溃留下的半个文件在重启时当作残留删掉。这与 B+Tree 的 [提交顺序](../../storage/notes/05-storage-recovery/04-commit-order-and-sync.md) 是同一个道理：数据页写到一半时，meta 还指着旧版本。
+封好的块是立刻写进文件，还是先攒在内存里最后一次写出，是实现上的选择。mini-lsm 把所有块攒在一个 `Vec<u8>` 里，最后一次写出整个文件（[table/builder.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/table/builder.rs) 的 `build`）；LevelDB、RocksDB 封一个块就往文件里追加一个，文件很大时不必在内存里多留一份。两种做法对外没有区别，因为写到一半的 SST 不算数：只有整个文件写完、同步、登记之后它才存在，中途崩溃留下的半个文件在重启时当作残留删掉。这与 B+Tree 的存储笔记《提交顺序与同步》是同一个道理：数据页写到一半时，meta 还指着旧版本。
 
 flush 时没有"SST 写满"：memtable 里有多少数据，写出的 SST 就多大。SST 的大小上限出现在 compaction 中，见 [compaction 的执行](09-compaction-execution.md)。
 
@@ -92,7 +92,7 @@ SST：     内存里的索引二分找到块 → 读进这一块 → 块内用�
 
 ## 与 B+Tree 页的对照
 
-块内部的问题与 [节点格式](../../storage/notes/03-btree-pages/03-node-format-and-record-addressing.md) 相同：几 KB 里放有序的变长记录，要能二分。答案的主体也相同：变长记录配一个定长的偏移数组。不同来自四处条件：
+块内部的问题与存储笔记《节点格式与变长记录寻址》相同：几 KB 里放有序的变长记录，要能二分。答案的主体也相同：变长记录配一个定长的偏移数组。不同来自四处条件：
 
 | | B+Tree 的页 | LSM 的数据块 |
 | --- | --- | --- |
@@ -112,7 +112,7 @@ SST：     内存里的索引二分找到块 → 读进这一块 → 块内用�
 - 页会被释放再重用。空出来的位置要能放下将来任何一张页，所以所有页一样大。大小不一的话，文件内部就需要一个处理碎片的分配器，与定长分配和 `malloc` 的差别相同。
 - 页靠页号定位，位置是"页号 × 页大小"，不需要查表。大小不一就得另存一张"页号 → 位置与长度"的表，这张表本身还要随每次修改更新并持久化。
 
-**"是扇区或系统页的整数倍"才与硬件有关。** 它关系到三件事：一次写入跨越几个扇区（[撕裂写](../../storage/notes/05-storage-recovery/03-file-format-and-meta-validation.md) 的范围）；mmap 以系统页为单位映射；绕过页缓存的直接 I/O 要求对齐。普通的文件读写没有对齐的要求，文件系统允许读写任意的字节范围，由内核去读覆盖它的那些扇区。
+**"是扇区或系统页的整数倍"才与硬件有关。** 它关系到三件事：一次写入跨越几个扇区（撕裂写，见存储笔记《文件格式与元数据校验》）；mmap 以系统页为单位映射；绕过页缓存的直接 I/O 要求对齐。普通的文件读写没有对齐的要求，文件系统允许读写任意的字节范围，由内核去读覆盖它的那些扇区。
 
 块不满足"固定"的两个前提：
 
@@ -256,7 +256,7 @@ LevelDB 的块也是"记录在前、索引在尾、最后是项数"，但索引�
 
 **块上的游标**（[block/iterator.rs](../engine/src/block/iterator.rs) 的 `BlockIterator`）：字段是 `Arc<Block>`、一个下标和一个 `Vec<u8>`。块是一段不再变化的字节，位置用"第几条"表示就够了，没有 [memtable 游标](03-iterators-and-merge.md#自引用的问题) 那样的自引用问题。压缩之后完整的 key 在块里不是连续的一段，`key()` 要返回 `&[u8]` 就只能借游标自己的缓冲区：每次移动位置之后把当前的 key 拼进去，缓冲区反复使用，容量够时不再分配内存。二分时也用它临时拼中间那条的 key 再比较。`value` 仍然直接借自块。它实现的是统一的游标接口，可以直接交给归并。
 
-格式里的整数是 `u16`，内存里做下标运算用 `usize`：写出时由 `usize` 转 `u16`（之前的断言保证放得下），读入时立刻转成 `usize`，此后不再转换。见 [[rust-learning/notes/01-syntax/04-数值转换与溢出处理|数值转换与溢出处理]]。
+格式里的整数是 `u16`，内存里做下标运算用 `usize`：写出时由 `usize` 转 `u16`（之前的断言保证放得下），读入时立刻转成 `usize`，此后不再转换。见 Rust 笔记《数值转换与溢出处理》。
 
 ### 二分的写法
 
@@ -283,18 +283,18 @@ LevelDB 的块也是"记录在前、索引在尾、最后是项数"，但索引�
 
 ## 工业对照
 
-**mini-lsm**（[block.rs](../../references/mini-lsm/mini-lsm/src/block.rs)、[block/builder.rs](../../references/mini-lsm/mini-lsm/src/block/builder.rs)、[block/iterator.rs](../../references/mini-lsm/mini-lsm/src/block/iterator.rs)）：块尾的布局、字段宽度与字节序和本项目相同。不同之处：
+**mini-lsm**（[block.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/block.rs)、[block/builder.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/block/builder.rs)、[block/iterator.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/block/iterator.rs)）：块尾的布局、字段宽度与字节序和本项目相同。不同之处：
 
 - 记录格式与本项目相同，也是相对块的首 key 做前缀压缩。
 - 它的游标同样把拼好的 key 存在自己里面，value 只记起止位置；它另外缓存了块的首 key，本项目每次从第一条记录里取。
 - 解析记录时不算下标，而是拿着一段"还没读的字节"，读走多少就把它缩短多少（`bytes` 库的 `Buf`）。
 - 解码时逐项检查偏移递增、长度不越界，坏数据返回错误。
 
-**GreptimeDB mito2** 没有自己的数据块格式。它的 SST 是 Parquet 文件（[sst/parquet/writer.rs](../../references/greptimedb/src/mito2/src/sst/parquet/writer.rs)），数据按列存放，文件里的单位是 row group 和其中每一列的 page，由 Parquet 的库负责编码。两边可以对上的是：
+**GreptimeDB mito2** 没有自己的数据块格式。它的 SST 是 Parquet 文件（[sst/parquet/writer.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/sst/parquet/writer.rs)），数据按列存放，文件里的单位是 row group 和其中每一列的 page，由 Parquet 的库负责编码。两边可以对上的是：
 
 | | 本项目 | mito2 |
 | --- | --- | --- |
-| 文件里的单位 | 块，约 4 KB，装着若干行的 key 与 value | row group，默认 102400 行（[sst/parquet.rs](../../references/greptimedb/src/mito2/src/sst/parquet.rs) 的 `DEFAULT_ROW_GROUP_SIZE`），内部按列分成 page |
+| 文件里的单位 | 块，约 4 KB，装着若干行的 key 与 value | row group，默认 102400 行（[sst/parquet.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/sst/parquet.rs) 的 `DEFAULT_ROW_GROUP_SIZE`），内部按列分成 page |
 | 何时封口 | 加入之后会超过目标字节数 | 行数达到上限 |
 | 块内定位 | 偏移数组上二分 | 用每个 row group、每个 page 的最小最大值统计跳过不相关的部分，再按列解码 |
 | 压缩 | 目前没有 | 每个 page 用 ZSTD 压缩 |
@@ -306,8 +306,8 @@ LevelDB 的块也是"记录在前、索引在尾、最后是项数"，但索引�
 LSM 的结构（memtable、flush、compaction、manifest、WAL）与文件内部的格式是两件事。mito2 自己写了前者，后者选了现成的 Parquet。理由有三层：
 
 - **负载适合按列存放。** 一行是"若干标签列、一个时间戳、若干数值列"，查询多是对几列做大范围的扫描与聚合。按行存放的块（key、value 首尾相接）读一列也要把整行读进来；按列存放只读用到的列，同一列的值类型相同、彼此相近，压缩率高得多，解出来就是可以成批计算的数组。
-- **不必重做。** Parquet 是成熟的开放格式，Rust 里有现成的读写库，统计信息（每个 row group、每个 page 的最小最大值）与按条件跳过都已具备；mito2 的查询引擎 DataFusion 本来就以 Arrow 的列式批次为处理单位，读出来不需要转换。mito2 的依赖里直接有 `parquet` 与 `datafusion`（[Cargo.toml](../../references/greptimedb/src/mito2/Cargo.toml)）。
-- **文件能被别的系统读。** 它的数据放在对象存储上，Parquet 文件可以被其他分析工具直接读取。源码里专门为列写入了与 Iceberg 兼容的字段编号（[sst.rs](../../references/greptimedb/src/mito2/src/sst.rs) 的 `PARQUET_FIELD_ID_KEY`）。
+- **不必重做。** Parquet 是成熟的开放格式，Rust 里有现成的读写库，统计信息（每个 row group、每个 page 的最小最大值）与按条件跳过都已具备；mito2 的查询引擎 DataFusion 本来就以 Arrow 的列式批次为处理单位，读出来不需要转换。mito2 的依赖里直接有 `parquet` 与 `datafusion`（[Cargo.toml](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/Cargo.toml)）。
+- **文件能被别的系统读。** 它的数据放在对象存储上，Parquet 文件可以被其他分析工具直接读取。源码里专门为列写入了与 Iceberg 兼容的字段编号（[sst.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/sst.rs) 的 `PARQUET_FIELD_ID_KEY`）。
 
 代价是按 key 找一行不方便：Parquet 里没有"每行一项"的偏移，最细只能靠统计信息定位到 page，再把这一页解码。mito2 为此另建索引（倒排索引、Bloom filter 等），存在与 SST 配套的 puffin 文件里。
 
@@ -322,7 +322,7 @@ Parquet： 文件 → row group → 列 → page → 值         尾部：每个
 
 ### 导读：puffin 文件的尾部
 
-GreptimeDB 里手写的、与"从尾部倒着找"对应的代码在索引文件的格式里。mito2 的索引（倒排索引、Bloom filter 等）存在 puffin 格式的文件中，读文件尾的代码在 [puffin/src/file_format/reader/footer.rs](../../references/greptimedb/src/puffin/src/file_format/reader/footer.rs)：
+GreptimeDB 里手写的、与"从尾部倒着找"对应的代码在索引文件的格式里。mito2 的索引（倒排索引、Bloom filter 等）存在 puffin 格式的文件中，读文件尾的代码在 [puffin/src/file_format/reader/footer.rs](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/puffin/src/file_format/reader/footer.rs)：
 
 ```rust
 /// Footer layout: HeadMagic Payload PayloadSize Flags FootMagic
@@ -375,7 +375,7 @@ fn decode_payload_size(&self, suffix: &[u8]) -> Result<u64> {
 - **value 的长度从记录的固定位置读。** 它紧跟在 key 后面，位置取决于 key 的长度，只能先读 key 的长度再算。
 - **二分找成了"第一条大于"。** 给定的 key 存在时会跳过它，点查就找不到已有的 key。
 - **定位从游标当前的位置往后找。** 往回定位时得到错误的结果；定位与之前的位置无关。
-- **在只读的方法里克隆 `Arc` 再从副本借出引用。** 借出的字节要从游标自己拿着的那个 `Arc` 出发，见 [[rust-learning/notes/02-ownership/03-返回引用与生命周期标注|返回引用与生命周期标注]]。
+- **在只读的方法里克隆 `Arc` 再从副本借出引用。** 借出的字节要从游标自己拿着的那个 `Arc` 出发，见 Rust 笔记《返回引用与生命周期标注》。
 
 ## 大纲
 
@@ -383,7 +383,7 @@ fn decode_payload_size(&self, suffix: &[u8]) -> Result<u64> {
 
 ## 资料
 
-- mini-lsm 教程第一周第 3 章：[week1-03-block.md](../../references/mini-lsm/mini-lsm-book/src/week1-03-block.md)。
-- 已学内容中相关的篇：[页格式与记录定位](../../storage/notes/03-btree-pages/03-node-format-and-record-addressing.md)、[页内布局对照](../../storage/notes/06-storage-comparisons/01-page-layout-alternatives.md)。
+- mini-lsm 教程第一周第 3 章：[week1-03-block.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-03-block.md)。
+- 已学内容中相关的篇：存储笔记《节点格式与变长记录寻址》、《页内布局对照》。
 
 返回 [本组目录](README.md)。

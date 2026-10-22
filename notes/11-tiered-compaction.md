@@ -192,7 +192,7 @@ tier 是逻辑上的分组，只记在状态里；SST 是磁盘上的文件，�
 
 ## 工业对照
 
-**mini-lsm**（[tiered.rs](../../references/mini-lsm/mini-lsm/src/compact/tiered.rs)）：规则相同。不同处：tier 是 `(tier 编号, SST 编号列表)`，编号取输出的第一个 SST；比较用浮点数；换状态时用一张"编号 → 文件列表"的表找到要拿掉的 tier，在遍历中遇到最后一个输入时插入输出；`max_merge_width` 只用于触发 3。
+**mini-lsm**（[tiered.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/compact/tiered.rs)）：规则相同。不同处：tier 是 `(tier 编号, SST 编号列表)`，编号取输出的第一个 SST；比较用浮点数；换状态时用一张"编号 → 文件列表"的表找到要拿掉的 tier，在遍历中遇到最后一个输入时插入输出；`max_merge_width` 只用于触发 3。
 
 **RocksDB universal**：
 
@@ -282,7 +282,7 @@ let mut inputs = if found_runs > 1 {
 
 ## 资料
 
-- mini-lsm 教程第二周第 3 章：[week2-03-tiered.md](../../references/mini-lsm/mini-lsm-book/src/week2-03-tiered.md)；三种放大见 [week2-overview.md](../../references/mini-lsm/mini-lsm-book/src/week2-overview.md)。
+- mini-lsm 教程第二周第 3 章：[week2-03-tiered.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-03-tiered.md)；三种放大见 [week2-overview.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-overview.md)。
 - RocksDB Wiki：Universal Compaction。
 - 上一篇：[简单分层 compaction](10-simple-leveled-compaction.md)；tiered 与 leveled 的最初对比：[compaction 的执行](09-compaction-execution.md#另一种组织方式tiered)。
 - 基准记录：[tiered compaction：写放大减半，读取看停下时剩几个 tier](../bench/results/2026-10-18-tiered-compaction.md)。

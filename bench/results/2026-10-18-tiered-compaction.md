@@ -3,12 +3,12 @@
 2026-10-18。要回答的问题：在 L10 的同一组负载下，tiered 比简单分层省多少写放大；读与空间各付出多少；`num_tiers` 取 4、8、16 有什么差别；L10 里"合并跟不上写入"在 tiered 下怎样。
 
 - 机器：Apple M5（Mac17,2），10 个逻辑 CPU，32 GB 内存，macOS 26.6.2，**使用电池**；内置 SSD，APFS。
-- 代码状态：提交 81880b8 之上加了 L11 的工作区，即与本记录一起提交的那一版（`compaction::tiered`、`CompactionOptions`、flush 在 tiered 下成为新的 tier、按 tier 换状态；基准驱动新增 `--compaction tiered` 与 `--num-tiers` 等选项）。
+- 代码状态：提交 420a88a 之上加了 L11 的工作区，即与本记录一起提交的那一版（`compaction::tiered`、`CompactionOptions`、flush 在 tiered 下成为新的 tier、按 tier 换状态；基准驱动新增 `--compaction tiered` 与 `--num-tiers` 等选项）。
 - 对照对象：同一天、同一版代码上重跑的简单分层（L10 的 B 组参数），不是 L10 记录里的数字。
 - 每个配置运行 3 次，下表取中位数，方括号里是三次的最小与最大值。
 - 读负载都在后台合并做完之后才开始，读的是合并停下时的形状。
 
-重跑方式（在 `lsm/` 下，四组只差后面的合并参数）：
+重跑方式（在仓库根目录下，四组只差后面的合并参数）：
 
 ```sh
 cargo run --release -p lsm-bench -- --target engine --memtable-mb 4 --block-cache-mb 64 --workloads fillrandom,overwrite,readrandom,readmissing,seekrandom \

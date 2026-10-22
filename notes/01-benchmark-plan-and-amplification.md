@@ -6,7 +6,7 @@
 
 LSM 里很多机制不改变读出来的结果，只改变代价：去掉 Bloom filter，所有测试照样通过，只是查不存在的 key 变慢；三种 compaction 策略读到的数据完全相同，差别只在磁盘被写了多少遍、占了多少空间。这类机制有没有用、值不值它的代价，测试回答不了，只能靠数字。
 
-LSM 的代价通常用三种放大描述（定义见 [B+Tree 与 LSM](../../storage/notes/06-storage-comparisons/03-btree-and-lsm.md#三种放大)），三者互相牵制。要比较两种做法，就要在同一份固定的负载下把它们量出来。性能测量的一般方法（吞吐、延迟分位数、可复现的记录、常见错误）见 [性能基线](../../docs/notes/02-validation-observability/08-performance-baselines.md)，本篇只讲 LSM 特有的部分。
+LSM 的代价通常用三种放大描述（定义见存储笔记《B+Tree 与 LSM》），三者互相牵制。要比较两种做法，就要在同一份固定的负载下把它们量出来。性能测量的一般方法（吞吐、延迟分位数、可复现的记录、常见错误）见验证与观测笔记《性能基线》，本篇只讲 LSM 特有的部分。
 
 ## 负载与它能看出什么
 
@@ -126,7 +126,7 @@ compaction 在后台、延后发生，读数太早会漏掉还没做的工作：
 
 ## 本项目的做法
 
-`lsm/` 是一个 cargo workspace，引擎与驱动程序是两个 crate：
+本仓库是一个 cargo workspace，引擎与驱动程序是两个 crate：
 
 | crate | 目录 | 内容 |
 | --- | --- | --- |
@@ -135,7 +135,7 @@ compaction 在后台、延后发生，读数太早会漏掉还没做的工作：
 
 驱动程序不放进引擎的单元测试：测试要快、要确定，基准要跑得久、数据量大，并且必须用 release 编译。
 
-计数器用原子类型，各自以 `Relaxed` 递增：它们之间没有需要同时成立的关系，只要每次加法不丢。内存序的含义见 [[rust-learning/notes/09-concurrency/13-原子内存序|原子内存序]]。
+计数器用原子类型，各自以 `Relaxed` 递增：它们之间没有需要同时成立的关系，只要每次加法不丢。内存序的含义见 Rust 笔记《原子内存序》。
 
 随功能加入的记录点：
 
@@ -157,12 +157,12 @@ compaction 在后台、延后发生，读数太早会漏掉还没做的工作：
 | 空间放大的来源 | 页内的空闲空间；等待读者结束才能回收的旧页 | 被覆盖的旧版本与墓碑，等 compaction 才清理 |
 | 写入发生的时刻 | 全部在提交时，前台承担 | 大部分推迟到后台，前台只写 WAL 和内存 |
 
-LSM 把写入的大部分代价挪到了后台，所以量它的时候必须把后台的工作算进来，这也是读数时机那一节的由来。页回收见 [页回收与读者](../../storage/notes/05-storage-recovery/07-page-reclamation-and-readers.md)。
+LSM 把写入的大部分代价挪到了后台，所以量它的时候必须把后台的工作算进来，这也是读数时机那一节的由来。页回收见存储笔记《页回收与读者》。
 
 ## 工业对照
 
 - **RocksDB `db_bench`**：负载名（`fillseq`、`fillrandom`、`overwrite`、`readrandom`、`readmissing`、`seekrandom`、`readwhilewriting` 等）与默认规模（key 16 字节、value 100 字节、100 万条）的出处。RocksDB 自己的统计输出里按层列出写放大。
-- **mini-lsm**：[compaction 模拟器](../../references/mini-lsm/mini-lsm/src/bin/compaction-simulator.rs#L370-L372)不写真实数据，只模拟文件的生成与合并，打印写放大，用来比较 compaction 策略。完整的基准程序没有放进课程正文，列在[课程之后的练习](../../references/mini-lsm/mini-lsm-book/src/week4-overview.md)里。
+- **mini-lsm**：[compaction 模拟器](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/bin/compaction-simulator.rs#L370-L372)不写真实数据，只模拟文件的生成与合并，打印写放大，用来比较 compaction 策略。完整的基准程序没有放进课程正文，列在[课程之后的练习](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week4-overview.md)里。
 
 ## 常见错误
 

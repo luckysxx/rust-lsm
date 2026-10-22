@@ -11,7 +11,7 @@
 
 ## 资料
 
-- mini-lsm 教程第三周第 3 章：[week3-03-snapshot-read-part-2.md](../../references/mini-lsm/mini-lsm-book/src/week3-03-snapshot-read-part-2.md)。
-- 已学内容中相关的篇：[页回收与读者](../../storage/notes/05-storage-recovery/07-page-reclamation-and-readers.md)。
+- mini-lsm 教程第三周第 3 章：[week3-03-snapshot-read-part-2.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week3-03-snapshot-read-part-2.md)。
+- 已学内容中相关的篇：存储笔记《页回收与读者》。
 
 返回 [本组目录](README.md)。
