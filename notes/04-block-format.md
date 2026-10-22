@@ -43,7 +43,7 @@ flush 一张冻结的 memtable：
     整个文件写完并同步之后，才登记进 MANIFEST
 ```
 
-封好的块是立刻写进文件，还是先攒在内存里最后一次写出，是实现上的选择。mini-lsm 把所有块攒在一个 `Vec<u8>` 里，最后一次写出整个文件（[table/builder.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/table/builder.rs) 的 `build`）；LevelDB、RocksDB 封一个块就往文件里追加一个，文件很大时不必在内存里多留一份。两种做法对外没有区别，因为写到一半的 SST 不算数：只有整个文件写完、同步、登记之后它才存在，中途崩溃留下的半个文件在重启时当作残留删掉。这与 B+Tree 的存储笔记《提交顺序与同步》是同一个道理：数据页写到一半时，meta 还指着旧版本。
+封好的块是立刻写进文件，还是先攒在内存里最后一次写出，是实现上的选择。mini-lsm 把所有块攒在一个 `Vec<u8>` 里，最后一次写出整个文件（[table/builder.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/table/builder.rs) 的 `build`）；LevelDB、RocksDB 封一个块就往文件里追加一个，文件很大时不必在内存里多留一份。两种做法对外没有区别，因为写到一半的 SST 不算数：只有整个文件写完、同步、登记之后它才存在，中途崩溃留下的半个文件在重启时当作残留删掉。这与 B+Tree 的存储笔记[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)是同一个道理：数据页写到一半时，meta 还指着旧版本。
 
 flush 时没有"SST 写满"：memtable 里有多少数据，写出的 SST 就多大。SST 的大小上限出现在 compaction 中，见 [compaction 的执行](09-compaction-execution.md)。
 
@@ -92,7 +92,7 @@ SST：     内存里的索引二分找到块 → 读进这一块 → 块内用�
 
 ## 与 B+Tree 页的对照
 
-块内部的问题与存储笔记《节点格式与变长记录寻址》相同：几 KB 里放有序的变长记录，要能二分。答案的主体也相同：变长记录配一个定长的偏移数组。不同来自四处条件：
+块内部的问题与存储笔记[节点格式与变长记录寻址](https://github.com/luckysxx/go-btree-kv/blob/main/notes/03-btree-pages/03-node-format-and-record-addressing.md)相同：几 KB 里放有序的变长记录，要能二分。答案的主体也相同：变长记录配一个定长的偏移数组。不同来自四处条件：
 
 | | B+Tree 的页 | LSM 的数据块 |
 | --- | --- | --- |
@@ -112,7 +112,7 @@ SST：     内存里的索引二分找到块 → 读进这一块 → 块内用�
 - 页会被释放再重用。空出来的位置要能放下将来任何一张页，所以所有页一样大。大小不一的话，文件内部就需要一个处理碎片的分配器，与定长分配和 `malloc` 的差别相同。
 - 页靠页号定位，位置是"页号 × 页大小"，不需要查表。大小不一就得另存一张"页号 → 位置与长度"的表，这张表本身还要随每次修改更新并持久化。
 
-**"是扇区或系统页的整数倍"才与硬件有关。** 它关系到三件事：一次写入跨越几个扇区（撕裂写，见存储笔记《文件格式与元数据校验》）；mmap 以系统页为单位映射；绕过页缓存的直接 I/O 要求对齐。普通的文件读写没有对齐的要求，文件系统允许读写任意的字节范围，由内核去读覆盖它的那些扇区。
+**"是扇区或系统页的整数倍"才与硬件有关。** 它关系到三件事：一次写入跨越几个扇区（撕裂写，见存储笔记[文件格式与元数据校验](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/03-file-format-and-meta-validation.md)）；mmap 以系统页为单位映射；绕过页缓存的直接 I/O 要求对齐。普通的文件读写没有对齐的要求，文件系统允许读写任意的字节范围，由内核去读覆盖它的那些扇区。
 
 块不满足"固定"的两个前提：
 
@@ -384,6 +384,6 @@ fn decode_payload_size(&self, suffix: &[u8]) -> Result<u64> {
 ## 资料
 
 - mini-lsm 教程第一周第 3 章：[week1-03-block.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-03-block.md)。
-- 已学内容中相关的篇：存储笔记《节点格式与变长记录寻址》、《页内布局对照》。
+- 已学内容中相关的篇：存储笔记[节点格式与变长记录寻址](https://github.com/luckysxx/go-btree-kv/blob/main/notes/03-btree-pages/03-node-format-and-record-addressing.md)、[页内布局对照](https://github.com/luckysxx/go-btree-kv/blob/main/notes/06-storage-comparisons/01-page-layout-alternatives.md)。
 
 返回 [本组目录](README.md)。

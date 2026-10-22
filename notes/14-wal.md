@@ -15,7 +15,7 @@
 | meta 页换完之前，新页都不算数 | manifest 记下"哪张表已写成 SST"之前，它的 WAL 都不能删 |
 | 打开时选一个有效的 meta，高水位以上的页视为不存在 | 打开时重放 manifest 得到高水位，高水位以上的 WAL 重放，以下的删掉 |
 
-一般原理见存储笔记《提交顺序与同步》、《打开与故障恢复》；数据库 WAL 与 Raft 日志的区别见知识库笔记《预写日志与复制日志》。用 Raft 的话说：日志是事实，memtable 是把日志应用之后的状态机；重放就是从头应用一遍日志。
+一般原理见存储笔记[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/05-open-and-crash-recovery.md)；数据库 WAL 与 Raft 日志的区别见知识库笔记《预写日志与复制日志》。用 Raft 的话说：日志是事实，memtable 是把日志应用之后的状态机；重放就是从头应用一遍日志。
 
 ## 什么时候算写成功：持久化的四级
 
@@ -276,7 +276,7 @@ mito2 不自己写 WAL 文件：所有 region 共用一个日志库（单机时�
 
 - mini-lsm 教程第二周第 6 章：[week2-06-wal.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-06-wal.md)；代码 [wal.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/wal.rs)。
 - RocksDB Wiki：Write Ahead Log、WAL Recovery Modes、WAL Performance。源码（v9.10.0）：`db/db_impl/db_impl_write.cc` 的 `WriteToWAL`，`db/db_impl/db_impl_open.cc` 的 `RecoverLogFiles`，`include/rocksdb/options.h` 的 `avoid_flush_during_recovery`。
-- 存储笔记：《提交顺序与同步》、《打开与故障恢复》、《写入、同步与错误边界》的“父目录的同步”一节。
+- 存储笔记：[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/05-open-and-crash-recovery.md)、[写入、同步与错误边界 · 父目录的同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
 - 基准记录：[WAL 的代价](../bench/results/2026-10-21-wal.md)。
 
 返回 [本组目录](README.md)。

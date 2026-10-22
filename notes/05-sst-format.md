@@ -12,7 +12,7 @@
 
 | B+Tree | 这里 |
 | --- | --- |
-| `write`、`fsync`、父目录同步（存储笔记《文件、可见性与持久化》） | 写出一个 SST 文件 |
+| `write`、`fsync`、父目录同步（存储笔记 [A 组：文件、可见性与持久化](https://github.com/luckysxx/go-btree-kv/blob/main/notes/01-file-persistence/README.md)） | 写出一个 SST 文件 |
 | Pager 按页号读页 | 按索引读块 |
 | 页缓存与 buffer pool | 块的缓存 |
 | 游标从一个叶子走到下一个 | SST 的游标换块 |
@@ -40,7 +40,7 @@ filter：    位数组 │ k（1 字节），见 [Bloom filter 与 key 前缀压
 - 块的长度不记。它等于下一个块的起点减自己的起点；最后一个块用索引的起点来减。
 - 块的末 key 记。定位只需要首 key，这与 B+Tree 的内部节点只存每个孩子的最小 key 相同。但 LSM 还需要整个文件的 key 范围：L0 的文件之间范围可以重叠，查询要靠"文件的首 key 到末 key"判断有没有交集，没有就整个跳过；compaction 选文件时也看范围是否重叠。文件的首 key 是第一个块的首 key，文件的末 key 只能来自最后一个块的末 key；从后一个块的首 key 只能知道"比它小"，得不到末 key 本身。
 
-**魔数与版本号。** 文件最后 4 字节固定为 ASCII 的 `LSM1`，打开时先核对，不是就说明这不是引擎写的文件或者文件被截断了。作用与 B+Tree 的 meta 页里的魔数相同，见存储笔记《文件格式与元数据校验》。魔数之前是格式的版本号。两者分工不同：
+**魔数与版本号。** 文件最后 4 字节固定为 ASCII 的 `LSM1`，打开时先核对，不是就说明这不是引擎写的文件或者文件被截断了。作用与 B+Tree 的 meta 页里的魔数相同，见存储笔记[文件格式与元数据校验](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/03-file-format-and-meta-validation.md)。魔数之前是格式的版本号。两者分工不同：
 
 - **魔数**回答"这是不是我们的文件"，定下之后永远不变。
 - **版本号**回答"按哪一版格式写的"，格式每改一次加一。读的一侧先认魔数，再认版本号，遇到不认识的版本明确报错，不猜着读。
@@ -117,7 +117,7 @@ SST 的构建器手里有一个正在装的块、已经封口的块攒成的字�
 
 SST 写完不改，没有用 mmap 写入时"落盘顺序不受控"的问题，用 mmap 读是可行的，LevelDB 对一部分文件就这样做。本项目用 `pread` 加自己的块缓存，RocksDB 的默认做法与 mini-lsm 也是如此。理由：块之后要校验、要解压，读进来必须先处理，mmap 省不掉那次拷贝；读盘出错是可以处理的返回值；缓存的容量与淘汰由引擎决定；读出的字节由块自己拥有，块不必借用映射。
 
-mmap 的机制与代价见存储笔记《OS 页缓存与显式 buffer pool》。
+mmap 的机制与代价见存储笔记[OS 页缓存与显式 buffer pool](https://github.com/luckysxx/go-btree-kv/blob/main/notes/02-cache-pager/07-page-cache-versus-buffer-pool.md)。
 
 ## 错误类型
 
@@ -259,6 +259,6 @@ LRU 有两个问题：
 ## 资料
 
 - mini-lsm 教程第一周第 4 章：[week1-04-sst.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-04-sst.md)。
-- 已学内容中相关的篇：存储笔记《文件格式与元数据校验》、《OS 页缓存与显式 buffer pool》。
+- 已学内容中相关的篇：存储笔记[文件格式与元数据校验](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/03-file-format-and-meta-validation.md)、[OS 页缓存与显式 buffer pool](https://github.com/luckysxx/go-btree-kv/blob/main/notes/02-cache-pager/07-page-cache-versus-buffer-pool.md)。
 
 返回 [本组目录](README.md)。

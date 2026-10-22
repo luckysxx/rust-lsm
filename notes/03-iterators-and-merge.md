@@ -340,6 +340,6 @@ impl<T> Ord for GenericNode<T> {
 ## 资料
 
 - mini-lsm 教程第一周第 2 章：[week1-02-merge-iterator.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-02-merge-iterator.md)。
-- 已学内容中相关的篇：存储笔记《扫描与叶子链接》。
+- 已学内容中相关的篇：存储笔记[扫描与叶子链接](https://github.com/luckysxx/go-btree-kv/blob/main/notes/04-btree-tree/05-scan-and-leaf-links.md)。
 
 返回 [本组目录](README.md)。

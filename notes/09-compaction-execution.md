@@ -11,7 +11,7 @@
 | B+Tree | LSM |
 | --- | --- |
 | 覆盖与删除就地进行，找到那一页改掉；空出来的页进空闲列表 | 覆盖与删除只写新记录，旧数据先不管；compaction 把推迟的整理批量补上 |
-| 旧页要等登记过的读者都结束才能回收（存储笔记《页回收与读者》） | 旧文件要等拿着旧状态的读者都结束才能真正释放；Unix 上可以先删文件名，把"等读者"交给操作系统 |
+| 旧页要等登记过的读者都结束才能回收（存储笔记[页回收与读者](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/07-page-reclamation-and-readers.md)） | 旧文件要等拿着旧状态的读者都结束才能真正释放；Unix 上可以先删文件名，把"等读者"交给操作系统 |
 | 写完新页再切换 meta，切换是一步 | 写完新文件再换状态指针，换状态是一步 |
 
 ## 问题：文件只增不减
@@ -264,7 +264,7 @@ impl Drop for FileHandleInner {
 ## 资料
 
 - mini-lsm 教程第二周第 1 章：[week2-01-compaction.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-01-compaction.md)；三种放大与两个极端见 [week2-overview.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-overview.md)。
-- 已学内容中相关的篇：存储笔记《页回收与读者》、《B+Tree 与 LSM》。
+- 已学内容中相关的篇：存储笔记[页回收与读者](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/07-page-reclamation-and-readers.md)、[B+Tree 与 LSM](https://github.com/luckysxx/go-btree-kv/blob/main/notes/06-storage-comparisons/03-btree-and-lsm.md)。
 - 基准记录：[全量 compaction 的前后对比](../bench/results/2026-10-15-full-compaction.md)。
 
 返回 [本组目录](README.md)。

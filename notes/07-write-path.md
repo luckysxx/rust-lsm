@@ -36,7 +36,7 @@
 
 - **写文件期间不占着状态的锁。** 被 flush 的表已经冻结，不会再变，读它不需要任何锁；读者手里的快照也不受影响。
 - **换状态是一步。** 读者取到的快照要么是"表还在、文件不在"，要么是"表不在了、文件在"，没有两边都缺或者两边都有的时刻。
-- **先落盘，后换状态。** 状态里出现的 SST 都是已经写完并同步的。这与 B+Tree 的存储笔记《提交顺序与同步》"数据页 → 同步 → meta"是同一个次序，状态指针在这里扮演 meta 的角色；等有了 [manifest](13-manifest.md)，登记进 manifest 的那一步接在落盘之后、换状态之前。
+- **先落盘，后换状态。** 状态里出现的 SST 都是已经写完并同步的。这与 B+Tree 的存储笔记[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)"数据页 → 同步 → meta"是同一个次序，状态指针在这里扮演 meta 的角色；等有了 [manifest](13-manifest.md)，登记进 manifest 的那一步接在落盘之后、换状态之前。
 - **失败时状态不变。** 写文件出错就带着错误返回，那张表仍在冻结列表里，数据照样读得到，之后可以重试。写到一半的文件留在目录里，没有任何地方引用它。
 - **flush 之间要排队。** "看最旧的是哪张"与"把它拿掉"之间不能插进另一次 flush，否则两次 flush 会写同一张表。冻结不必与 flush 排队：冻结只往列表的开头加，不碰末尾。
 
@@ -120,6 +120,6 @@ LevelDB、RocksDB 的 `Put` 从一开始就返回 `Status`，mini-lsm 的 `put` 
 ## 资料
 
 - mini-lsm 教程第一周第 6 章：[week1-06-write-path.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-06-write-path.md)。
-- 已学内容中相关的篇：存储笔记《提交顺序与同步》。
+- 已学内容中相关的篇：存储笔记[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)。
 
 返回 [本组目录](README.md)。

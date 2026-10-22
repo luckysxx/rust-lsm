@@ -23,7 +23,7 @@
 | 崩溃原子 | 重启之后整批都在，或者整批都不在 | 做到：整批是 WAL 里的一条记录 |
 | 可见原子 | 别的线程读的时候，不会看到半批 | 没做：要等序号（时间戳） |
 
-崩溃原子用的是存储笔记里"单一发布点"的办法（存储笔记《原子写批次》）：整批编码成一条记录，外层帧的长度与校验和保证一条记录要么完整、要么作为残尾被截掉，不需要新的机制。拆成几条记录就不行：崩溃时可能只写进了前几条，重放出半批。
+崩溃原子用的是存储笔记里"单一发布点"的办法（存储笔记[原子写批次](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/06-atomic-write-batches.md)）：整批编码成一条记录，外层帧的长度与校验和保证一条记录要么完整、要么作为残尾被截掉，不需要新的机制。拆成几条记录就不行：崩溃时可能只写进了前几条，重放出半批。
 
 可见原子要等第三周：每批分一个时间戳，整批插完才推进"已发布的时间戳"，读者只看已发布的部分。mini-lsm 这一章也明确只做接口，不保证可见原子。
 
@@ -379,7 +379,7 @@ RocksDB 用 `WALRecoveryMode` 让用户选：
 ## 资料
 
 - mini-lsm 教程第二周第 7 章：[week2-07-snacks.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-07-snacks.md)。
-- 已学内容中相关的篇：存储笔记《原子写批次》、《文件格式与元数据校验》、《提交顺序与同步》、[WAL](14-wal.md)、[SST 格式](05-sst-format.md)。
+- 已学内容中相关的篇：存储笔记[原子写批次](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/06-atomic-write-batches.md)、[文件格式与元数据校验](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/03-file-format-and-meta-validation.md)、[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)、[WAL](14-wal.md)、[SST 格式](05-sst-format.md)。
 - RocksDB Wiki：Write Batch With Index、WAL Recovery Modes、Pipelined Write、Block-based Table Format。源码（v9.10.0）：`db/write_thread.cc`、`db/write_batch.cc`、`table/block_based/block_based_table_builder.cc`。
 - LevelDB：`db/db_impl.cc` 的 `DBImpl::Write`、`BuildBatchGroup`。
 - PostgreSQL：`src/backend/access/transam/xlog.c` 的 `XLogFlush`；文档 WAL Configuration（`commit_delay`、`synchronous_commit`）。

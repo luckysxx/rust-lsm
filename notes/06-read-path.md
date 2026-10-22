@@ -111,6 +111,6 @@ memtable   SST
 ## 资料
 
 - mini-lsm 教程第一周第 5 章：[week1-05-read-path.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week1-05-read-path.md)。
-- 已学内容中相关的篇：存储笔记《根定位与整树查找》、《页回收与读者》。
+- 已学内容中相关的篇：存储笔记[根定位与整树查找](https://github.com/luckysxx/go-btree-kv/blob/main/notes/04-btree-tree/02-root-and-tree-search.md)、[页回收与读者](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/07-page-reclamation-and-readers.md)。
 
 返回 [本组目录](README.md)。

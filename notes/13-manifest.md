@@ -16,7 +16,7 @@
 | 双 meta 交替写，打开时选校验和对得上、版本较新的那份 | 只往末尾追加记录，打开时从头重放，末尾不完整的一条当作没写过 |
 | 空闲页的回收 | 删除文件，交给文件系统 |
 
-提交顺序与同步的一般原理见存储笔记《提交顺序与同步》、《打开与故障恢复》；目录为什么要单独同步见存储笔记《写入、同步与错误边界》的“父目录的同步”一节。
+提交顺序与同步的一般原理见存储笔记[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/05-open-and-crash-recovery.md)；目录为什么要单独同步见存储笔记[写入、同步与错误边界 · 父目录的同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
 
 ## 问题：为什么不能直接看目录
 
@@ -233,7 +233,7 @@ mito2 的数据放在对象存储上，对象不能追加，所以"日志"是一
 
 - mini-lsm 教程第二周第 5 章：[week2-05-manifest.md](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm-book/src/week2-05-manifest.md)；代码 [manifest.rs](https://github.com/skyzh/mini-lsm/blob/v202608/mini-lsm/src/manifest.rs)。
 - RocksDB Wiki：MANIFEST；WAL Recovery Modes。
-- 存储笔记：《文件格式与元数据校验》、《提交顺序与同步》、《打开与故障恢复》、《写入、同步与错误边界》的“父目录的同步”一节。
+- 存储笔记：[文件格式与元数据校验](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/03-file-format-and-meta-validation.md)、[提交顺序与同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/04-commit-order-and-sync.md)、[打开与故障恢复](https://github.com/luckysxx/go-btree-kv/blob/main/notes/05-storage-recovery/05-open-and-crash-recovery.md)、[写入、同步与错误边界 · 父目录的同步](https://github.com/luckysxx/go-btree-kv/blob/main/notes/01-file-persistence/04-write-sync-and-errors.md#父目录的同步)。
 - 基准记录：[manifest 的前后对比](../bench/results/2026-10-20-manifest.md)。
 
 返回 [本组目录](README.md)。
