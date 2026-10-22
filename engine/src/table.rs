@@ -1,12 +1,12 @@
 //! SST：磁盘上的一个有序文件，由很多数据块、一份索引和一个 Bloom filter 组成，写完之后不再修改。
 //!
-//! 文件的样子（所有整数都是大端）：
+//! 文件的样子（版本 2，所有整数都是大端）：
 //!
 //! ```text
-//! ┌─────┬─────┬───┬────────┬──────┬────────┬────────────┬──────────────┬───────┬──────┐
-//! │ 块 0 │ 块 1 │ … │ 块 n-1 │ 索引 │ filter │ 索引的起点 │ filter 的起点 │ 版本号 │ 魔数 │
-//! └─────┴─────┴───┴────────┴──────┴────────┴────────────┴──────────────┴───────┴──────┘
-//!   数据块，一个接一个        每块一项  见 bloom.rs   4 字节        4 字节        4 字节  4 字节
+//! ┌──────┬─────┬──────┬─────┬───┬──────┬─────┬────────┬─────┬────────────┬──────────────┬───────┬──────┐
+//! │ 块 0 │ crc │ 块 1 │ crc │ … │ 索引 │ crc │ filter │ crc │ 索引的起点 │ filter 的起点 │ 版本号 │ 魔数 │
+//! └──────┴─────┴──────┴─────┴───┴──────┴─────┴────────┴─────┴────────────┴──────────────┴───────┴──────┘
+//!   数据块与它的校验和，一个接一个  每块一项     见 bloom.rs     4 字节        4 字节        4 字节  4 字节
 //!
 //! 索引：      块数（4 字节）│ 第 0 项 │ 第 1 项 │ …
 //! 索引的一项： 块的起点（4 字节）│ 首 key 长度（2 字节）│ 首 key │ 末 key 长度（2 字节）│ 末 key
@@ -15,6 +15,15 @@
 //! 与块的尾巴是同一个办法：内容在前，索引在后，最后几个字节指回索引。
 //! 块的长度不记：它等于下一个块的起点减自己的起点，最后一个块用索引的起点来减。
 //! 索引的长度也不记：它到 filter 的起点为止；filter 到末尾固定的 16 个字节为止。
+//!
+//! 每个 crc 是紧挨在它前面那一段（一个数据块、索引、filter）的 crc32，4 字节，只管那一段：
+//! 一段的范围由上面的起点划出，最后 4 个字节是校验和，前面是内容。读一段时先核对校验和，
+//! 对得上才解码。数据块各带各的校验和：读一个块只读这一段，不必读别的。
+//!
+//! 末尾的 16 个字节自己没有校验和：魔数与版本号各自核对，两个起点先检查范围，
+//! 指错了位置，切出来的那一段的校验和就对不上。
+//!
+//! 版本 1 没有这些 crc，其余相同；版本 1 的文件照样能打开，只是读出的内容不做校验。
 //!
 //! 魔数确认"这是引擎写的 SST"，永远不变；版本号说明按哪一版格式写的，格式每改一次加一。
 //!
@@ -68,10 +77,17 @@ pub fn new_block_cache(capacity_bytes: u64) -> BlockCache {
 /// 魔数不随格式改变；格式的变化记在 [`SST_FORMAT_VERSION`] 里。
 pub const SST_MAGIC: u32 = 0x4C53_4D31;
 
-/// 现在写出的 SST 的格式版本，放在魔数前面。打开时只认这一个版本。
+/// 现在写出的 SST 的格式版本，放在魔数前面。打开时认得这一版和它之前的每一版。
 ///
-/// 版本 1：数据块、索引、Bloom filter。
-pub const SST_FORMAT_VERSION: u32 = 1;
+/// - 版本 1：数据块、索引、Bloom filter。
+/// - 版本 2：数据块、索引、filter 后面各跟一个 crc32（L15）。
+pub const SST_FORMAT_VERSION: u32 = 2;
+
+/// 认得的最老的格式版本。
+const OLDEST_SST_FORMAT_VERSION: u32 = 1;
+
+/// 版本 2 起每一段后面的校验和：crc32，4 字节。
+const CHECKSUM_SIZE: usize = 4;
 
 /// 写 SST 时 Bloom filter 的目标误判率。
 pub const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
@@ -185,6 +201,26 @@ fn check_block_meta(block_meta: &[BlockMeta], block_meta_start: usize) -> Result
     Ok(())
 }
 
+/// 这个版本的文件里，每一段后面有没有校验和。
+fn has_checksums(format_version: u32) -> bool {
+    format_version >= 2
+}
+
+/// 把一段"内容 + 4 字节 crc32"切开并核对，返回内容。`what` 说明是哪一段，写进错误信息。
+///
+/// 这一段短得放不下校验和，或者校验和对不上时返回 [`Error::Corruption`]。
+fn verify_checksum<'a>(section: &'a [u8], what: &str) -> Result<&'a [u8]> {
+    if section.len() < CHECKSUM_SIZE {
+        return Err(corrupt_sst(&format!("{what}：短得放不下校验和")));
+    }
+    let (content, checksum) = section.split_at(section.len() - CHECKSUM_SIZE);
+    let stored = read_u32(checksum, 0);
+    if stored != crc32fast::hash(content) {
+        return Err(corrupt_sst(&format!("{what}：校验和不对")));
+    }
+    Ok(content)
+}
+
 /// 造一个"SST 文件损坏"的错误。
 fn corrupt_sst(message: &str) -> Error {
     Error::Corruption(format!("SST 文件：{message}"))
@@ -253,6 +289,8 @@ pub struct SsTable {
     last_key: Bytes,
     /// 文件里全部 key 的 Bloom filter。
     bloom: Bloom,
+    /// 文件的格式版本：决定读块时有没有校验和要核对。
+    format_version: u32,
     /// 读块时先查的缓存。`None` 表示不用缓存，每次都从文件读。
     block_cache: Option<Arc<BlockCache>>,
     /// 从文件读出一个块，就在这里记一次。`None` 表示不记。
@@ -263,8 +301,8 @@ impl SsTable {
     /// 打开一个已有的 SST 文件：从尾部读回索引和 Bloom filter，数据块留在磁盘上。
     ///
     /// 读块时先查 `block_cache`；给 `None` 就不用缓存。
-    /// 文件不符合格式（包括版本号不是 [`SST_FORMAT_VERSION`]）时返回 [`Error::Corruption`]，
-    /// 读文件失败时返回 [`Error::Io`]。
+    /// 版本 2 起，索引与 filter 先核对校验和再解码。文件不符合格式（包括不认得的版本号、
+    /// 校验和对不上）时返回 [`Error::Corruption`]，读文件失败时返回 [`Error::Io`]。
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // 从文件的尾巴倒着找。末尾固定的 16 个字节：索引的起点、filter 的起点、版本号、魔数。
         // 先确认文件够长，再做减法：无符号数相减不能得到负数。
@@ -283,9 +321,9 @@ impl SsTable {
         if sst_magic != SST_MAGIC {
             return Err(corrupt_sst("末尾的魔数不对，这不是引擎写的 SST"));
         }
-        if format_version != SST_FORMAT_VERSION {
+        if !(OLDEST_SST_FORMAT_VERSION..=SST_FORMAT_VERSION).contains(&format_version) {
             return Err(corrupt_sst(&format!(
-                "格式版本是 {format_version}，只认得版本 {SST_FORMAT_VERSION}"
+                "格式版本是 {format_version}，只认得版本 {OLDEST_SST_FORMAT_VERSION} 到 {SST_FORMAT_VERSION}"
             )));
         }
         if block_meta_start > bloom_start || bloom_start > footer_start {
@@ -296,7 +334,11 @@ impl SsTable {
         // 两段紧挨着，一次读出来再切开。
         let raw_meta_len = footer_start - block_meta_start;
         let raw_meta = file.read(block_meta_start, raw_meta_len)?;
-        let (raw_block_meta, raw_bloom) = raw_meta.split_at(bloom_start - block_meta_start);
+        let (mut raw_block_meta, mut raw_bloom) = raw_meta.split_at(bloom_start - block_meta_start);
+        if has_checksums(format_version) {
+            raw_block_meta = verify_checksum(raw_block_meta, "索引")?;
+            raw_bloom = verify_checksum(raw_bloom, "Bloom filter")?;
+        }
 
         let block_meta = decode_block_meta(raw_block_meta)?;
         check_block_meta(&block_meta, block_meta_start)?;
@@ -312,6 +354,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom,
+            format_version,
             block_cache,
             stats: None,
         })
@@ -344,7 +387,7 @@ impl SsTable {
         self.read_block_from_file(block_index)
     }
 
-    /// 从文件里读出第 `block_index` 个数据块并解码，不经过缓存。
+    /// 从文件里读出第 `block_index` 个数据块并解码，不经过缓存。版本 2 起先核对块的校验和。
     ///
     /// `block_index` 必须小于 `block_count()`。读文件失败或块的内容损坏时返回错误。
     fn read_block_from_file(&self, block_index: usize) -> Result<Arc<Block>> {
@@ -356,6 +399,7 @@ impl SsTable {
         );
 
         // 块占 [block_start, block_end)：终点是下一个块的起点，最后一个块到索引的起点为止。
+        // 版本 2 起这一段的最后 4 个字节是块的校验和。
         let block_start = self.block_meta[block_index].offset;
         let block_end = match self.block_meta.get(block_index + 1) {
             Some(next_meta) => next_meta.offset,
@@ -364,8 +408,13 @@ impl SsTable {
 
         // `read` 要的是起点和长度，不是起点和终点。
         let block_len = block_end - block_start;
-        let encoded = self.file.read(block_start, block_len)?;
-        let block = Block::decode(&encoded)?;
+        let section = self.file.read(block_start, block_len)?;
+        let encoded = if has_checksums(self.format_version) {
+            verify_checksum(&section, &format!("第 {block_index} 个数据块"))?
+        } else {
+            &section[..]
+        };
+        let block = Block::decode(encoded)?;
         if let Some(stats) = &self.stats {
             stats.add_blocks_read(1);
         }
@@ -465,6 +514,11 @@ impl SsTable {
     pub fn file_size(&self) -> u64 {
         self.file.size() as u64
     }
+
+    /// 文件的格式版本。
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
 }
 
 #[cfg(test)]
@@ -477,10 +531,16 @@ mod tests {
     use tempfile::TempDir;
 
     /// 七条记录，块的目标大小 32 恰好放三条：三个块 [a, c]、[d, f]、[g, g]，
-    /// 起点依次是 0、32、64，索引从 76 开始。返回文件的路径。
+    /// 各 32、32、12 字节，每块后面跟 4 字节的校验和，起点依次是 0、36、72，索引从 88 开始。
+    /// 返回文件的路径。
     fn write_three_block_sst(dir: &TempDir) -> PathBuf {
+        write_three_block_sst_with_version(dir, SST_FORMAT_VERSION)
+    }
+
+    /// 与 `write_three_block_sst` 的记录相同，按给定的格式版本写。
+    fn write_three_block_sst_with_version(dir: &TempDir, format_version: u32) -> PathBuf {
         let path = dir.path().join("1.sst");
-        let mut builder = SsTableBuilder::new(32);
+        let mut builder = SsTableBuilder::new(32).with_format_version(format_version);
         for (key, value) in [
             ("a", "1"),
             ("b", "2"),
@@ -700,7 +760,7 @@ mod tests {
         let sst = open_sst(&path).unwrap();
 
         assert_eq!(sst.block_count(), 3);
-        assert_eq!(sst.block_meta_start(), 76);
+        assert_eq!(sst.block_meta_start(), 88);
         let summary: Vec<(usize, &[u8], &[u8])> = sst
             .block_meta()
             .iter()
@@ -710,8 +770,8 @@ mod tests {
             summary,
             vec![
                 (0, &b"a"[..], &b"c"[..]),
-                (32, &b"d"[..], &b"f"[..]),
-                (64, &b"g"[..], &b"g"[..]),
+                (36, &b"d"[..], &b"f"[..]),
+                (72, &b"g"[..], &b"g"[..]),
             ]
         );
     }
@@ -749,15 +809,16 @@ mod tests {
         let path = write_three_block_sst(&dir);
         let bytes = std::fs::read(&path).unwrap();
         let len = bytes.len();
-        // 索引：块数 4 字节，三项各 4 + 3 + 3 字节，共 34 字节，所以 filter 从 110 开始。
-        assert_eq!(&bytes[len - 16..len - 12], &[0, 0, 0, 76]);
-        assert_eq!(&bytes[len - 12..len - 8], &[0, 0, 0, 110]);
-        assert_eq!(&bytes[len - 8..len - 4], &[0, 0, 0, 1]);
+        // 索引：块数 4 字节，三项各 4 + 3 + 3 字节，共 34 字节，再加 4 字节的校验和，
+        // 所以 filter 从 126 开始。
+        assert_eq!(&bytes[len - 16..len - 12], &[0, 0, 0, 88]);
+        assert_eq!(&bytes[len - 12..len - 8], &[0, 0, 0, 126]);
+        assert_eq!(&bytes[len - 8..len - 4], &[0, 0, 0, 2]);
         assert_eq!(&bytes[len - 4..], b"LSM1");
 
         let sst = open_sst(&path).unwrap();
 
-        assert_eq!(sst.block_meta_start(), 76);
+        assert_eq!(sst.block_meta_start(), 88);
         assert_eq!(sst.block_count(), 3);
     }
 
@@ -769,7 +830,7 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         let len = original.len();
 
-        for version in [0u32, 2, 0xffff_ffff] {
+        for version in [0u32, SST_FORMAT_VERSION + 1, 0xffff_ffff] {
             let mut bytes = original.clone();
             bytes[len - 8..len - 4].copy_from_slice(&version.to_be_bytes());
             std::fs::write(&path, &bytes).unwrap();
@@ -801,7 +862,7 @@ mod tests {
 
         // 索引的起点在 filter 的起点之后。
         let mut meta_after_bloom = original.clone();
-        meta_after_bloom[len - 16..len - 12].copy_from_slice(&[0, 0, 0, 111]);
+        meta_after_bloom[len - 16..len - 12].copy_from_slice(&[0, 0, 0, 127]);
         assert_open_reports_corruption(&path, &meta_after_bloom);
     }
 
@@ -817,14 +878,14 @@ mod tests {
         assert_open_reports_corruption(&path, &bytes);
     }
 
-    // filter 坏了（它的最后一个字节 k 变成 0）：打不开。
+    // filter 坏了（它的最后一个字节 k 变成 0，k 之后是 4 字节的校验和与末尾的 16 字节）：打不开。
     #[test]
     fn open_rejects_corrupted_bloom() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_three_block_sst(&dir);
         let mut bytes = std::fs::read(&path).unwrap();
         let len = bytes.len();
-        bytes[len - 17] = 0;
+        bytes[len - 21] = 0;
 
         assert_open_reports_corruption(&path, &bytes);
     }
@@ -953,7 +1014,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_three_block_sst(&dir);
         let mut bytes = std::fs::read(&path).unwrap();
-        // 第一个块占 [0, 32)，它的条数在最后两个字节。
+        // 第一个块占 [0, 32)，它的条数在最后两个字节；校验和在 [32, 36)。
         bytes[30] = 0;
         bytes[31] = 0;
         std::fs::write(&path, &bytes).unwrap();
@@ -1253,5 +1314,167 @@ mod tests {
         assert!(!sst.overlaps_range(Bound::Excluded(b"g"), Bound::Included(b"z")));
         // 只看范围，不看文件里实际有没有记录：(a, b) 里虽然没有记录，也算相交。
         assert!(sst.overlaps_range(Bound::Excluded(b"a"), Bound::Excluded(b"b")));
+    }
+
+    // ---------- 校验和（L15） ----------
+
+    /// 打开文件并读出每一个块；任何一步出错都返回错误。
+    fn open_and_read_every_block(path: &Path) -> Result<Vec<(String, String)>> {
+        let sst = open_sst(path)?;
+        let mut records = Vec::new();
+        for block_index in 0..sst.block_count() {
+            let mut iter = BlockIterator::new(sst.read_block(block_index)?);
+            records.extend(collect_all(&mut iter));
+        }
+        Ok(records)
+    }
+
+    // 改坏文件里任何一个字节：打开或读块时一定报错，不会读出错的内容，也不会 panic。
+    #[test]
+    fn every_corrupted_byte_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let original = std::fs::read(&path).unwrap();
+
+        for at in 0..original.len() {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0xff;
+            std::fs::write(&path, &bytes).unwrap();
+
+            let result = open_and_read_every_block(&path);
+
+            assert!(
+                matches!(result, Err(Error::Corruption(_))),
+                "改坏第 {at} 个字节之后：{result:?}"
+            );
+        }
+    }
+
+    // 版本 1 没有校验和：改坏一个 value 的字节，读出的就是错的内容，没有任何报错。
+    // 这正是版本 2 要解决的问题。
+    #[test]
+    fn version_1_does_not_notice_a_corrupted_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst_with_version(&dir, 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // 第一个块的第一条记录：key 长度 2 字节、key "a"、value 长度 2 字节、value "1"。
+        assert_eq!(bytes[7], b'1');
+        bytes[7] = b'9';
+        std::fs::write(&path, &bytes).unwrap();
+
+        let records = open_and_read_every_block(&path).unwrap();
+
+        assert_eq!(records[0], ("a".to_string(), "9".to_string()));
+    }
+
+    // 版本 1 的文件照样能打开、读块、问 filter。
+    #[test]
+    fn version_1_files_are_still_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst_with_version(&dir, 1);
+
+        let sst = open_sst(&path).unwrap();
+
+        assert_eq!(sst.format_version(), 1);
+        assert_eq!(sst.block_meta_start(), 76);
+        let records = open_and_read_every_block(&path).unwrap();
+        let keys: Vec<&str> = records.iter().map(|(key, _value)| key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "b", "c", "d", "e", "f", "g"]);
+        assert!(sst.bloom_may_contain(key_hash(b"d")));
+    }
+
+    // 读一个版本 1 的文件、写成新的文件（compaction 就是这样）：新文件是版本 2，内容不变。
+    #[test]
+    fn rewriting_a_version_1_file_produces_version_2() {
+        let dir = tempfile::tempdir().unwrap();
+        use crate::iterators::StorageIterator;
+        let old = Arc::new(open_sst(&write_three_block_sst_with_version(&dir, 1)).unwrap());
+        let mut iter = SsTableIterator::new_and_seek_to_first(old).unwrap();
+        let mut builder = SsTableBuilder::new(32);
+        while iter.is_valid() {
+            builder.add(iter.key(), iter.value());
+            iter.next().unwrap();
+        }
+        let new_path = dir.path().join("2.sst");
+
+        let written = builder.build(2, None, &new_path).unwrap();
+
+        assert_eq!(written.format_version(), SST_FORMAT_VERSION);
+        let records = open_and_read_every_block(&new_path).unwrap();
+        assert_eq!(records.len(), 7);
+        assert_eq!(records[6], ("g".to_string(), "7".to_string()));
+    }
+
+    // 每个校验和只算它前面那一段：块、索引、filter 的字节范围各自核对得上。
+    #[test]
+    fn each_checksum_covers_exactly_its_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len();
+        let crc_at = |at: usize| read_u32(&bytes, at);
+
+        // 三个块：[0, 32)、[36, 68)、[72, 84)，校验和紧跟在后面。
+        for (start, end) in [(0, 32), (36, 68), (72, 84)] {
+            assert_eq!(crc_at(end), crc32fast::hash(&bytes[start..end]));
+        }
+        // 索引 [88, 122)，filter [126, len - 20)。
+        assert_eq!(crc_at(122), crc32fast::hash(&bytes[88..122]));
+        assert_eq!(crc_at(len - 20), crc32fast::hash(&bytes[126..len - 20]));
+    }
+
+    // 块的内容被改坏、改完仍能解码（改的是 value）：校验和发现了，报告是哪个块。
+    #[test]
+    fn read_block_reports_bad_checksum_even_if_block_still_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // 第二个块从 36 开始，第一条记录 "d" → "4" 的 value 在 36 + 7。
+        assert_eq!(bytes[43], b'4');
+        bytes[43] = b'9';
+        std::fs::write(&path, &bytes).unwrap();
+        let sst = open_sst(&path).unwrap();
+
+        match sst.read_block(1) {
+            Err(Error::Corruption(message)) => {
+                assert!(message.contains("第 1 个数据块：校验和"), "{message}")
+            }
+            Err(other) => panic!("应当是 Corruption，实际是 {other:?}"),
+            Ok(_) => panic!("改坏的块不应该读得出来"),
+        }
+        assert_eq!(records_in_block(&sst, 0).len(), 3);
+    }
+
+    // 索引或 filter 的内容被改坏：打开时就报告是哪一段的校验和不对。
+    #[test]
+    fn open_reports_bad_checksum_of_index_and_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_three_block_sst(&dir);
+        let original = std::fs::read(&path).unwrap();
+
+        for (at, what) in [(100, "索引：校验和"), (130, "Bloom filter：校验和")] {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0x01;
+            std::fs::write(&path, &bytes).unwrap();
+            match open_sst(&path) {
+                Err(Error::Corruption(message)) => assert!(message.contains(what), "{message}"),
+                Err(other) => panic!("应当是 Corruption，实际是 {other:?}"),
+                Ok(_) => panic!("改坏第 {at} 个字节之后不应该打得开"),
+            }
+        }
+    }
+
+    // 一段短得放不下 4 字节的校验和：报告损坏，不越界。
+    #[test]
+    fn verify_checksum_rejects_sections_shorter_than_the_checksum() {
+        for section in [&[][..], &[1, 2, 3][..]] {
+            assert!(matches!(
+                verify_checksum(section, "测试"),
+                Err(Error::Corruption(_))
+            ));
+        }
+        let mut section = b"abc".to_vec();
+        section.extend_from_slice(&crc32fast::hash(b"abc").to_be_bytes());
+        assert_eq!(verify_checksum(&section, "测试").unwrap(), b"abc");
     }
 }

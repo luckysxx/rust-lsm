@@ -125,6 +125,17 @@ pub struct WriteOptions {
     pub sync: bool,
 }
 
+/// 写批次里的一条：写入一对 key 与 value，或者删除一个 key。
+///
+/// key 与 value 可以是任何能借出 `&[u8]` 的类型，例如 `&[u8]`、`Vec<u8>`、`Bytes`。
+#[derive(Debug, Clone)]
+pub enum WriteBatchRecord<T: AsRef<[u8]>> {
+    /// 写入，与 `put` 相同：key 与 value 都不能为空。
+    Put(T, T),
+    /// 删除，与 `delete` 相同：写入一条墓碑。key 不能为空。
+    Delete(T),
+}
+
 pub struct LsmStorage {
     /// 指向当前状态的指针。读写锁保护的是"当前状态是哪一份"，不是表里的内容。
     state: RwLock<Arc<LsmStorageState>>,
@@ -479,57 +490,112 @@ impl LsmStorage {
         self.delete_opt(key, WriteOptions::default())
     }
 
-    /// 写入一条记录，选项由调用方给。错误与返回值见 `write`。
+    /// 写入一条记录，选项由调用方给。就是只有一条的写批次，错误与返回值见 `write_batch_opt`。
+    ///
+    /// 不经过 `write_batch_opt`：那里要在堆上建一个 `Vec` 放换好的 key 与 value，
+    /// 单条写入每次都付这一次分配，不写 WAL 时慢两成。
     pub fn put_opt(&self, key: &[u8], value: &[u8], options: WriteOptions) -> Result<bool> {
         assert!(!key.is_empty(), "key 不能为空");
         assert!(!value.is_empty(), "value 不能为空，空 value 表示删除");
-        self.write(key, value, options)
+        self.write(&[(key, value)], options)
     }
 
     /// 删除一个 key，选项由调用方给。
     pub fn delete_opt(&self, key: &[u8], options: WriteOptions) -> Result<bool> {
         assert!(!key.is_empty(), "key 不能为空");
-        self.write(key, b"", options)
+        self.write(&[(key, b"")], options)
     }
 
-    /// `put` 与 `delete` 共用的写入步骤。返回这次写入有没有冻结一张表。
+    /// 写入一批记录，用默认的选项（不同步）。错误与返回值见 `write_batch_opt`。
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<bool> {
+        self.write_batch_opt(batch, WriteOptions::default())
+    }
+
+    /// 写入一批记录，选项由调用方给。返回这次写入有没有冻结一张表。
     ///
-    /// - key 超过 `MAX_KEY_LEN` 或 value 超过 `MAX_VALUE_LEN` 字节：[`Error::InvalidArgument`]，
-    ///   什么都没有写。
+    /// 整批是 WAL 里的一条记录，崩溃之后要么全在、要么全不在；同一个 key 出现几次时，
+    /// 后面的覆盖前面的。不保证别的线程读不到半批（要等有了序号）。
+    ///
+    /// 空的 key、`Put` 的空 value 会 panic，与 `put`、`delete` 相同。错误见 `write`。
+    pub fn write_batch_opt<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+        options: WriteOptions,
+    ) -> Result<bool> {
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(batch.len());
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => {
+                    let key = key.as_ref();
+                    let value = value.as_ref();
+                    assert!(!key.is_empty(), "key 不能为空");
+                    assert!(!value.is_empty(), "value 不能为空，空 value 表示删除");
+                    pairs.push((key, value));
+                }
+                WriteBatchRecord::Delete(key) => {
+                    let key = key.as_ref();
+                    assert!(!key.is_empty(), "key 不能为空");
+                    pairs.push((key, b""));
+                }
+            }
+        }
+        self.write(&pairs, options)
+    }
+
+    /// 所有写入共用的步骤：把一批 key 与 value（value 为空是墓碑）写进可写的表。
+    /// 返回这次写入有没有冻结一张表。
+    ///
+    /// - 有一个 key 超过 `MAX_KEY_LEN` 或 value 超过 `MAX_VALUE_LEN` 字节：
+    ///   [`Error::InvalidArgument`]，整批什么都没有写。
     /// - 追加 WAL、同步或者冻结时建新的 WAL 失败：[`Error::Io`]。
+    /// - 批次是空的：什么都不写；`sync` 为真时照样同步，之前完成的写入落盘之后再返回。
     ///
     /// 写入期间持有 `state` 的读锁：冻结要拿写锁，所以不会有表在写入途中被冻结，
-    /// 追加 WAL 与插入的是同一张表。表本身允许多个线程同时写入。
-    fn write(&self, key: &[u8], value: &[u8], options: WriteOptions) -> Result<bool> {
-        if key.len() > MAX_KEY_LEN {
-            return Err(Error::InvalidArgument(format!(
-                "key 有 {} 字节，超过了上限 {MAX_KEY_LEN}",
-                key.len()
-            )));
+    /// 追加 WAL 与插入的是同一张表，一批不会分到两张表里。表本身允许多个线程同时写入。
+    fn write(&self, batch: &[(&[u8], &[u8])], options: WriteOptions) -> Result<bool> {
+        for &(key, value) in batch {
+            if key.len() > MAX_KEY_LEN {
+                return Err(Error::InvalidArgument(format!(
+                    "key 有 {} 字节，超过了上限 {MAX_KEY_LEN}",
+                    key.len()
+                )));
+            }
+            if value.len() > MAX_VALUE_LEN {
+                return Err(Error::InvalidArgument(format!(
+                    "value 有 {} 字节，超过了上限 {MAX_VALUE_LEN}",
+                    value.len()
+                )));
+            }
         }
-        if value.len() > MAX_VALUE_LEN {
-            return Err(Error::InvalidArgument(format!(
-                "value 有 {} 字节，超过了上限 {MAX_VALUE_LEN}",
-                value.len()
-            )));
+        if batch.is_empty() {
+            if options.sync {
+                self.sync()?;
+            }
+            return Ok(false);
         }
         let size_after_write;
+        let memtable;
+        let wal_end;
         {
             let guard = self.state.read().unwrap();
-            guard.memtable.put(key, value)?;
-            size_after_write = guard.memtable.approximate_size();
+            memtable = Arc::clone(&guard.memtable);
+            wal_end = memtable.put_batch(batch)?;
+            size_after_write = memtable.approximate_size();
         }
         // 写入成功之后才计入：追加 WAL 失败时，这次写入没有被接受，文件里也没有多出这些字节。
-        self.stats
-            .add_user_bytes_written((key.len() + value.len()) as u64);
+        let user_bytes: usize = batch
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        self.stats.add_user_bytes_written(user_bytes as u64);
         if self.options.enable_wal {
-            let wal_bytes = wal::encoded_len(key.len(), value.len());
+            let wal_bytes = wal::encoded_len(batch);
             self.stats.add_wal_bytes_written(wal_bytes as u64);
         }
         // 同步要在读锁外：同步时 `snapshot` 还要拿一次读锁，同一个线程持着读锁再拿读锁，
         // 遇上排队的冻结（写锁）会死锁；而且同步要等几毫秒，持着读锁会让冻结一直等着。
         if options.sync {
-            self.sync()?;
+            self.sync_after_write(&memtable, wal_end)?;
         }
         // 读锁已经放开：冻结要拿写锁，持着读锁去冻结会等自己，造成死锁。
         self.try_freeze(size_after_write)
@@ -543,11 +609,35 @@ impl LsmStorage {
     pub fn sync(&self) -> Result<()> {
         if self.options.enable_wal {
             let snapshot = self.snapshot();
-            snapshot.memtable.sync_wal()?;
+            let mut fsyncs = 0;
+            fsyncs += u64::from(snapshot.memtable.sync_wal()?);
             for memtable in &snapshot.imm_memtables {
-                memtable.sync_wal()?;
+                fsyncs += u64::from(memtable.sync_wal()?);
+            }
+            self.stats.add_wal_syncs(fsyncs);
+        }
+        Ok(())
+    }
+
+    /// 同步写入返回之前调用：让这次写入与它之前完成的全部写入落盘。
+    ///
+    /// 这次写入所在的表（`memtable`，写完之后可能已经被冻结）只同步到这次写入的末尾
+    /// `wal_end`：排队期间别人的 fsync 已经带下去时不再做，并发的同步写入由此共用一次 fsync。
+    /// 比它旧的冻结的表整个同步：里面可能还有更早完成、没同步过的写入；多半已经同步过，
+    /// 不做 fsync。比它新的表里的写入都晚于这次写入，不用管。已经写成 SST 的表不在状态里。
+    fn sync_after_write(&self, memtable: &MemTable, wal_end: u64) -> Result<()> {
+        if !self.options.enable_wal {
+            return Ok(());
+        }
+        let snapshot = self.snapshot();
+        let mut fsyncs = 0;
+        for older in &snapshot.imm_memtables {
+            if older.id() < memtable.id() {
+                fsyncs += u64::from(older.sync_wal()?);
             }
         }
+        fsyncs += u64::from(memtable.sync_wal_to(wal_end)?);
+        self.stats.add_wal_syncs(fsyncs);
         Ok(())
     }
 
@@ -3208,11 +3298,18 @@ mod tests {
         ids
     }
 
-    /// 编号为 `id` 的 WAL 里的全部记录，变成字符串。
+    /// 编号为 `id` 的 WAL 里有几条记录，也就是几批。
+    fn wal_batch_count(dir: &Path, id: usize) -> usize {
+        let (_wal, batches) = crate::wal::Wal::recover(&wal_path(dir, id)).unwrap();
+        batches.len()
+    }
+
+    /// 编号为 `id` 的 WAL 里的全部记录，不分批次，变成字符串。
     fn wal_entries(dir: &Path, id: usize) -> Vec<(String, String)> {
-        let (_wal, entries) = crate::wal::Wal::recover(&wal_path(dir, id)).unwrap();
-        entries
+        let (_wal, batches) = crate::wal::Wal::recover(&wal_path(dir, id)).unwrap();
+        batches
             .iter()
+            .flatten()
             .map(|(key, value)| {
                 let key = String::from_utf8(key.to_vec()).unwrap();
                 let value = String::from_utf8(value.to_vec()).unwrap();
@@ -3637,7 +3734,7 @@ mod tests {
         storage.put(b"a", b"1").unwrap();
         storage.put(b"b", b"2").unwrap();
         let id = storage.snapshot().memtable.id();
-        let half = crate::wal::encode_entry(b"c", b"3");
+        let half = crate::wal::encode_batch(&[(b"c", b"3")]);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(wal_path(storage.dir(), id))
@@ -3698,10 +3795,338 @@ mod tests {
     fn wals_without_a_manifest_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("00001.wal");
-        std::fs::write(&path, crate::wal::encode_entry(b"a", b"1")).unwrap();
+        std::fs::write(&path, crate::wal::encode_batch(&[(b"a", b"1")])).unwrap();
 
         assert_open_corruption(LsmStorage::open(dir.path(), no_compaction_options()));
         assert!(path.exists());
         assert!(!dir.path().join(MANIFEST_FILE_NAME).exists());
+    }
+
+    // ---------- 写批次 ----------
+
+    /// 写批次的一条：写入。
+    fn put_record<'a>(key: &'a str, value: &'a str) -> WriteBatchRecord<&'a [u8]> {
+        WriteBatchRecord::Put(key.as_bytes(), value.as_bytes())
+    }
+
+    /// 写批次的一条：删除。
+    fn delete_record(key: &str) -> WriteBatchRecord<&[u8]> {
+        WriteBatchRecord::Delete(key.as_bytes())
+    }
+
+    // 一批里有写入也有删除：按顺序生效，同一个 key 后面的覆盖前面的，删除能盖住批次之前的值。
+    #[test]
+    fn write_batch_applies_puts_and_deletes_in_order() {
+        let storage = open_with_wal(usize::MAX);
+        storage.put(b"old", b"x").unwrap();
+
+        let froze = storage
+            .write_batch(&[
+                put_record("a", "1"),
+                put_record("b", "2"),
+                put_record("a", "3"),
+                delete_record("old"),
+                delete_record("b"),
+            ])
+            .unwrap();
+
+        assert!(!froze);
+        assert_eq!(scan_all(&storage), expected(&[("a", "3")]));
+        assert_eq!(get_str(&storage, "old"), None);
+    }
+
+    // key 与 value 可以是自己持有数据的类型（这里是 Vec<u8>）。
+    #[test]
+    fn write_batch_accepts_owned_buffers() {
+        let storage = open_without_auto_freeze();
+        let batch = vec![
+            WriteBatchRecord::Put(b"a".to_vec(), b"1".to_vec()),
+            WriteBatchRecord::Delete(b"b".to_vec()),
+        ];
+
+        storage.write_batch(&batch).unwrap();
+
+        assert_eq!(get_str(&storage, "a"), Some("1".to_string()));
+    }
+
+    // 整批是 WAL 里的一条记录；put 与 delete 各是一条只有一对的批次。
+    #[test]
+    fn write_batch_is_one_wal_record() {
+        let storage = open_with_wal(usize::MAX);
+
+        storage
+            .write_batch(&[
+                put_record("a", "1"),
+                put_record("b", "2"),
+                delete_record("c"),
+            ])
+            .unwrap();
+        storage.put(b"d", b"4").unwrap();
+        storage.delete(b"a").unwrap();
+
+        let id = storage.snapshot().memtable.id();
+        assert_eq!(wal_batch_count(storage.dir(), id), 3);
+        assert_eq!(
+            wal_entries(storage.dir(), id),
+            expected(&[("a", "1"), ("b", "2"), ("c", ""), ("d", "4"), ("a", "")])
+        );
+    }
+
+    // 统计按整批计入：用户写入的字节是全部 key 与 value 的长度之和，WAL 的字节与文件的大小一致。
+    #[test]
+    fn write_batch_counts_bytes_of_the_whole_batch() {
+        let storage = open_with_wal(usize::MAX);
+
+        storage
+            .write_batch(&[put_record("ab", "123"), delete_record("c")])
+            .unwrap();
+
+        let stats = storage.stats();
+        assert_eq!(stats.user_bytes_written, 2 + 3 + 1);
+        let id = storage.snapshot().memtable.id();
+        let file_len = std::fs::metadata(wal_path(storage.dir(), id))
+            .unwrap()
+            .len();
+        assert_eq!(stats.wal_bytes_written, file_len);
+    }
+
+    // 批次中间有一个超长的 key：返回 InvalidArgument，整批都没有写，前面的几对也不在表里与 WAL 里。
+    #[test]
+    fn write_batch_rejects_whole_batch_with_too_long_key() {
+        let storage = open_with_wal(usize::MAX);
+        let long_key = vec![b'k'; MAX_KEY_LEN + 1];
+        let long_value = vec![b'v'; MAX_VALUE_LEN + 1];
+
+        for bad in [
+            WriteBatchRecord::Put(&long_key[..], &b"v"[..]),
+            WriteBatchRecord::Put(&b"k"[..], &long_value[..]),
+            WriteBatchRecord::Delete(&long_key[..]),
+        ] {
+            let result = storage.write_batch(&[put_record("a", "1"), bad, put_record("b", "2")]);
+
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(scan_all(&storage), expected(&[]));
+        let id = storage.snapshot().memtable.id();
+        assert_eq!(wal_batch_count(storage.dir(), id), 0);
+    }
+
+    // 空批次什么都不写，不冻结；同步的空批次也能正常返回。
+    #[test]
+    fn empty_write_batch_writes_nothing() {
+        let storage = open_with_wal(usize::MAX);
+        let empty: [WriteBatchRecord<&[u8]>; 0] = [];
+
+        assert!(!storage.write_batch(&empty).unwrap());
+        assert!(
+            !storage
+                .write_batch_opt(&empty, WriteOptions { sync: true })
+                .unwrap()
+        );
+
+        let id = storage.snapshot().memtable.id();
+        assert_eq!(
+            std::fs::metadata(wal_path(storage.dir(), id))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(storage.stats().user_bytes_written, 0);
+    }
+
+    // 批次里有空的 key：与 put 一样 panic。
+    #[test]
+    #[should_panic(expected = "key 不能为空")]
+    fn write_batch_rejects_empty_key() {
+        let storage = open_without_auto_freeze();
+
+        storage
+            .write_batch(&[put_record("a", "1"), delete_record("")])
+            .unwrap();
+    }
+
+    // 批次里 Put 的 value 是空的：与 put 一样 panic，删除要用 Delete。
+    #[test]
+    #[should_panic(expected = "value 不能为空")]
+    fn write_batch_rejects_empty_value_in_put() {
+        let storage = open_without_auto_freeze();
+
+        storage.write_batch(&[put_record("a", "")]).unwrap();
+    }
+
+    // 一批写过了 memtable 的上限：整批进同一张表、同一个 WAL，之后才冻结。
+    #[test]
+    fn write_batch_larger_than_memtable_stays_in_one_table() {
+        let storage = open_with_wal(10);
+        let keys: Vec<String> = (0..20).map(|i| format!("key-{i:02}")).collect();
+        let batch: Vec<_> = keys.iter().map(|key| put_record(key, "v")).collect();
+
+        let froze = storage.write_batch(&batch).unwrap();
+
+        assert!(froze);
+        let state = storage.snapshot();
+        assert_eq!(state.imm_memtables.len(), 1);
+        assert_eq!(state.memtable.approximate_size(), 0);
+        let frozen_id = state.imm_memtables[0].id();
+        assert_eq!(wal_batch_count(storage.dir(), frozen_id), 1);
+        assert_eq!(wal_entries(storage.dir(), frozen_id).len(), 20);
+    }
+
+    // 重新打开之后整批都在：同一个 key 后面的覆盖前面的，与写入时看到的一样。
+    #[test]
+    fn write_batch_survives_reopen() {
+        let storage = open_with_wal(usize::MAX);
+        storage
+            .write_batch(&[
+                put_record("a", "1"),
+                put_record("b", "2"),
+                put_record("a", "3"),
+            ])
+            .unwrap();
+        storage
+            .write_batch(&[delete_record("b"), put_record("c", "4")])
+            .unwrap();
+
+        let storage = storage.reopen();
+
+        assert_eq!(scan_all(&storage), expected(&[("a", "3"), ("c", "4")]));
+    }
+
+    // 最后一批只写进去一半（崩溃在追加途中）：重新打开后这一批一对都不在，之前的批次都在。
+    #[test]
+    fn torn_write_batch_is_all_or_nothing() {
+        let storage = open_with_wal(usize::MAX);
+        storage
+            .write_batch(&[put_record("a", "1"), put_record("b", "2")])
+            .unwrap();
+        let id = storage.snapshot().memtable.id();
+        let frame = crate::wal::encode_batch(&[(b"c", b"3"), (b"a", b""), (b"d", b"4")]);
+        // 前两对已经完整写进文件，只差最后一对的几个字节与校验和。
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal_path(storage.dir(), id))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &frame[..frame.len() - 6]).unwrap();
+        drop(file);
+
+        let storage = storage.reopen();
+
+        assert_eq!(scan_all(&storage), expected(&[("a", "1"), ("b", "2")]));
+    }
+
+    // ---------- group commit ----------
+
+    // 同步写入做一次 fsync；之后没有新写入时 sync 不再 fsync；有新写入再 fsync。
+    #[test]
+    fn sync_skips_wals_without_new_writes() {
+        let storage = open_with_wal(usize::MAX);
+        let sync = WriteOptions { sync: true };
+
+        storage.put_opt(b"a", b"1", sync).unwrap();
+        assert_eq!(storage.stats().wal_syncs, 1);
+        storage.sync().unwrap();
+        assert_eq!(storage.stats().wal_syncs, 1);
+        storage.put(b"b", b"2").unwrap();
+        storage.sync().unwrap();
+        assert_eq!(storage.stats().wal_syncs, 2);
+    }
+
+    // 同步写入也同步比它旧的冻结的表：那里还有没同步过的写入时多做一次 fsync，
+    // 已经同步过的不再做。
+    #[test]
+    fn sync_write_also_syncs_older_frozen_wals() {
+        let storage = open_with_wal(usize::MAX);
+        let sync = WriteOptions { sync: true };
+        storage.put(b"a", b"1").unwrap();
+        freeze(&storage);
+
+        storage.put_opt(b"b", b"2", sync).unwrap();
+        assert_eq!(storage.stats().wal_syncs, 2);
+
+        freeze(&storage);
+        storage.put_opt(b"c", b"3", sync).unwrap();
+        assert_eq!(storage.stats().wal_syncs, 3);
+    }
+
+    // 没开 WAL 时同步写入什么都不做。
+    #[test]
+    fn sync_write_without_wal_does_not_fsync() {
+        let storage = open_without_auto_freeze();
+
+        storage
+            .put_opt(b"a", b"1", WriteOptions { sync: true })
+            .unwrap();
+
+        assert_eq!(storage.stats().wal_syncs, 0);
+    }
+
+    // 同步写入只等自己那条记录：自己的记录已经被别人那次 fsync 带下去，就算那次 fsync 期间
+    // 又有别人追加了新记录，也不再 fsync。拿"当前追加到哪里"去比，就会白做一次。
+    #[test]
+    fn sync_write_waits_only_for_its_own_record() {
+        crate::test_util::run_with_slow_deadline("只等自己的记录", || {
+            let storage = open_with_wal(usize::MAX);
+            let memtable = Arc::clone(&storage.snapshot().memtable);
+            memtable.make_wal_syncs_slow();
+            let first_end = memtable.put_batch(&[(b"a", b"1")]).unwrap();
+            let second_end = memtable.put_batch(&[(b"b", b"2")]).unwrap();
+
+            thread::scope(|scope| {
+                // 第一次写入的同步：fsync 开始之前两条都已追加，会被一起带下去。
+                let first_sync =
+                    scope.spawn(|| storage.sync_after_write(&memtable, first_end).unwrap());
+                while memtable.wal_fsyncs_started() == 0 {
+                    thread::yield_now();
+                }
+                // 那次 fsync 进行期间，又有一次写入追加了。
+                memtable.put_batch(&[(b"c", b"3")]).unwrap();
+                first_sync.join().unwrap();
+            });
+            // 第二次写入这才来同步：它的记录已经落盘了。
+            storage.sync_after_write(&memtable, second_end).unwrap();
+
+            assert_eq!(memtable.wal_fsyncs_started(), 1);
+            assert_eq!(storage.stats().wal_syncs, 1);
+        });
+    }
+
+    // 几个线程同时做同步写入，fsync 很慢：排队的写者被别人的 fsync 带下去，
+    // fsync 的次数远少于写入的次数；每次写入返回之后都读得到。
+    #[test]
+    fn concurrent_sync_writes_share_fsyncs() {
+        crate::test_util::run_with_slow_deadline("并发的同步写入", || {
+            let storage = open_with_wal(usize::MAX);
+            storage.snapshot().memtable.make_wal_syncs_slow();
+            let threads = 8;
+            let writes_per_thread = 10;
+            thread::scope(|scope| {
+                for thread_id in 0..threads {
+                    let storage = &storage;
+                    scope.spawn(move || {
+                        for i in 0..writes_per_thread {
+                            let key = format!("t{thread_id}-{i}");
+                            storage
+                                .put_opt(key.as_bytes(), b"v", WriteOptions { sync: true })
+                                .unwrap();
+                            assert_eq!(get_str(storage, &key), Some("v".to_string()));
+                        }
+                    });
+                }
+            });
+
+            let writes = (threads * writes_per_thread) as u64;
+            let fsyncs = storage.stats().wal_syncs;
+            assert_eq!(
+                fsyncs as usize,
+                storage.snapshot().memtable.wal_fsyncs_started()
+            );
+            assert!(
+                fsyncs * 2 < writes,
+                "{writes} 次同步写入做了 {fsyncs} 次 fsync"
+            );
+        });
     }
 }

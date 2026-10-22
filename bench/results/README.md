@@ -39,3 +39,4 @@ cargo run --release -p lsm-bench > bench/results/2026-10-07-btreemap-baseline.md
 | [2026-10-19-leveled-compaction.md](2026-10-19-leveled-compaction.md) | leveled 与简单分层、tiered 的对比：穿过空层的复制消失（4 层与 2 层相同），整次运行的写放大 4.3，介于两者之间；读与空间接近简单分层；顺序写入时让互不重叠的 L0 文件一起挪，写放大从 1.87 降到 0.95；一千万条时规律不变 |
 | [2026-10-20-manifest.md](2026-10-20-manifest.md) | manifest 的前后对比（接电源）：吞吐与放大基本不变，每次换状态多一次 `F_FULLFSYNC`（约 3 毫秒），在 `state_lock` 里，写入的最大延迟从几十微秒变成几毫秒；冻结极频繁时吞吐低三成；写完之后等后台每条记录多约 3 毫秒 |
 | [2026-10-21-wal.md](2026-10-21-wal.md) | WAL 的代价（电池供电）：每次写入多一次 `write`（约 1 µs），单线程写入慢五到七倍，写放大多 1.10；不合并时读不变；有合并时写入变慢让合并跟得上，形状改变，SST 的写放大与读也跟着变；每次都同步时每秒 362 次；真实进程崩溃（SIGKILL）后完成了的写入一条不少 |
+| [2026-10-22-write-batch-and-checksums.md](2026-10-22-write-batch-and-checksums.md) | 写批次、group commit 与 SST 校验和：16 个线程的同步写入从每秒约 270 次到约 2100 次，每次 fsync 带走约"线程数 ÷ 2"个写入；拿着锁做 fsync 的第一版只到一半；100 条一批的同步写入快 93 倍，10 条一批让不同步写入的锁竞争基本消失；读多一次 crc32，慢 5～12%，文件大 0.1% |

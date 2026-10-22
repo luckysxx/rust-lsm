@@ -28,6 +28,9 @@ pub struct Config {
     pub threads: usize,
     /// 范围扫描负载每次读多少条记录。
     pub scan_length: usize,
+    /// 写负载每次调用写入几条记录：1 是一条一条 `put`，大于 1 时连续几条攒成一批交给
+    /// `put_batch`。延迟按每次调用计。
+    pub batch_size: usize,
 }
 
 impl Config {
@@ -143,6 +146,7 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
     let plans = plan_threads(workload, config);
     let key_count = config.num;
     let scan_length = config.scan_length;
+    let batch_size = config.batch_size;
 
     // 起跑线：各工作线程加上发令的主线程，到齐后一起放行。
     let start_line = Barrier::new(plans.len() + 1);
@@ -161,6 +165,7 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
                     plan,
                     key_count,
                     scan_length,
+                    batch_size,
                     value,
                     start_line,
                 )
@@ -214,13 +219,31 @@ pub fn run_workload(target: &dyn KvTarget, workload: Workload, config: &Config) 
     }
 }
 
+/// 把编号为 `indexes` 的 key 都写成 `value`，作为一批交给被测对象，记下这次调用的延迟。
+/// 返回写入的字节数。key 在计时之前就生成好。
+fn put_batch_timed(
+    target: &dyn KvTarget,
+    indexes: &[u64],
+    value: &[u8],
+    latency_nanos: &mut Histogram<u64>,
+) -> u64 {
+    let keys: Vec<[u8; KEY_SIZE]> = indexes.iter().map(|&index| existing_key(index)).collect();
+    let pairs: Vec<(&[u8], &[u8])> = keys.iter().map(|key| (&key[..], value)).collect();
+    let op_started = Instant::now();
+    target.put_batch(&pairs);
+    record(latency_nanos, op_started.elapsed());
+    (pairs.len() * (KEY_SIZE + value.len())) as u64
+}
+
 /// 一个线程的全部工作：在起跑线等齐，然后逐个执行自己的操作并计时。
+#[allow(clippy::too_many_arguments)]
 fn run_thread(
     target: &dyn KvTarget,
     workload: Workload,
     plan: ThreadPlan,
     key_count: u64,
     scan_length: usize,
+    batch_size: usize,
     value: &[u8],
     start_line: &Barrier,
 ) -> ThreadResult {
@@ -233,22 +256,35 @@ fn run_thread(
 
     match workload {
         Workload::FillSeq | Workload::FillRandom => {
-            for index in plan.fill_order {
-                let key = existing_key(index);
-                let op_started = Instant::now();
-                target.put(&key, value);
-                record(&mut latency_nanos, op_started.elapsed());
-                user_bytes += (KEY_SIZE + value.len()) as u64;
+            if batch_size == 1 {
+                for index in plan.fill_order {
+                    let key = existing_key(index);
+                    let op_started = Instant::now();
+                    target.put(&key, value);
+                    record(&mut latency_nanos, op_started.elapsed());
+                    user_bytes += (KEY_SIZE + value.len()) as u64;
+                }
+            } else {
+                for indexes in plan.fill_order.chunks(batch_size) {
+                    user_bytes += put_batch_timed(target, indexes, value, &mut latency_nanos);
+                }
             }
         }
         Workload::Overwrite => {
-            for _ in 0..plan.ops {
-                let index = rng.below(key_count);
-                let key = existing_key(index);
-                let op_started = Instant::now();
-                target.put(&key, value);
-                record(&mut latency_nanos, op_started.elapsed());
-                user_bytes += (KEY_SIZE + value.len()) as u64;
+            if batch_size == 1 {
+                for _ in 0..plan.ops {
+                    let index = rng.below(key_count);
+                    let key = existing_key(index);
+                    let op_started = Instant::now();
+                    target.put(&key, value);
+                    record(&mut latency_nanos, op_started.elapsed());
+                    user_bytes += (KEY_SIZE + value.len()) as u64;
+                }
+            } else {
+                let indexes: Vec<u64> = (0..plan.ops).map(|_| rng.below(key_count)).collect();
+                for batch in indexes.chunks(batch_size) {
+                    user_bytes += put_batch_timed(target, batch, value, &mut latency_nanos);
+                }
             }
         }
         Workload::ReadRandom => {
@@ -323,6 +359,7 @@ mod tests {
             seed: 1,
             threads: 1,
             scan_length: 10,
+            batch_size: 1,
         }
     }
 
@@ -553,5 +590,41 @@ mod tests {
         assert_eq!(result.latency_nanos.len(), 100);
         assert!(result.found <= 100 * 10);
         assert!(result.found > 100 * 9);
+    }
+
+    // 按批写入：每个 key 仍然恰好写一次，延迟按批计（1000 条、每批 64 条，共 16 次调用）。
+    #[test]
+    fn batched_fillrandom_writes_every_key_once() {
+        let target = BTreeMapTarget::new();
+        let config = Config {
+            batch_size: 64,
+            ..small_config()
+        };
+
+        let result = run_workload(&target, Workload::FillRandom, &config);
+
+        assert_eq!(result.ops, 1000);
+        assert_eq!(result.latency_nanos.len(), 16);
+        assert_eq!(result.user_bytes, 1000 * (16 + 100));
+        for index in 0..config.num {
+            assert!(target.get(&existing_key(index)).is_some());
+        }
+    }
+
+    // 按批覆盖写：写入的字节与一条一条写时相同，不产生新的 key。
+    #[test]
+    fn batched_overwrite_writes_the_same_bytes() {
+        let target = BTreeMapTarget::new();
+        let config = Config {
+            batch_size: 10,
+            ..small_config()
+        };
+        run_workload(&target, Workload::FillRandom, &config);
+
+        let result = run_workload(&target, Workload::Overwrite, &config);
+
+        assert_eq!(result.user_bytes, 1000 * (16 + 100));
+        assert_eq!(result.latency_nanos.len(), 100);
+        assert_eq!(target.scan(&existing_key(0), usize::MAX), 1000);
     }
 }

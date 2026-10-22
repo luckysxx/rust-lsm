@@ -1,6 +1,6 @@
 # WAL
 
-状态：已有正文 · 代码：[wal.rs](../engine/src/wal.rs) 的 `Wal::create`、`Wal::recover`、`Wal::append`、`Wal::sync`、`encode_entry`、`encoded_len`、`decode_entries`、`decode_body`；[mem_table.rs](../engine/src/mem_table.rs) 的 `MemTable::new`、`create_with_wal`、`recover_from_wal`、`put`、`sync_wal`、`insert`；[lsm_storage.rs](../engine/src/lsm_storage.rs) 的 `WriteOptions`、`put_opt`、`delete_opt`、`write`、`sync`、`force_freeze_memtable`、`force_flush_next_imm_memtable`、`open`、`recover_memtables`、`list_wal_ids`、`new_memtable`、`wal_path`；[manifest.rs](../engine/src/manifest.rs) 的 `VersionEdit::flushed_memtable_id`、`RecoveredLayout::flushed_memtable_id`、`replay`；[db.rs](../engine/src/db.rs) 的 `put_opt`、`delete_opt`、`sync`；真实进程崩溃的测试 [tests/crash.rs](../engine/tests/crash.rs)
+状态：已有正文 · 代码：[wal.rs](../engine/src/wal.rs) 的 `Wal::create`、`Wal::recover`、`Wal::append`、`Wal::sync`、`encode_batch`、`encoded_len`、`decode_batches`、`decode_body`（L15 起按批次，原来的 `encode_entry`、`decode_entries` 改成了这两个）；[mem_table.rs](../engine/src/mem_table.rs) 的 `MemTable::new`、`create_with_wal`、`recover_from_wal`、`put`、`sync_wal`、`insert`；[lsm_storage.rs](../engine/src/lsm_storage.rs) 的 `WriteOptions`、`put_opt`、`delete_opt`、`write`、`sync`、`force_freeze_memtable`、`force_flush_next_imm_memtable`、`open`、`recover_memtables`、`list_wal_ids`、`new_memtable`、`wal_path`；[manifest.rs](../engine/src/manifest.rs) 的 `VersionEdit::flushed_memtable_id`、`RecoveredLayout::flushed_memtable_id`、`replay`；[db.rs](../engine/src/db.rs) 的 `put_opt`、`delete_opt`、`sync`；真实进程崩溃的测试 [tests/crash.rs](../engine/tests/crash.rs)
 
 ## 位置
 
@@ -198,7 +198,7 @@ A：插入表(k=1)
 内容： key 的长度（2 字节）│ key │ value 的长度（2 字节）│ value
 ```
 
-value 为空是墓碑。分两层：外层与 manifest 的帧相同，只管"这一段完整、没被改过"，残尾的规则也相同（剩下的不够一条：截掉；最后一条校验和不对：截掉；中间一条不对：报错）；里层只管 key 与 value 怎么排，校验和对得上、里层却解不出来（长度对不上、有多余的字节）是损坏。一条记录要放多对 key 与 value（写批次）时只改里层。外层的长度对 16 字节 key、100 字节 value 来说多占 4 字节：一条 128 字节，用户数据 116 字节。
+value 为空是墓碑。分两层：外层与 manifest 的帧相同，只管"这一段完整、没被改过"，残尾的规则也相同（剩下的不够一条：截掉；最后一条校验和不对：截掉；中间一条不对：报错）；里层只管 key 与 value 怎么排，校验和对得上、里层却解不出来（长度对不上、有多余的字节）是损坏。一条记录要放多对 key 与 value（写批次）时只改里层：[L15](15-write-batch-and-checksums.md#文件格式一批是一条记录) 把里层改成一对接一对，上面的单条记录正好是只有一对的批次。外层的长度对 16 字节 key、100 字节 value 来说多占 4 字节：一条 128 字节，用户数据 116 字节。
 
 manifest 用 JSON 是因为一次运行只有几十条、要能读懂；WAL 一次运行一百万条，用二进制。key 与 value 的长度字段是 2 字节，与数据块相同，超长的写入在入口就返回错误，到不了编码这一步。
 

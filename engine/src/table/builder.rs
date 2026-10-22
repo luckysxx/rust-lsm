@@ -6,8 +6,8 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes};
 
 use super::{
-    BLOOM_FALSE_POSITIVE_RATE, BlockCache, BlockMeta, Bloom, FileObject, SST_FORMAT_VERSION,
-    SST_MAGIC, SsTable, encode_block_meta, key_hash,
+    BLOOM_FALSE_POSITIVE_RATE, BlockCache, BlockMeta, Bloom, CHECKSUM_SIZE, FileObject,
+    SST_FORMAT_VERSION, SST_MAGIC, SsTable, encode_block_meta, has_checksums, key_hash,
 };
 use crate::block::BlockBuilder;
 use crate::error::Result;
@@ -31,8 +31,10 @@ pub struct SsTableBuilder {
     block_meta: Vec<BlockMeta>,
     /// 已经加入的每条记录的 key 的哈希值，按加入的顺序。
     key_hashes: Vec<u32>,
-    /// 每个块的目标大小。
+    /// 每个块的目标大小。只算块本身，不算跟在后面的校验和。
     block_size: usize,
+    /// 写成哪个格式版本。总是 [`SST_FORMAT_VERSION`]，测试里可以换成旧版本。
+    format_version: u32,
 }
 
 impl SsTableBuilder {
@@ -46,6 +48,31 @@ impl SsTableBuilder {
             block_meta: Vec::new(),
             key_hashes: Vec::new(),
             block_size,
+            format_version: SST_FORMAT_VERSION,
+        }
+    }
+
+    /// 只在测试里用：改成按旧的格式版本写，用来造旧版本的文件。
+    #[cfg(test)]
+    pub(crate) fn with_format_version(mut self, format_version: u32) -> Self {
+        self.format_version = format_version;
+        self
+    }
+
+    /// 这个版本里一段内容后面跟着的校验和有几个字节：版本 1 没有。
+    fn checksum_size(&self) -> usize {
+        if has_checksums(self.format_version) {
+            CHECKSUM_SIZE
+        } else {
+            0
+        }
+    }
+
+    /// 版本 2 起，给 `self.data` 里从 `section_start` 到末尾的这一段接上它的校验和。
+    fn append_checksum(&mut self, section_start: usize) {
+        if has_checksums(self.format_version) {
+            let checksum = crc32fast::hash(&self.data[section_start..]);
+            self.data.put_u32(checksum);
         }
     }
 
@@ -54,12 +81,12 @@ impl SsTableBuilder {
         self.builder.is_empty() && self.block_meta.is_empty()
     }
 
-    /// 已经加入的记录编码后大约占多少字节：封口的块加上正在装的块。
+    /// 已经加入的记录编码后大约占多少字节：封口的块（连同校验和）加上正在装的块与它的校验和。
     ///
     /// 不含索引、Bloom filter 与文件末尾的 16 字节，所以写出的文件会比它稍大。
     /// 用来判断一个文件写得够不够大、该不该换下一个。
     pub fn estimated_size(&self) -> usize {
-        self.data.len() + self.builder.encoded_size()
+        self.data.len() + self.builder.encoded_size() + self.checksum_size()
     }
 
     /// 加入一条记录。value 为空表示墓碑，照常加入。
@@ -102,7 +129,8 @@ impl SsTableBuilder {
         }
     }
 
-    /// 把正在装的块封口：编码后接到 `data` 后面，在索引里记一项，换上一个新的空块。
+    /// 把正在装的块封口：编码后接到 `data` 后面（版本 2 起再接上它的校验和），在索引里记一项，
+    /// 换上一个新的空块。
     ///
     /// 调用时正在装的块里至少要有一条记录。
     fn finish_block(&mut self) {
@@ -118,8 +146,10 @@ impl SsTableBuilder {
             first_key: Bytes::copy_from_slice(&self.first_key),
             last_key: Bytes::copy_from_slice(&self.last_key),
         };
+        let block_start = self.data.len();
         self.block_meta.push(new_block_meta);
         self.data.put_slice(&encoded_block);
+        self.append_checksum(block_start);
 
         // 新的块还是空的。
         self.first_key.clear();
@@ -143,19 +173,21 @@ impl SsTableBuilder {
         // 最后一个块还没有封口。
         self.finish_block();
 
-        // 数据块之后依次是索引、filter、末尾固定的 16 个字节。
-        // 每一段的起点都要在接上这一段之前取。
+        // 数据块之后依次是索引、filter（版本 2 起各跟着校验和）、末尾固定的 16 个字节。
+        // 每一段的起点都要在接上这一段之前取；校验和只算这一段，不算前面已经攒下的字节。
         let block_meta_start = self.data.len();
         encode_block_meta(&self.block_meta, &mut self.data);
+        self.append_checksum(block_meta_start);
 
         let bloom_start = self.data.len();
         let bits_per_key = Bloom::bits_per_key(BLOOM_FALSE_POSITIVE_RATE);
         let bloom = Bloom::build(&self.key_hashes, bits_per_key);
         bloom.encode(&mut self.data);
+        self.append_checksum(bloom_start);
 
         self.data.put_u32(block_meta_start as u32);
         self.data.put_u32(bloom_start as u32);
-        self.data.put_u32(SST_FORMAT_VERSION);
+        self.data.put_u32(self.format_version);
         self.data.put_u32(SST_MAGIC);
 
         let file = FileObject::create(path, &self.data)?;
@@ -170,6 +202,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom,
+            format_version: self.format_version,
             block_cache,
             stats: None,
         })
@@ -182,6 +215,7 @@ mod tests {
     use crate::block::{Block, BlockIterator};
     use crate::error::Error;
     use crate::iterators::vec_iterator::collect_all;
+    use crate::table::verify_checksum;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -197,7 +231,7 @@ mod tests {
         (sst, bytes)
     }
 
-    /// 按索引把文件里的每个块切出来解码，收集全部记录。
+    /// 按索引把文件里的每个块切出来，核对校验和、解码，收集全部记录。
     fn records_in_file(sst: &SsTable, bytes: &[u8]) -> Vec<(String, String)> {
         let mut records = Vec::new();
         let block_meta = sst.block_meta();
@@ -206,7 +240,8 @@ mod tests {
                 Some(next) => next.offset,
                 None => sst.block_meta_start(),
             };
-            let block = Block::decode(&bytes[meta.offset..block_end]).unwrap();
+            let encoded = verify_checksum(&bytes[meta.offset..block_end], "数据块").unwrap();
+            let block = Block::decode(encoded).unwrap();
             let mut iter = BlockIterator::new(Arc::new(block));
             records.extend(collect_all(&mut iter));
         }
@@ -222,8 +257,9 @@ mod tests {
 
     // ---------- 第 2 步之一：add 与 finish_block ----------
 
-    // 文件的内容逐字节确定：两个数据块、索引、filter、末尾的 16 个字节。
-    // filter 的内容由 bloom.rs 的测试管，这里只确认它放在索引之后、由两个 key 做成。
+    // 文件的内容逐字节确定：两个数据块、索引、filter，每一段后面跟着只算这一段的校验和，
+    // 最后是末尾的 16 个字节。filter 的内容由 bloom.rs 的测试管，这里只确认它放在索引之后、
+    // 由两个 key 做成。
     #[test]
     fn file_layout_is_exact() {
         let dir = tempfile::tempdir().unwrap();
@@ -236,16 +272,66 @@ mod tests {
         assert_eq!(expected_bloom.len(), 9);
 
         #[rustfmt::skip]
-        let mut expected: Vec<u8> = vec![
-            // 块 0，占 [0, 12)：记录 "a" → "1"（共有前缀 0），偏移数组 [0]，条数 1
+        let block_0: &[u8] = &[
+            // 记录 "a" → "1"（共有前缀 0），偏移数组 [0]，条数 1
             0, 0, 0, 1, b'a', 0, 1, b'1',   0, 0,   0, 1,
-            // 块 1，占 [12, 24)：记录 "b" → "2"（块的第一条，共有前缀 0），偏移数组 [0]，条数 1
+        ];
+        #[rustfmt::skip]
+        let block_1: &[u8] = &[
+            // 记录 "b" → "2"（块的第一条，共有前缀 0），偏移数组 [0]，条数 1
             0, 0, 0, 1, b'b', 0, 1, b'2',   0, 0,   0, 1,
-            // 索引从 24 开始：块数 2
+        ];
+        #[rustfmt::skip]
+        let block_meta: &[u8] = &[
+            // 块数 2
             0, 0, 0, 2,
             // 第 0 项：起点 0，首 key "a"，末 key "a"
             0, 0, 0, 0,   0, 1, b'a',   0, 1, b'a',
-            // 第 1 项：起点 12，首 key "b"，末 key "b"
+            // 第 1 项：起点 16，首 key "b"，末 key "b"
+            0, 0, 0, 16,   0, 1, b'b',   0, 1, b'b',
+        ];
+        let mut expected = Vec::new();
+        // 块 0 占 [0, 12)，校验和 [12, 16)；块 1 占 [16, 28)，校验和 [28, 32)。
+        for section in [block_0, block_1] {
+            expected.extend_from_slice(section);
+            expected.extend_from_slice(&crc32fast::hash(section).to_be_bytes());
+        }
+        // 索引占 [32, 56)，校验和 [56, 60)；filter 占 [60, 69)，校验和 [69, 73)。
+        for section in [block_meta, &expected_bloom[..]] {
+            expected.extend_from_slice(section);
+            expected.extend_from_slice(&crc32fast::hash(section).to_be_bytes());
+        }
+        #[rustfmt::skip]
+        expected.extend_from_slice(&[
+            // 索引的起点 32，filter 的起点 60，版本号 2
+            0, 0, 0, 32,   0, 0, 0, 60,   0, 0, 0, 2,
+            // 魔数 "LSM1"
+            b'L', b'S', b'M', b'1',
+        ]);
+        assert_eq!(bytes, expected);
+    }
+
+    // 按版本 1 写：没有校验和，其余与版本 2 相同。用来造旧版本的文件。
+    #[test]
+    fn version_1_layout_has_no_checksums() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let mut builder = SsTableBuilder::new(16).with_format_version(1);
+        builder.add(b"a", b"1");
+        builder.add(b"b", b"2");
+        builder.build(1, None, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let mut expected_bloom = Vec::new();
+        Bloom::build(&[key_hash(b"a"), key_hash(b"b")], 10).encode(&mut expected_bloom);
+        #[rustfmt::skip]
+        let mut expected: Vec<u8> = vec![
+            // 块 0 占 [0, 12)，块 1 占 [12, 24)
+            0, 0, 0, 1, b'a', 0, 1, b'1',   0, 0,   0, 1,
+            0, 0, 0, 1, b'b', 0, 1, b'2',   0, 0,   0, 1,
+            // 索引从 24 开始：块数 2，第 0 项起点 0，第 1 项起点 12
+            0, 0, 0, 2,
+            0, 0, 0, 0,   0, 1, b'a',   0, 1, b'a',
             0, 0, 0, 12,   0, 1, b'b',   0, 1, b'b',
         ];
         // filter 从 48 开始。
@@ -254,7 +340,6 @@ mod tests {
         expected.extend_from_slice(&[
             // 索引的起点 24，filter 的起点 48，版本号 1
             0, 0, 0, 24,   0, 0, 0, 48,   0, 0, 0, 1,
-            // 魔数 "LSM1"
             b'L', b'S', b'M', b'1',
         ]);
         assert_eq!(bytes, expected);
@@ -307,7 +392,7 @@ mod tests {
         );
     }
 
-    // 每个块的起点是它前面所有块的长度之和：第一个是 0，之后严格递增。
+    // 每个块的起点是它前面所有块（连同校验和）的长度之和：第一个是 0，之后严格递增。
     #[test]
     fn block_offsets_follow_encoded_block_lengths() {
         let dir = tempfile::tempdir().unwrap();
@@ -325,10 +410,10 @@ mod tests {
             ],
         );
 
-        // 三条记录的块是 32 字节，一条记录的块是 12 字节。
+        // 三条记录的块是 32 字节，一条记录的块是 12 字节，每个块后面跟 4 字节的校验和。
         let offsets: Vec<usize> = sst.block_meta().iter().map(|meta| meta.offset).collect();
-        assert_eq!(offsets, vec![0, 32, 64]);
-        assert_eq!(sst.block_meta_start(), 76);
+        assert_eq!(offsets, vec![0, 36, 72]);
+        assert_eq!(sst.block_meta_start(), 88);
     }
 
     // 放不下而换块的那条记录没有丢：它是新块的第一条。
@@ -409,9 +494,9 @@ mod tests {
         assert_eq!(read_u32_at(len - 8), SST_FORMAT_VERSION);
         let meta_offset = read_u32_at(len - 16);
         assert_eq!(meta_offset as usize, sst.block_meta_start());
-        // filter 从索引之后开始，到末尾的 16 字节之前为止。
+        // filter 从索引之后开始，连同 4 字节的校验和，到末尾的 16 字节之前为止。
         let bloom_offset = read_u32_at(len - 12) as usize;
-        assert_eq!(len - 16 - bloom_offset, sst.bloom().encoded_len());
+        assert_eq!(len - 16 - bloom_offset, sst.bloom().encoded_len() + 4);
         // 索引紧跟在数据块后面，开头是块数。
         let block_count = u32::from_be_bytes(
             bytes[sst.block_meta_start()..sst.block_meta_start() + 4]
@@ -449,20 +534,21 @@ mod tests {
         assert!(!builder.is_empty());
     }
 
-    // 估算的大小随记录增加，等于封口的块加上正在装的块；写出的文件只多出索引、filter 和末尾。
+    // 估算的大小随记录增加，等于封口的块加上正在装的块，各连同校验和；
+    // 写出的文件只多出索引、filter 和末尾。
     #[test]
     fn estimated_size_counts_finished_and_open_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let mut builder = SsTableBuilder::new(32);
-        // 空的块也有 2 字节的条数。
-        assert_eq!(builder.estimated_size(), 2);
+        // 空的块也有 2 字节的条数，加上 4 字节的校验和。
+        assert_eq!(builder.estimated_size(), 2 + 4);
 
         // 每条记录连同偏移 10 字节，目标 32 放三条；第四条开新块。
         for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
             builder.add(key.as_bytes(), value.as_bytes());
         }
-        // 封口的块 32 字节，正在装的块 2 + 10 字节。
-        assert_eq!(builder.estimated_size(), 32 + 12);
+        // 封口的块 32 + 4 字节，正在装的块 2 + 10 字节再加 4 字节。
+        assert_eq!(builder.estimated_size(), 36 + 16);
 
         let estimated = builder.estimated_size();
         let sst = builder.build(1, None, &dir.path().join("1.sst")).unwrap();

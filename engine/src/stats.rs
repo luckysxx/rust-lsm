@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Stats {
     user_bytes_written: AtomicU64,
     wal_bytes_written: AtomicU64,
+    wal_syncs: AtomicU64,
     flush_bytes_written: AtomicU64,
     compaction_bytes_written: AtomicU64,
     gets: AtomicU64,
@@ -31,6 +32,11 @@ impl Stats {
     /// 追加到 WAL 文件的字节。
     pub fn add_wal_bytes_written(&self, bytes: u64) {
         self.wal_bytes_written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 真正做过的 WAL fsync 次数（已经被别人的 fsync 带下去、直接返回的不算）。
+    pub fn add_wal_syncs(&self, syncs: u64) {
+        self.wal_syncs.fetch_add(syncs, Ordering::Relaxed);
     }
 
     /// flush 写出的 SST 字节。
@@ -73,6 +79,7 @@ impl Stats {
         StatsSnapshot {
             user_bytes_written: self.user_bytes_written.load(Ordering::Relaxed),
             wal_bytes_written: self.wal_bytes_written.load(Ordering::Relaxed),
+            wal_syncs: self.wal_syncs.load(Ordering::Relaxed),
             flush_bytes_written: self.flush_bytes_written.load(Ordering::Relaxed),
             compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
             gets: self.gets.load(Ordering::Relaxed),
@@ -88,6 +95,7 @@ impl Stats {
 pub struct StatsSnapshot {
     pub user_bytes_written: u64,
     pub wal_bytes_written: u64,
+    pub wal_syncs: u64,
     pub flush_bytes_written: u64,
     pub compaction_bytes_written: u64,
     pub gets: u64,
@@ -102,6 +110,7 @@ impl StatsSnapshot {
         StatsSnapshot {
             user_bytes_written: self.user_bytes_written - earlier.user_bytes_written,
             wal_bytes_written: self.wal_bytes_written - earlier.wal_bytes_written,
+            wal_syncs: self.wal_syncs - earlier.wal_syncs,
             flush_bytes_written: self.flush_bytes_written - earlier.flush_bytes_written,
             compaction_bytes_written: self.compaction_bytes_written
                 - earlier.compaction_bytes_written,

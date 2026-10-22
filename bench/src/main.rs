@@ -25,6 +25,8 @@ const USAGE: &str = "\
   --workloads A,B,C  按顺序执行的负载（默认 fillseq 以外的五种）
   --target NAME      被测对象（默认 btreemap）
   --threads N        同时发起操作的线程数（默认 1）
+  --batch-size N     写负载（fillseq、fillrandom、overwrite）每次调用写入几条记录：
+                     大于 1 时连续几条攒成一批，引擎用写批次；延迟按每次调用计（默认 1）
   --scan-length N    范围扫描每次读的记录数（默认 100）
   --memtable-mb N    被测对象为 engine 时，memtable 的上限，单位 MB（默认 64）
   --block-cache-mb N 被测对象为 engine 时，块缓存的容量，单位 MB；0 表示不用（默认 64）
@@ -154,6 +156,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
         seed: 1,
         threads: 1,
         scan_length: 100,
+        batch_size: 1,
     };
     let mut workloads = Workload::DEFAULT.to_vec();
     let mut target = "btreemap".to_string();
@@ -189,6 +192,7 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
             "--workloads" => workloads = parse_workloads(value)?,
             "--target" => target = value.clone(),
             "--threads" => config.threads = parse_number(flag, value)? as usize,
+            "--batch-size" => config.batch_size = parse_number(flag, value)? as usize,
             "--scan-length" => config.scan_length = parse_number(flag, value)? as usize,
             "--memtable-mb" => memtable_megabytes = parse_number(flag, value)? as usize,
             "--block-cache-mb" => block_cache_megabytes = parse_number(flag, value)? as usize,
@@ -216,6 +220,9 @@ fn parse_args(raw: &[String]) -> Result<Option<Args>, String> {
     }
     if config.threads == 0 || config.threads as u64 > config.num {
         return Err("--threads 必须至少为 1，且不超过 --num".to_string());
+    }
+    if config.batch_size == 0 {
+        return Err("--batch-size 必须至少为 1".to_string());
     }
     if !TARGET_NAMES.contains(&target.as_str()) {
         return Err(format!("不认识的被测对象：{target}"));
@@ -337,9 +344,10 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         println!("- 被测对象说明：{details}");
     }
     println!(
-        "- 参数：`--target {} --threads {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} {} --wal {} --workloads {}`",
+        "- 参数：`--target {} --threads {} --batch-size {} --num {} --value-size {} --seed {} --scan-length {} --memtable-mb {} --block-cache-mb {} --max-levels {} {} --wal {} --workloads {}`",
         args.target,
         config.threads,
+        config.batch_size,
         config.num,
         config.value_size,
         config.seed,
@@ -352,8 +360,8 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         workload_names.join(",")
     );
     println!(
-        "- key {} 字节，value {} 字节，{} 个线程；范围扫描每次读 {} 条",
-        KEY_SIZE, config.value_size, config.threads, config.scan_length
+        "- key {} 字节，value {} 字节，{} 个线程；范围扫描每次读 {} 条；写负载每次调用写 {} 条",
+        KEY_SIZE, config.value_size, config.threads, config.scan_length, config.batch_size
     );
     println!("- 编译：{profile}，工具链 {toolchain}");
     println!(
@@ -398,12 +406,15 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
     // 空间放大的分母：全部 key 各一份的大小。基准里没有删除，写满之后 key 的个数不变。
     let live_bytes = args.config.num * (KEY_SIZE + args.config.value_size) as u64;
     println!(
-        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 其中 WAL (字节) | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 / … 的 SST | 结束时 SST 的总字节 | 空间放大 |"
+        "| 负载 | 用户写入 (字节) | 磁盘写入 (字节) | 其中 WAL (字节) | WAL fsync 次数 | 写放大 | 每次点查进入的 SST | 每次点查被 Bloom filter 排除的 SST | 每次点查读的数据块 | 结束时 L0 / L1 / … 的 SST | 结束时 SST 的总字节 | 空间放大 |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
     let mut total_user_bytes = 0;
     let mut total_disk_bytes = 0;
     let mut total_wal_bytes = 0;
+    let mut total_wal_syncs = 0;
     for result in results {
         let Some(stats) = result.stats else {
             continue;
@@ -411,6 +422,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         total_user_bytes += stats.user_bytes_written;
         total_disk_bytes += stats.disk_bytes_written();
         total_wal_bytes += stats.wal_bytes_written;
+        total_wal_syncs += stats.wal_syncs;
         let (layout, total_bytes, space_amplification) = match &result.sst_layout {
             Some(layout) => (
                 format!("{} / {}", layout.l0_files, join_counts(&layout.level_files)),
@@ -420,11 +432,12 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
             None => ("—".to_string(), "—".to_string(), "—".to_string()),
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             result.workload.name(),
             stats.user_bytes_written,
             stats.disk_bytes_written(),
             stats.wal_bytes_written,
+            stats.wal_syncs,
             ratio(stats.write_amplification()),
             ratio(stats.tables_probed_per_get()),
             ratio(stats.tables_skipped_by_bloom_per_get()),
@@ -441,7 +454,7 @@ fn print_report(target: &dyn KvTarget, args: &Args, results: &[WorkloadResult]) 
         Some(total_disk_bytes as f64 / total_user_bytes as f64)
     };
     println!(
-        "| 合计 | {total_user_bytes} | {total_disk_bytes} | {total_wal_bytes} | {} | — | — | — | — | — | — |",
+        "| 合计 | {total_user_bytes} | {total_disk_bytes} | {total_wal_bytes} | {total_wal_syncs} | {} | — | — | — | — | — | — |",
         ratio(total_write_amplification)
     );
     println!();
@@ -485,6 +498,7 @@ mod tests {
         assert_eq!(args.config.num, 1_000_000);
         assert_eq!(args.config.value_size, 100);
         assert_eq!(args.config.threads, 1);
+        assert_eq!(args.config.batch_size, 1);
         assert_eq!(args.config.scan_length, 100);
         assert_eq!(args.memtable_megabytes, 64);
         assert_eq!(args.block_cache_megabytes, 64);
@@ -531,6 +545,8 @@ mod tests {
             "memtable",
             "--threads",
             "4",
+            "--batch-size",
+            "16",
             "--scan-length",
             "10",
             "--memtable-mb",
@@ -552,6 +568,7 @@ mod tests {
         assert_eq!(args.config.value_size, 32);
         assert_eq!(args.config.seed, 9);
         assert_eq!(args.config.threads, 4);
+        assert_eq!(args.config.batch_size, 16);
         assert_eq!(args.config.scan_length, 10);
         assert_eq!(args.memtable_megabytes, 8);
         assert_eq!(args.block_cache_megabytes, 0);
@@ -578,6 +595,7 @@ mod tests {
         assert!(parse_args(&strings(&["--frobnicate", "1"])).is_err());
         assert!(parse_args(&strings(&["--target", "nosuch"])).is_err());
         assert!(parse_args(&strings(&["--threads", "0"])).is_err());
+        assert!(parse_args(&strings(&["--batch-size", "0"])).is_err());
         assert!(parse_args(&strings(&["--num", "2", "--threads", "3"])).is_err());
         assert!(parse_args(&strings(&["--value-size", "0"])).is_err());
         assert!(parse_args(&strings(&["--scan-length", "0"])).is_err());

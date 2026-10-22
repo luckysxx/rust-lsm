@@ -23,7 +23,9 @@ use bytes::Bytes;
 
 use crate::compaction::CompactionOptions;
 use crate::error::Result;
-use crate::lsm_storage::{LsmStorage, LsmStorageOptions, ScanIterator, WriteOptions};
+use crate::lsm_storage::{
+    LsmStorage, LsmStorageOptions, ScanIterator, WriteBatchRecord, WriteOptions,
+};
 use crate::stats::StatsSnapshot;
 
 /// flush 线程等信号的最长时间。等满这么久还没有信号，它也会检查一次有没有冻结的
@@ -141,6 +143,25 @@ impl Db {
     /// 删除一个 key，选项由调用方给。
     pub fn delete_opt(&self, key: &[u8], options: WriteOptions) -> Result<()> {
         let froze = self.storage.delete_opt(key, options)?;
+        if froze {
+            self.wake_flush_thread();
+        }
+        Ok(())
+    }
+
+    /// 写入一批记录，用默认的选项。整批是 WAL 里的一条记录，崩溃之后要么全在、要么全不在；
+    /// 同一个 key 出现几次时，后面的覆盖前面的。错误与 `put` 相同，有一条不合法时整批都不写。
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        self.write_batch_opt(batch, WriteOptions::default())
+    }
+
+    /// 写入一批记录，选项由调用方给。
+    pub fn write_batch_opt<T: AsRef<[u8]>>(
+        &self,
+        batch: &[WriteBatchRecord<T>],
+        options: WriteOptions,
+    ) -> Result<()> {
+        let froze = self.storage.write_batch_opt(batch, options)?;
         if froze {
             self.wake_flush_thread();
         }
@@ -913,6 +934,27 @@ mod tests {
             wait_until(|| db.imm_memtable_count() == 0 && db.l0_sstable_count() > 0),
             "表被冻结之后后台线程没有被叫醒"
         );
+    }
+
+    // 写批次冻结了一张表时也会叫醒后台线程；批次里的写入与删除都生效。
+    #[test]
+    fn db_write_batch_wakes_the_flush_thread() {
+        let db = TestDb::open(64, NEVER);
+        let keys: Vec<String> = (0..20).map(|i| format!("key-{i:03}")).collect();
+        let mut batch: Vec<WriteBatchRecord<&[u8]>> = keys
+            .iter()
+            .map(|key| WriteBatchRecord::Put(key.as_bytes(), &b"value"[..]))
+            .collect();
+        batch.push(WriteBatchRecord::Delete(keys[0].as_bytes()));
+
+        db.write_batch(&batch).unwrap();
+
+        assert!(
+            wait_until(|| db.imm_memtable_count() == 0 && db.l0_sstable_count() > 0),
+            "写批次冻结了表之后后台线程没有被叫醒"
+        );
+        assert_eq!(db.get_str("key-000"), None);
+        assert_eq!(db.get_str("key-019"), Some("value".to_string()));
     }
 
     // 几个线程同时写入，后台线程同时在 flush：每条记录写完立刻读得到，最后一条不少。

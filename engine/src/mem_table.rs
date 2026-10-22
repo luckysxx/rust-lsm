@@ -28,7 +28,8 @@ pub struct MemTable {
     /// 这张表的 WAL。没开 WAL 时是 `None`，写入只进内存。
     wal: Option<Wal>,
     /// 有 WAL 时，"追加 WAL、插入表"两步一起在这把锁里做：WAL 里的先后就是插入的先后，
-    /// 重放得到的表与崩溃前的一样。没有 WAL 时不用它，写入之间不排队。
+    /// 重放得到的表与崩溃前的一样。没有 WAL 时只有多对的批次用它，让一批批整批先后生效；
+    /// 单条写入之间不排队。
     write_lock: Mutex<()>,
 }
 
@@ -52,15 +53,17 @@ impl MemTable {
         Ok(table)
     }
 
-    /// 从 `path` 的 WAL 重建一张表：按写入的顺序把记录插回去，之后的写入接着追加到这个文件。
+    /// 从 `path` 的 WAL 重建一张表：按写入的顺序把一批批记录插回去，之后的写入接着追加到这个文件。
     ///
     /// 末尾写了一半的记录被截掉（见 [`Wal::recover`]）；中间损坏时返回
     /// [`crate::error::Error::Corruption`]。
     pub fn recover_from_wal(id: usize, path: &Path) -> Result<Self> {
-        let (wal, entries) = Wal::recover(path)?;
+        let (wal, batches) = Wal::recover(path)?;
         let mut table = Self::new(id);
-        for (key, value) in entries {
-            table.insert(&key, &value);
+        for batch in batches {
+            for (key, value) in batch {
+                table.insert(&key, &value);
+            }
         }
         table.wal = Some(wal);
         Ok(table)
@@ -78,32 +81,71 @@ impl MemTable {
 
     /// 写入一条记录，覆盖同一个 key 原有的记录。value 为空表示这个 key 被删除。
     ///
-    /// 有 WAL 时先追加到 WAL、再插入表，两步在 `write_lock` 里一起做；追加失败时返回错误，
-    /// 表不变。追加只写进页缓存、不同步，要落到磁盘上再调用 [`MemTable::sync_wal`]。
-    ///
-    /// key 和 value 各拷贝一次，之后表里的数据与调用方的缓冲区无关。
+    /// 就是只有一对的 [`MemTable::put_batch`]。
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        match &self.wal {
-            Some(wal) => {
-                let _guard = self.write_lock.lock().unwrap();
-                wal.append(key, value)?;
-                self.insert(key, value);
-            }
-            None => {
-                self.insert(key, value);
-            }
-        }
+        self.put_batch(&[(key, value)])?;
         Ok(())
     }
 
-    /// 把这张表的 WAL 同步到磁盘；没有 WAL 时什么都不做。
+    /// 写入一批记录，按顺序插入：同一个 key 出现几次时，后面的覆盖前面的。批次不能为空。
+    ///
+    /// 有 WAL 时先把整批作为一条记录追加到 WAL、再逐对插入表，两步在 `write_lock` 里一起做；
+    /// 追加失败时返回错误，表不变。追加只写进页缓存、不同步，要落到磁盘上，把返回的
+    /// "这条记录在 WAL 里的末尾"交给 [`MemTable::sync_wal_to`]。没有 WAL 时返回 0。
+    ///
+    /// 插入期间别的线程可能读到这批的一部分：这里只保证崩溃之后整批都在或都不在。
+    /// key 和 value 各拷贝一次，之后表里的数据与调用方的缓冲区无关。
+    pub fn put_batch(&self, batch: &[(&[u8], &[u8])]) -> Result<u64> {
+        match &self.wal {
+            Some(wal) => {
+                let _guard = self.write_lock.lock().unwrap();
+                let wal_end = wal.append(batch)?;
+                for &(key, value) in batch {
+                    self.insert(key, value);
+                }
+                Ok(wal_end)
+            }
+            None => {
+                // 多对的批次也要排队：两批同时写同几个 key 时，不排队就会一对一对交错，
+                // 写完之后 a 是这一批的、b 是那一批的，哪种先后次序都得不到这个结果。
+                let _guard = (batch.len() > 1).then(|| self.write_lock.lock().unwrap());
+                for &(key, value) in batch {
+                    self.insert(key, value);
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    /// 把这张表的 WAL 同步到磁盘；没有 WAL 时什么都不做。返回这次有没有真的做 fsync。
     ///
     /// 不拿 `write_lock`：同步期间别的线程照常写入。返回之后，调用之前完成的写入都已落盘。
-    pub fn sync_wal(&self) -> Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.sync()?;
+    pub fn sync_wal(&self) -> Result<bool> {
+        match &self.wal {
+            Some(wal) => wal.sync(),
+            None => Ok(false),
         }
-        Ok(())
+    }
+
+    /// 让这张表的 WAL 里末尾不超过 `wal_end`（[`MemTable::put_batch`] 的返回值）的记录落盘，
+    /// 别的线程那次 fsync 已经带下去时不再做。返回这次有没有真的做 fsync。
+    pub fn sync_wal_to(&self, wal_end: u64) -> Result<bool> {
+        match &self.wal {
+            Some(wal) => wal.sync_to(wal_end),
+            None => Ok(false),
+        }
+    }
+
+    /// 只在测试里用：之后这张表的 WAL 每次 fsync 都变慢，见 [`Wal::make_syncs_slow`]。
+    #[cfg(test)]
+    pub(crate) fn make_wal_syncs_slow(&self) {
+        self.wal.as_ref().unwrap().make_syncs_slow();
+    }
+
+    /// 只在测试里用：这张表的 WAL 开始过几次 fsync。
+    #[cfg(test)]
+    pub(crate) fn wal_fsyncs_started(&self) -> usize {
+        self.wal.as_ref().unwrap().fsyncs_started()
     }
 
     /// 只插入表，不碰 WAL。
@@ -477,11 +519,30 @@ mod tests {
 
     // ---------- WAL ----------
 
-    /// 读出 WAL 文件里的全部记录，变成字符串。
-    fn wal_entries(path: &Path) -> Vec<(String, String)> {
-        let (_wal, entries) = Wal::recover(path).unwrap();
-        entries
+    /// 读出 WAL 文件里的全部批次，每批是一个列表，变成字符串。
+    fn wal_batches(path: &Path) -> Vec<Vec<(String, String)>> {
+        let (_wal, batches) = Wal::recover(path).unwrap();
+        batches
             .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = String::from_utf8(key.to_vec()).unwrap();
+                        let value = String::from_utf8(value.to_vec()).unwrap();
+                        (key, value)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 读出 WAL 文件里的全部记录，不分批次，变成字符串。
+    fn wal_entries(path: &Path) -> Vec<(String, String)> {
+        let (_wal, batches) = Wal::recover(path).unwrap();
+        batches
+            .iter()
+            .flatten()
             .map(|(key, value)| {
                 let key = String::from_utf8(key.to_vec()).unwrap();
                 let value = String::from_utf8(value.to_vec()).unwrap();
@@ -577,5 +638,120 @@ mod tests {
                 assert_eq!(value.as_bytes(), &in_table[..], "{key}");
             }
         });
+    }
+
+    // 一批写入：按顺序插入，同一个 key 后面的覆盖前面的；WAL 里整批是一条记录。
+    #[test]
+    fn put_batch_inserts_in_order_as_one_wal_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00007.wal");
+        let table = MemTable::create_with_wal(7, &path).unwrap();
+
+        table.put(b"z", b"0").unwrap();
+        table
+            .put_batch(&[(b"a", b"1"), (b"b", b"2"), (b"a", b"3"), (b"b", b"")])
+            .unwrap();
+
+        assert_eq!(table.get(b"a"), Some(Bytes::from_static(b"3")));
+        assert_eq!(table.get(b"b"), Some(Bytes::new()));
+        assert_eq!(table.get(b"z"), Some(Bytes::from_static(b"0")));
+        let expected_batches = vec![
+            vec![("z".to_string(), "0".to_string())],
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("a".to_string(), "3".to_string()),
+                ("b".to_string(), String::new()),
+            ],
+        ];
+        assert_eq!(wal_batches(&path), expected_batches);
+    }
+
+    // 没有 WAL 的表也能整批写入，同一个 key 后面的覆盖前面的。
+    #[test]
+    fn put_batch_without_wal() {
+        let table = MemTable::new(3);
+
+        table.put_batch(&[(b"a", b"1"), (b"a", b"2")]).unwrap();
+
+        assert_eq!(table.get(b"a"), Some(Bytes::from_static(b"2")));
+        assert_eq!(table.approximate_size(), 4);
+    }
+
+    // 没有 WAL 时，几个线程同时写同几个 key 的批次：每一轮写完，各个 key 的值都来自同一批，
+    // 不会一对来自这一批、另一对来自那一批。每轮先用 Barrier 让线程对齐再一起写。
+    #[test]
+    fn concurrent_batches_without_wal_do_not_interleave() {
+        crate::test_util::run_with_slow_deadline("并发写批次", || {
+            let table = MemTable::new(1);
+            let threads = 4;
+            let rounds = 2000;
+            let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+            let barrier = std::sync::Barrier::new(threads);
+            thread::scope(|scope| {
+                for thread_id in 0..threads {
+                    let table = &table;
+                    let barrier = &barrier;
+                    let keys = &keys;
+                    scope.spawn(move || {
+                        for round in 0..rounds {
+                            let value = format!("t{thread_id}-r{round}");
+                            let batch: Vec<(&[u8], &[u8])> = keys
+                                .iter()
+                                .map(|key| (key.as_bytes(), value.as_bytes()))
+                                .collect();
+                            barrier.wait();
+                            table.put_batch(&batch).unwrap();
+                            barrier.wait();
+                            let first = table.get(keys[0].as_bytes()).unwrap();
+                            for key in keys {
+                                assert_eq!(
+                                    table.get(key.as_bytes()).unwrap(),
+                                    first,
+                                    "第 {round} 轮"
+                                );
+                            }
+                            barrier.wait();
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    // 从 WAL 重建的表与写入时的一样：每一批的每一对都插回去，顺序不变。
+    #[test]
+    fn recover_from_wal_replays_every_pair_of_every_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00007.wal");
+        let table = MemTable::create_with_wal(7, &path).unwrap();
+        table.put_batch(&[(b"a", b"1"), (b"b", b"2")]).unwrap();
+        table.put(b"c", b"3").unwrap();
+        table.put_batch(&[(b"a", b""), (b"c", b"4")]).unwrap();
+        drop(table);
+
+        let table = MemTable::recover_from_wal(7, &path).unwrap();
+
+        let mut iter = MemTableIterator::new(Arc::new(table), Bound::Unbounded, Bound::Unbounded);
+        let all = collect_all(&mut iter);
+        assert_eq!(all, expected(&[("a", ""), ("b", "2"), ("c", "4")]));
+    }
+
+    // 带 WAL 时 put_batch 返回这批记录在 WAL 里的末尾，同步到那里就够了；没有 WAL 时返回 0。
+    #[test]
+    fn put_batch_returns_wal_end_for_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("00007.wal");
+        let table = MemTable::create_with_wal(7, &path).unwrap();
+
+        let first = table.put_batch(&[(b"a", b"1")]).unwrap();
+        let second = table.put_batch(&[(b"b", b"2"), (b"c", b"3")]).unwrap();
+
+        assert_eq!(second, std::fs::metadata(&path).unwrap().len());
+        assert!(first < second);
+        assert!(table.sync_wal_to(first).unwrap());
+        assert!(!table.sync_wal_to(second).unwrap());
+        assert!(!table.sync_wal().unwrap());
+        assert_eq!(MemTable::new(3).put_batch(&[(b"a", b"1")]).unwrap(), 0);
     }
 }

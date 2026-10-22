@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use lsm::compaction::CompactionOptions;
 use lsm::db::Db;
 use lsm::iterators::StorageIterator;
-use lsm::lsm_storage::{LsmStorageOptions, WriteOptions};
+use lsm::lsm_storage::{LsmStorageOptions, WriteBatchRecord, WriteOptions};
 use lsm::manifest::{MANIFEST_FILE_NAME, Manifest};
 use lsm::mem_table::{MemTable, MemTableIterator};
 use lsm::stats::StatsSnapshot;
@@ -19,6 +19,13 @@ pub trait KvTarget: Sync {
     fn name(&self) -> &'static str;
 
     fn put(&self, key: &[u8], value: &[u8]);
+
+    /// 一次写入一批记录。默认一条一条 `put`；引擎用写批次，整批是 WAL 里的一条记录。
+    fn put_batch(&self, pairs: &[(&[u8], &[u8])]) {
+        for &(key, value) in pairs {
+            self.put(key, value);
+        }
+    }
 
     /// 返回 value 的副本；key 不存在时返回 `None`。
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
@@ -239,6 +246,17 @@ impl KvTarget for EngineTarget {
             sync: self.config.sync_writes,
         };
         self.db.put_opt(key, value, options).expect("写入失败");
+    }
+
+    fn put_batch(&self, pairs: &[(&[u8], &[u8])]) {
+        let options = WriteOptions {
+            sync: self.config.sync_writes,
+        };
+        let batch: Vec<WriteBatchRecord<&[u8]>> = pairs
+            .iter()
+            .map(|&(key, value)| WriteBatchRecord::Put(key, value))
+            .collect();
+        self.db.write_batch_opt(&batch, options).expect("写入失败");
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
