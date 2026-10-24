@@ -90,6 +90,7 @@ cargo run --release -p lsm-bench -- --target engine --compaction leveled --wal o
 | [cli](cli) | `lsm-cli` | 交互式命令行程序 | [main.rs](cli/src/main.rs)、[command.rs](cli/src/command.rs)、[execute.rs](cli/src/execute.rs) |
 | [bench/results](bench/results) | | 每次基准运行的记录 | [记录方式与列表](bench/results/README.md) |
 | [notes](notes) | | 设计笔记（中文） | [阅读索引与全景图](notes/README.md) |
+| [docs](docs) | | 工程文档：模块、线程、锁、调用链与不变量 | [architecture.md](docs/architecture.md) |
 
 单元测试写在被测代码所在文件末尾的 `tests` 子模块里，每个测试上方用一行注释说明检查的是哪条性质。
 
