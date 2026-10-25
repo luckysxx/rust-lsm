@@ -16,7 +16,7 @@
 | WAL | `00013.wal` | 一张 memtable 收到的全部写入 | 只追加；那张表写成 SST 并记进 manifest 后删除 |
 | manifest | `MANIFEST` | 各层有哪些 SST 的变更日志 | 只追加，每条追加完立刻同步 |
 
-SST 与 memtable 共用一个编号计数器，所以 `.sst` 和 `.wal` 的编号不会重复。文件名里的编号只表示创建的先后，一个 SST 在哪一层由 manifest 决定。
+SST 与 memtable 共用一个编号计数器，所以 `.sst` 和 `.wal` 的编号不会重复。文件名里的编号只表示创建的先后，一个 SST 在哪一层由 manifest 决定。三种文件精确到字节的格式见[磁盘格式](on-disk-format.md)。
 
 workspace 里有三个 package：
 
