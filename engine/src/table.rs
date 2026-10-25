@@ -95,6 +95,9 @@ pub const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// 文件末尾固定的部分有多长：索引的起点、filter 的起点、版本号、魔数，各 4 字节。
 const FOOTER_SIZE: usize = 16;
 
+/// 一个 SST 最多多少字节。索引里块的起点、末尾的两个起点都是 4 字节，文件再大就记不下。
+pub const MAX_SST_SIZE: usize = u32::MAX as usize;
+
 /// 索引里的一项：一个数据块在文件的哪里，装着哪个范围的 key。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockMeta {

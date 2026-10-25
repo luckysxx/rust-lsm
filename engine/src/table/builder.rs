@@ -7,10 +7,11 @@ use bytes::{BufMut, Bytes};
 
 use super::{
     BLOOM_FALSE_POSITIVE_RATE, BlockCache, BlockMeta, Bloom, CHECKSUM_SIZE, FileObject,
-    SST_FORMAT_VERSION, SST_MAGIC, SsTable, encode_block_meta, has_checksums, key_hash,
+    MAX_SST_SIZE, SST_FORMAT_VERSION, SST_MAGIC, SsTable, encode_block_meta, has_checksums,
+    key_hash,
 };
 use crate::block::BlockBuilder;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// 构建一个 SST。
 ///
@@ -158,7 +159,10 @@ impl SsTableBuilder {
 
     /// 封口并写成文件，返回这个 SST。`id` 是文件的编号，`path` 是文件的路径。
     ///
-    /// 至少要加入过一条记录。写文件失败时返回错误。
+    /// 至少要加入过一条记录。
+    ///
+    /// - 整个文件超过 [`MAX_SST_SIZE`] 字节：[`Error::InvalidArgument`]，不创建文件。
+    /// - 写文件失败：[`Error::Io`]。
     pub fn build(
         mut self,
         id: usize,
@@ -190,6 +194,9 @@ impl SsTableBuilder {
         self.data.put_u32(self.format_version);
         self.data.put_u32(SST_MAGIC);
 
+        // 文件超过上限时，上面几处 `as u32` 已经把起点截断了，写出去的文件打不开。
+        // 在创建文件之前拒绝，目录里不会留下坏文件。
+        check_sst_size(self.data.len())?;
         let file = FileObject::create(path, &self.data)?;
 
         let first_key = self.block_meta[0].first_key.clone();
@@ -207,6 +214,17 @@ impl SsTableBuilder {
             stats: None,
         })
     }
+}
+
+/// 编码好的 SST 有 `size` 字节，能不能写成文件：超过 [`MAX_SST_SIZE`] 时返回
+/// [`Error::InvalidArgument`]。
+fn check_sst_size(size: usize) -> Result<()> {
+    if size > MAX_SST_SIZE {
+        return Err(Error::InvalidArgument(format!(
+            "SST 有 {size} 字节，超过了上限 {MAX_SST_SIZE}：文件里的起点只有 4 字节"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -621,5 +639,15 @@ mod tests {
         let builder = SsTableBuilder::new(4096);
 
         let _ = builder.build(1, None, &path);
+    }
+
+    // 文件正好到上限可以写，多 1 字节就返回 InvalidArgument（不真的写 4 GiB，只测判断大小的一步）。
+    #[test]
+    fn check_sst_size_rejects_files_over_the_limit() {
+        assert!(check_sst_size(MAX_SST_SIZE).is_ok());
+
+        let result = check_sst_size(MAX_SST_SIZE + 1);
+
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 }

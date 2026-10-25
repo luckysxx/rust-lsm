@@ -133,6 +133,7 @@ cargo run --release -p lsm-bench -- --target engine --compaction leveled --wal o
 **性能与资源**
 
 - 没有写入停顿：合并跟不上写入时，L0 会一直积压，冻结的表在内存里排队也没有上限。
+- 一个 SST 最多 4 GiB：一张 memtable 写成一个文件，memtable 上限设得接近 4 GiB 时，这张表的 flush 一直失败、留在内存里。
 - 开 WAL 后，不同步写入在 memtable 的写锁里排成一列（追加 WAL、插入跳表），多线程反而比单线程慢。
 - manifest 的追加和 fsync 在状态大锁里做，写入的最大延迟有几毫秒。
 - 合并单线程执行，后台线程每 50 毫秒轮询一次，flush 之后不会被叫醒。leveled 挑文件只看编号，不看与下层重叠的大小。
